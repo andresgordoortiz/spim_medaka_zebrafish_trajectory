@@ -51,7 +51,7 @@ FRAME_INTERVAL_MIN <- 0.5 # 30 sec = 0.5 min
 #
 
 FLIP_X <- FALSE   # Set TRUE if image is horizontally mirrored
-FLIP_Y <- TRUE   # Set TRUE if image is vertically flipped
+FLIP_Y <- FALSE   # Set TRUE if image is vertically flipped
 FLIP_Z <- FALSE   # Set TRUE if Z-axis is inverted
 SWAP_XY <- FALSE  # Set TRUE to swap X and Y axes
 
@@ -107,8 +107,8 @@ theme_track <- function(base_size = 10) {
 cat("\n=== PART 1: DATA LOADING ===\n")
 
 # Load data - skipping TrackMate metadata rows
-spots_raw <- read_csv("4D_spots.csv", show_col_types = FALSE)[-c(1:3),]
-tracks_raw <- read_csv("4D_tracks.csv", show_col_types = FALSE)[-c(1:3),]
+spots_raw <- read_csv("oriented_spots.csv", show_col_types = FALSE)[-c(1:3),]
+tracks_raw <- read_csv("oriented_tracks.csv", show_col_types = FALSE)[-c(1:3),]
 
 # Convert to numeric
 spots <- spots_raw %>%
@@ -423,7 +423,7 @@ p2 <- ggplot(tracks_clean, aes(x = SPEED_MEAN_UM_MIN)) +
 p3 <- ggplot(tracks, aes(x = DURATION_MIN, y = SPEED_MAX_UM_MIN)) +
   geom_point(aes(color = ifelse(passes_qc, "Kept", "Filtered")),
              alpha = 0.3, size = 0.5) +
-  geom_hline(yintercept = MAX_SPEED_UM_MIN, linetype = "dashed", color = "#B2182B", linewidth = 0.3) +
+  geom_hline(yintercept = MEAN_SPEED_THRESHOLD, linetype = "dashed", color = "#B2182B", linewidth = 0.3) +
   geom_vline(xintercept = MIN_DURATION_MIN, linetype = "dashed", color = "#B2182B", linewidth = 0.3) +
   scale_color_manual(values = c("Kept" = "#2166AC", "Filtered" = "grey70"),
                      breaks = c("Kept", "Filtered")) +
@@ -511,7 +511,7 @@ spots_velocity <- spots_clean %>%
 
 # Speed statistics
 speed_stats <- spots_velocity %>%
-  filter(!is.na(inst_speed_um_min) & inst_speed_um_min < 20) %>%  # Remove outliers
+  filter(!is.na(inst_speed_um_min) ) %>%  # Remove outliers
   summarise(
     mean = mean(inst_speed_um_min),
     median = median(inst_speed_um_min),
@@ -531,7 +531,7 @@ cat(sprintf("  95th percentile: %.2f µm/min\n", speed_stats$q95))
 #   - Width = variability in movement
 #   - Tail = fast movements (division, migration)
 #
-p5 <- ggplot(spots_velocity %>% filter(!is.na(inst_speed_um_min) & inst_speed_um_min < 15),
+p5 <- ggplot(spots_velocity %>% filter(!is.na(inst_speed_um_min)),
              aes(x = inst_speed_um_min)) +
   geom_histogram(aes(y = after_stat(density)), bins = 50, fill = "#2166AC", alpha = 0.7) +
   geom_density(color = "#B2182B", linewidth = 1) +
@@ -561,7 +561,7 @@ p6 <- ggplot(speed_over_time, aes(x = time_bin_min, y = mean_speed)) +
               alpha = 0.3, fill = "#2166AC") +
   geom_line(color = "#2166AC", linewidth = 1) +
   labs(
-    title = "Mean Nuclear Speed Over Developmental Time (3D)",
+    title = "Mean Instantenous Speed Over Time",
     subtitle = "Shaded: SE | Speed computed from XYZ displacements",
     x = "Time (min from start)",
     y = "Mean speed (µm/min)"
@@ -704,9 +704,9 @@ cat("\n=== PART 7: SPATIAL VELOCITY PATTERNS ===\n")
 spatial_velocity <- spots_velocity %>%
   filter(!is.na(inst_speed_um_min)) %>%
   mutate(
-    x_bin = round(POSITION_X / 30) * 30,  # 30 µm bins
-    y_bin = round(POSITION_Y / 30) * 30,
-    z_bin = round(POSITION_Z / 30) * 30
+    x_bin = round(POSITION_X / 15) * 15,  # 15 µm bins
+    y_bin = round(POSITION_Y / 15) * 15,
+    z_bin = round(POSITION_Z / 15) * 15
   )
 
 # Local velocity statistics (XY projection)
@@ -765,7 +765,7 @@ p10 <- ggplot(local_stats_xy %>% filter(n >= 50),
 # Combine spatial plots
 spatial_combined <- (p9 + p10) +
   plot_annotation(
-    title = "Spatial Velocity Patterns",
+    title = "Spatial Velocity Patterns (15 um clusters)",
     subtitle = "Where nuclei move faster and in what direction",
     theme = theme(
       plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
@@ -798,7 +798,7 @@ cat("\n=== PART 8: MSD ANALYSIS ===\n")
 # Calculate MSD for each track
 calculate_msd <- function(df, max_lag = 30) {
   n <- nrow(df)
-  if (n < 5) return(NULL)
+  if (n < MIN_SPOTS) return(NULL)
 
   max_lag <- min(max_lag, n - 1)
 
@@ -818,7 +818,7 @@ calculate_msd <- function(df, max_lag = 30) {
 
 # Sample tracks for MSD (memory efficient)
 set.seed(42)
-sample_tracks <- sample(unique(spots_clean$TRACK_ID), min(1000, n_distinct(spots_clean$TRACK_ID)))
+sample_tracks <- sample(unique(spots_clean$TRACK_ID), min(10000, n_distinct(spots_clean$TRACK_ID)))
 
 msd_data <- spots_clean %>%
   filter(TRACK_ID %in% sample_tracks) %>%
@@ -873,7 +873,7 @@ p11 <- ggplot() +
   scale_y_log10() +
   labs(
     title = "Mean Squared Displacement Analysis",
-    subtitle = sprintf("α = %.2f (%s)", alpha,
+    subtitle = sprintf("alpha = %.2f (%s)", alpha,
                       ifelse(alpha < 0.8, "subdiffusive",
                              ifelse(alpha > 1.2, "superdiffusive", "diffusive"))),
     x = "Time lag (min, log scale)",
@@ -903,7 +903,7 @@ cat("\n=== PART 9: MOVEMENT TYPE CLASSIFICATION ===\n")
 tracks_classified <- tracks_clean %>%
   mutate(
     movement_type = case_when(
-      CONFINEMENT_RATIO > 0.7 & LINEARITY_OF_FORWARD_PROGRESSION > 0.5 ~ "Directed",
+      CONFINEMENT_RATIO > 0.6 & LINEARITY_OF_FORWARD_PROGRESSION > 0.5 ~ "Directed",
       CONFINEMENT_RATIO < 0.3 ~ "Confined",
       TRUE ~ "Random"
     ),
@@ -937,7 +937,7 @@ p12 <- ggplot(tracks_classified,
              alpha = 0.1, size = 0.5) +
   geom_point(data = tracks_classified %>% filter(movement_type != "Random"),
              alpha = 0.5, size = 1) +
-  geom_vline(xintercept = c(0.3, 0.7), linetype = "dashed", color = "grey50", linewidth = 0.3) +
+  geom_vline(xintercept = c(0.3, 0.6), linetype = "dashed", color = "grey50", linewidth = 0.3) +
   geom_hline(yintercept = 0.5, linetype = "dashed", color = "grey50", linewidth = 0.3) +
   scale_color_manual(values = movement_colors, breaks = c("Directed", "Random", "Confined")) +
   labs(
@@ -1207,7 +1207,7 @@ cat("\n=== PART 12B: COMPREHENSIVE 4D ANALYSIS ===\n")
 # -----------------------------------------------------------------------------
 
 # Create spatial bins (voxels) for local statistics
-SPATIAL_BIN_SIZE <- 30  # µm per bin
+SPATIAL_BIN_SIZE <- 15  # µm per bin
 TIME_BIN_SIZE <- 10     # minutes per time bin
 
 # Join velocity data with turning angle from spots_direction
@@ -1233,10 +1233,10 @@ spots_4d <- spots_velocity %>%
     # Z-layers (normalized to 0-1 scale)
     z_range = max(POSITION_Z, na.rm = TRUE) - min(POSITION_Z, na.rm = TRUE),
     z_normalized = (POSITION_Z - min(POSITION_Z, na.rm = TRUE)) / z_range,
-    z_layer = cut(z_normalized, breaks = c(0, 0.2, 0.4, 0.6, 0.8, 1.0),
-                  labels = c("Deep (0-20%)", "Mid-deep (20-40%)",
-                            "Middle (40-60%)", "Mid-surface (60-80%)",
-                            "Surface (80-100%)"),
+    z_layer = cut(z_normalized, breaks = c(0, 0.25, 0.5, 0.75, 1.0),
+                  labels = c("Deep (0-25%)", "Mid-deep (25-50%)",
+                             "Mid-surface (50-75%)",
+                            "Surface (75-100%)"),
                   include.lowest = TRUE)
   )
 
@@ -1623,7 +1623,7 @@ cor_vars <- track_spatial_summary %>%
   select(mean_x, mean_y, mean_z, start_time, mean_speed, mean_vz,
          speed_variability, CONFINEMENT_RATIO, LINEARITY_OF_FORWARD_PROGRESSION)
 
-projections_combinedcor_matrix <- cor(cor_vars, use = "pairwise.complete.obs")
+cor_matrix <- cor(cor_vars, use = "pairwise.complete.obs")
 
 # Plot correlation heatmap
 cor_long <- as.data.frame(cor_matrix) %>%

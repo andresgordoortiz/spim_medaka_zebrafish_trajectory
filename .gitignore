@@ -1,0 +1,9 @@
+.Rproj.user
+.Rhistory
+.Rprofile
+.RData*
+.Ruserdata
+analysis_output
+renv*
+rsconnect
+.DS_Store

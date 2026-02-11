@@ -2,6 +2,9 @@
 .Rhistory
 .Rprofile
 .RData*
+rsconnect
+*data*
+*tracking
 .Ruserdata
 analysis_output
 renv*

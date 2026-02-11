@@ -611,31 +611,84 @@ cat(sprintf("  Default:   %s tracks (for comparison)\n",
 
 cat("\n=== STEP 7: PLOTS ===\n")
 
-# ─── PLOT 1: Filter impact (marginal effects) ───────────────────────────────
+# ─── PLOT 1: Filter impact (marginal effects — line plots) ───────────────────
 
-marginal <- sweep_scored %>%
-  select(min_spots, max_mean_speed, max_max_speed, max_gaps, quality_pctile,
-         score, inst_speed_median, n_tracks) %>%
-  pivot_longer(cols = c(min_spots, max_mean_speed, max_max_speed, max_gaps, quality_pctile),
-               names_to = "param", values_to = "param_value") %>%
-  pivot_longer(cols = c(score, inst_speed_median, n_tracks),
-               names_to = "metric", values_to = "metric_value") %>%
+# Compute medians for each parameter value, averaging over others
+marginal_data <- bind_rows(
+  sweep_scored %>%
+    group_by(value = min_spots) %>%
+    summarise(inst_median = median(inst_speed_median), track_median = median(track_speed_median),
+              score_med = median(score), n_tracks_med = median(n_tracks), .groups = "drop") %>%
+    mutate(param = "min_spots"),
+  sweep_scored %>% filter(is.finite(max_mean_speed)) %>%
+    group_by(value = max_mean_speed) %>%
+    summarise(inst_median = median(inst_speed_median), track_median = median(track_speed_median),
+              score_med = median(score), n_tracks_med = median(n_tracks), .groups = "drop") %>%
+    mutate(param = "max_mean_speed"),
+  sweep_scored %>% filter(is.finite(max_max_speed)) %>%
+    group_by(value = max_max_speed) %>%
+    summarise(inst_median = median(inst_speed_median), track_median = median(track_speed_median),
+              score_med = median(score), n_tracks_med = median(n_tracks), .groups = "drop") %>%
+    mutate(param = "max_max_speed"),
+  sweep_scored %>% filter(is.finite(max_gaps)) %>%
+    group_by(value = max_gaps) %>%
+    summarise(inst_median = median(inst_speed_median), track_median = median(track_speed_median),
+              score_med = median(score), n_tracks_med = median(n_tracks), .groups = "drop") %>%
+    mutate(param = "max_gaps"),
+  sweep_scored %>%
+    group_by(value = quality_pctile * 100) %>%
+    summarise(inst_median = median(inst_speed_median), track_median = median(track_speed_median),
+              score_med = median(score), n_tracks_med = median(n_tracks), .groups = "drop") %>%
+    mutate(param = "quality_%_removed")
+) %>%
+  mutate(param = factor(param, levels = c("min_spots", "max_mean_speed", "max_max_speed",
+                                           "max_gaps", "quality_%_removed")))
+
+# Row 1: Speed metrics vs GT
+marginal_speed <- marginal_data %>%
+  pivot_longer(cols = c(inst_median, track_median),
+               names_to = "metric", values_to = "speed") %>%
   mutate(metric = recode(metric,
-                         score = "Score (lower = closer to GT)",
-                         inst_speed_median = "Inst. speed median (µm/min)",
-                         n_tracks = "N tracks retained"),
-         param = recode(param,
-                        min_spots = "Min spots", max_mean_speed = "Max mean speed",
-                        max_max_speed = "Max max speed", max_gaps = "Max gaps",
-                        quality_pctile = "Quality pctile"))
+                          "inst_median"  = "Inst. speed median",
+                          "track_median" = "Per-track speed median"))
 
-p1 <- ggplot(marginal, aes(x = factor(param_value), y = metric_value)) +
-  geom_boxplot(fill = "#2166AC", alpha = 0.3, outlier.size = 0.3, outlier.alpha = 0.1) +
-  facet_grid(metric ~ param, scales = "free") +
-  labs(title = "Marginal Effect of Each Filter Parameter",
-       x = "Parameter value", y = NULL) + theme_pipe(base_size = 8)
+p1_speed <- ggplot(marginal_speed, aes(x = value, y = speed, color = metric)) +
+  geom_line(linewidth = 1) + geom_point(size = 1.5) +
+  geom_hline(yintercept = GT$inst_speed_median, linetype = "dashed", color = "#4DAF4A", linewidth = 0.5) +
+  geom_hline(yintercept = GT$track_mean_speed_median, linetype = "dotted", color = "#4DAF4A", linewidth = 0.5) +
+  scale_color_manual(values = c("Inst. speed median" = "#2166AC", "Per-track speed median" = "#B2182B")) +
+  facet_wrap(~param, scales = "free_x", nrow = 1) +
+  labs(title = "How each filter parameter affects speed metrics",
+       subtitle = "Green dashed/dotted = ground truth targets",
+       x = "Parameter value", y = "Speed (µm/min)", color = NULL) +
+  theme_pipe(base_size = 9) + theme(strip.text = element_text(size = 8))
 
-ggsave(file.path(OUTPUT_DIR, "01_filter_impact.pdf"), p1, width = 18, height = 10)
+# Row 2: Score (lower = better match to GT)
+p1_score <- ggplot(marginal_data, aes(x = value, y = score_med)) +
+  geom_line(linewidth = 0.8, color = "#762A83") + geom_point(size = 1.5, color = "#762A83") +
+  facet_wrap(~param, scales = "free_x", nrow = 1) +
+  labs(title = "Score (lower = closer to GT)",
+       x = "Parameter value", y = "Score") +
+  theme_pipe(base_size = 9) + theme(strip.text = element_text(size = 8))
+
+# Row 3: Tracks retained
+p1_n <- ggplot(marginal_data, aes(x = value, y = n_tracks_med)) +
+  geom_line(linewidth = 0.8, color = "grey40") + geom_point(size = 1.5) +
+  scale_y_log10() +
+  facet_wrap(~param, scales = "free_x", nrow = 1) +
+  labs(title = "Tracks remaining after each filter",
+       x = "Parameter value", y = "N tracks (log scale)") +
+  theme_pipe(base_size = 9) + theme(strip.text = element_text(size = 8))
+
+p1 <- p1_speed / p1_score / p1_n +
+  plot_annotation(
+    title = "Filter Impact Analysis",
+    subtitle = "Which QC parameters affect speed, score, and data retention?",
+    theme = theme(plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+                  plot.subtitle = element_text(size = 10, hjust = 0.5, color = "grey50"))
+  )
+
+ggsave(file.path(OUTPUT_DIR, "01_filter_impact.pdf"), p1, width = 16, height = 10)
 cat("  Saved: 01_filter_impact.pdf\n")
 
 # ─── PLOT 2: 2D Heatmaps (separate color scales) ─────────────────────────────

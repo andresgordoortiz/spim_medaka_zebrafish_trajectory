@@ -216,16 +216,39 @@ p6 <- ggplot(speed_over_time, aes(x = time_bin_min, y = mean_speed)) +
   ) +
   theme_track()
 
+# Plot 7: Number of detected spots per developmental time
+# Shows how many nuclei are tracked at each time point
+spots_per_time <- spots_clean %>%
+  mutate(time_min = FRAME * FRAME_INTERVAL_MIN) %>%
+  group_by(time_min) %>%
+  summarise(n_spots = n(), .groups = "drop")
+
+p7 <- ggplot(spots_per_time, aes(x = time_min, y = n_spots)) +
+  geom_line(color = "#2166AC", linewidth = 0.6) +
+  geom_smooth(method = "loess", span = 0.3, color = "#B2182B", linewidth = 1, se = FALSE) +
+  labs(
+    title = "Detected Spots per Time Point",
+    subtitle = sprintf("Total frames: %d | Mean: %.0f spots/frame",
+                       n_distinct(spots_clean$FRAME), mean(spots_per_time$n_spots)),
+    x = "Time (min from start)",
+    y = "Number of spots"
+  ) +
+  theme_track()
+
+cat(sprintf("  Spots per frame — mean: %.0f, range: %d–%d\n",
+            mean(spots_per_time$n_spots),
+            min(spots_per_time$n_spots), max(spots_per_time$n_spots)))
+
 # Combine velocity plots
-velocity_combined <- (p5 + p6) +
+velocity_combined <- (p5 + p6) / (p7 + plot_spacer()) +
   plot_annotation(
-    title = "Nuclear Velocity Analysis",
+    title = "Nuclear Velocity & Detection Overview",
     theme = theme(
       plot.title = element_text(size = 14, face = "bold", hjust = 0.5)
     )
   )
 
-ggsave("analysis_output/01_velocity_analysis.pdf", velocity_combined, width = 18, height = 5)
+ggsave("analysis_output/01_velocity_analysis.pdf", velocity_combined, width = 18, height = 10)
 cat("  Saved: 01_velocity_analysis.pdf\n")
 
 # =============================================================================
@@ -1730,12 +1753,19 @@ fig_4d <- plot_ly(
     )
   ) %>%
   animation_opts(
-    frame = 500,  # ms per frame
-    transition = 300,
-    redraw = FALSE
+    frame = 800,    # ms per frame
+    transition = 0, # no smooth transition (required for scatter3d)
+    redraw = TRUE   # must redraw full scene for 3D plots
   ) %>%
   animation_slider(
-    currentvalue = list(prefix = "Time: ")
+    currentvalue = list(prefix = "Time: "),
+    steps = lapply(levels(viz_animated$time_bin), function(b) {
+      list(method = "animate",
+           args = list(list(b), list(mode = "immediate",
+                                      frame = list(duration = 800, redraw = TRUE),
+                                      transition = list(duration = 0))),
+           label = b)
+    })
   )
 
 htmlwidgets::saveWidget(fig_4d, "analysis_output/19_interactive_4d_timelapse.html",
@@ -2039,7 +2069,282 @@ for (i in 1:nrow(movetype_z_summary)) {
 }
 
 # =============================================================================
-# PART 13: FINAL SUMMARY
+# PART 13: CELL INGRESSION ANALYSIS
+# =============================================================================
+#
+# BIOLOGICAL INTERPRETATION:
+#   Cell ingression = cells that diverge from the local epiboly flow and move
+#   upward toward the margin. We detect this by:
+#     1. Computing the LOCAL BULK FLOW — mean velocity of nearby cells in a
+#        spatial neighborhood (~30 µm radius, same time frame)
+#     2. Computing each cell's RESIDUAL velocity = actual - local flow
+#     3. Flagging ingression when residual vy > 0 (upward deviation from flow)
+#        A positive residual vx (toward dorsal/interior) adds confidence.
+#
+#   This captures cells whose movement diverges from what their neighbors do,
+#   rather than using absolute direction (which may just reflect bulk flow).
+#
+#   Ingression is expected after a configurable onset time (default: 100 min).
+#   Z-layer breakdown reveals depth-dependent ingression patterns.
+#
+
+cat("\n=== PART 13: CELL INGRESSION ANALYSIS ===\n")
+
+# ── User parameters ──────────────────────────────────────────────────────────
+INGRESSION_ONSET_MIN <- 100     # time (min) from which ingression is expected
+NEIGHBOR_RADIUS_UM   <- 30      # spatial radius for local flow computation
+
+cat(sprintf("  Ingression onset: %.0f min | Neighbor radius: %.0f µm\n",
+            INGRESSION_ONSET_MIN, NEIGHBOR_RADIUS_UM))
+
+# --- 13.1: Compute local bulk flow and residual velocities ---
+
+cat("  Computing local bulk flow (this may take a moment)...\n")
+
+# Work with steps that have valid velocities
+steps <- spots_velocity %>%
+  filter(!is.na(vx), !is.na(vy)) %>%
+  mutate(time_min = FRAME * FRAME_INTERVAL_MIN)
+
+# For each frame, compute local flow using spatial binning (fast approximation)
+# Instead of O(n²) per-point neighbor search, we bin into spatial tiles
+BIN_SIZE <- NEIGHBOR_RADIUS_UM  # bin matches radius
+steps <- steps %>%
+  mutate(x_bin = floor(POSITION_X / BIN_SIZE),
+         y_bin = floor(POSITION_Y / BIN_SIZE),
+         z_bin = floor(POSITION_Z / BIN_SIZE))
+
+# Local flow = mean velocity in surrounding bins (3×3×3 neighborhood)
+local_flow <- steps %>%
+  group_by(FRAME, x_bin, y_bin, z_bin) %>%
+  summarise(flow_vx = mean(vx, na.rm = TRUE),
+            flow_vy = mean(vy, na.rm = TRUE),
+            flow_n  = n(), .groups = "drop")
+
+# Expand to 3×3×3 neighborhood: each bin gets the average of its ±1 neighbors
+# This smooths the flow and approximates a circular radius
+neighbor_offsets <- expand.grid(dx = -1:1, dy = -1:1, dz = -1:1)
+
+local_flow_smooth <- local_flow %>%
+  crossing(neighbor_offsets) %>%
+  mutate(nb_x = x_bin + dx, nb_y = y_bin + dy, nb_z = z_bin + dz) %>%
+  group_by(FRAME, nb_x, nb_y, nb_z) %>%
+  summarise(flow_vx = weighted.mean(flow_vx, flow_n, na.rm = TRUE),
+            flow_vy = weighted.mean(flow_vy, flow_n, na.rm = TRUE),
+            flow_n  = sum(flow_n), .groups = "drop") %>%
+  rename(x_bin = nb_x, y_bin = nb_y, z_bin = nb_z)
+
+# Join back: each step gets its local flow
+steps <- steps %>%
+  left_join(local_flow_smooth, by = c("FRAME", "x_bin", "y_bin", "z_bin"),
+            suffix = c("", "_flow")) %>%
+  mutate(
+    # Residual = actual velocity minus local bulk flow
+    res_vx = vx - flow_vx,
+    res_vy = vy - flow_vy,
+    res_speed = sqrt(res_vx^2 + res_vy^2),
+    # Ingression: residual vy > 0 (primary) with optional +X confidence
+    is_ingressing = res_vy > 0,
+    # Confidence score: how much the residual points toward +Y and +X
+    ingression_confidence = case_when(
+      res_vy > 0 & res_vx > 0 ~ "High (+Y, +X)",
+      res_vy > 0 & res_vx <= 0 ~ "Moderate (+Y only)",
+      TRUE ~ "Not ingressing"
+    )
+  )
+
+cat(sprintf("  Computed residual velocities for %s steps\n",
+            format(nrow(steps), big.mark = ",")))
+
+# Assign Z layers
+z_breaks <- quantile(steps$POSITION_Z, probs = seq(0, 1, length.out = 6), na.rm = TRUE)
+z_labels <- paste0("Z", 1:5, " [",
+                    round(z_breaks[1:5]), "–",
+                    round(z_breaks[2:6]), " µm]")
+
+steps <- steps %>%
+  mutate(z_layer = cut(POSITION_Z, breaks = z_breaks, labels = z_labels,
+                       include.lowest = TRUE)) %>%
+  filter(!is.na(z_layer))
+
+# Overall ingression summary
+overall_pct <- mean(steps$is_ingressing) * 100
+high_conf_pct <- mean(steps$ingression_confidence == "High (+Y, +X)") * 100
+cat(sprintf("  Overall: %.1f%% steps ingressing (%.1f%% high confidence)\n",
+            overall_pct, high_conf_pct))
+
+# --- 13.2: Ingression rate over time, by Z layer ---
+
+ingression_by_z_time <- steps %>%
+  mutate(time_bin_min = floor(time_min / 10) * 10) %>%
+  group_by(time_bin_min, z_layer) %>%
+  summarise(pct_ingressing = mean(is_ingressing) * 100,
+            pct_high_conf  = mean(ingression_confidence == "High (+Y, +X)") * 100,
+            n = n(), .groups = "drop")
+
+p_ingress_time_z <- ggplot(ingression_by_z_time,
+                            aes(x = time_bin_min, y = pct_ingressing, color = z_layer)) +
+  geom_line(linewidth = 0.5, alpha = 0.4) +
+  geom_smooth(method = "loess", span = 0.4, se = FALSE, linewidth = 1) +
+  geom_vline(xintercept = INGRESSION_ONSET_MIN, linetype = "dashed", color = "grey40") +
+  annotate("text", x = INGRESSION_ONSET_MIN + 2,
+           y = max(ingression_by_z_time$pct_ingressing, na.rm = TRUE) * 0.95,
+           label = sprintf("onset (%d min)", INGRESSION_ONSET_MIN),
+           hjust = 0, size = 3, color = "grey40") +
+  scale_color_viridis_d(option = "C", end = 0.9) +
+  labs(title = "Ingression Rate Over Developmental Time by Z Layer",
+       subtitle = "% of steps with residual vy > 0 (deviating upward from local flow)",
+       x = "Time (min from start)", y = "% steps ingressing",
+       color = "Z layer") +
+  theme_track() + theme(legend.position = "right")
+
+# --- 13.3: High-confidence ingression (residual +Y AND +X) over time ---
+
+p_ingress_conf <- ggplot(ingression_by_z_time,
+                          aes(x = time_bin_min, y = pct_high_conf, color = z_layer)) +
+  geom_line(linewidth = 0.5, alpha = 0.4) +
+  geom_smooth(method = "loess", span = 0.4, se = FALSE, linewidth = 1) +
+  geom_vline(xintercept = INGRESSION_ONSET_MIN, linetype = "dashed", color = "grey40") +
+  scale_color_viridis_d(option = "C", end = 0.9) +
+  labs(title = "High-Confidence Ingression (+Y and +X residual)",
+       subtitle = "Cells deviating upward AND inward from local epiboly flow",
+       x = "Time (min from start)", y = "% steps (high confidence)",
+       color = "Z layer") +
+  theme_track() + theme(legend.position = "right")
+
+# --- 13.4: Per-track ingression (tracks active after onset) ---
+
+track_ingression <- steps %>%
+  filter(time_min >= INGRESSION_ONSET_MIN) %>%
+  group_by(TRACK_ID) %>%
+  filter(n() >= 3) %>%
+  summarise(
+    x_start = first(POSITION_X), y_start = first(POSITION_Y), z_start = first(POSITION_Z),
+    x_end   = last(POSITION_X),  y_end   = last(POSITION_Y),
+    mean_res_vx = mean(res_vx, na.rm = TRUE),
+    mean_res_vy = mean(res_vy, na.rm = TRUE),
+    pct_steps_ingress = mean(is_ingressing) * 100,
+    pct_high_conf = mean(ingression_confidence == "High (+Y, +X)") * 100,
+    mean_speed = mean(inst_speed_um_min, na.rm = TRUE),
+    n_steps = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    is_ingressing_track = pct_steps_ingress > 60,  # >60% of steps deviate upward
+    z_layer = cut(z_start, breaks = z_breaks, labels = z_labels, include.lowest = TRUE)
+  ) %>%
+  left_join(tracks_classified %>% select(TRACK_ID, movement_type),
+            by = "TRACK_ID")
+
+# Track-level summary
+ingression_summary <- track_ingression %>%
+  filter(!is.na(z_layer)) %>%
+  group_by(z_layer) %>%
+  summarise(n_total = n(),
+            n_ingressing = sum(is_ingressing_track),
+            pct = n_ingressing / n_total * 100, .groups = "drop")
+
+cat(sprintf("  Tracks active after %d min: %d\n",
+            INGRESSION_ONSET_MIN, nrow(track_ingression)))
+cat("  Track-level ingression by Z layer (>60%% of steps deviate upward):\n")
+for (i in 1:nrow(ingression_summary)) {
+  cat(sprintf("    %s: %d / %d ingressing (%.1f%%)\n",
+              ingression_summary$z_layer[i],
+              ingression_summary$n_ingressing[i],
+              ingression_summary$n_total[i],
+              ingression_summary$pct[i]))
+}
+
+# --- 13.5: Residual velocity field (post-onset), faceted by Z ---
+
+residual_field <- steps %>%
+  filter(time_min >= INGRESSION_ONSET_MIN) %>%
+  mutate(x_bin = round(POSITION_X / 25) * 25,
+         y_bin = round(POSITION_Y / 25) * 25) %>%
+  group_by(x_bin, y_bin, z_layer) %>%
+  summarise(mean_res_vx = mean(res_vx, na.rm = TRUE),
+            mean_res_vy = mean(res_vy, na.rm = TRUE),
+            pct_ingress = mean(is_ingressing) * 100,
+            n = n(), .groups = "drop") %>%
+  filter(n >= 3)
+
+p_ingress_field <- ggplot(residual_field, aes(x = x_bin, y = y_bin)) +
+  geom_tile(aes(fill = pct_ingress), alpha = 0.7) +
+  geom_segment(aes(xend = x_bin + mean_res_vx * 8, yend = y_bin + mean_res_vy * 8),
+               arrow = arrow(length = unit(1, "mm")), linewidth = 0.25, alpha = 0.6) +
+  scale_fill_gradient2(low = "#2166AC", mid = "grey95", high = "#B2182B",
+                        midpoint = 50, name = "% ingressing") +
+  facet_wrap(~z_layer, nrow = 1) +
+  coord_fixed() +
+  labs(title = sprintf("Residual Velocity Field (≥ %d min)", INGRESSION_ONSET_MIN),
+       subtitle = "Arrows = residual velocity (actual − local flow) | Color = ingression %",
+       x = "X (µm)", y = "Y (µm)") +
+  theme_track(base_size = 8) + theme(strip.text = element_text(size = 7))
+
+# --- 13.6: Spatial map of ingressing tracks, by Z ---
+
+p_ingress_map <- ggplot(track_ingression %>% filter(!is.na(z_layer)),
+                         aes(x = x_start, y = y_start)) +
+  geom_point(data = track_ingression %>% filter(!is_ingressing_track, !is.na(z_layer)),
+             color = "grey80", alpha = 0.3, size = 0.5) +
+  geom_point(data = track_ingression %>% filter(is_ingressing_track, !is.na(z_layer)),
+             color = "#B2182B", alpha = 0.5, size = 0.8) +
+  geom_segment(data = track_ingression %>% filter(is_ingressing_track, !is.na(z_layer)),
+               aes(xend = x_end, yend = y_end),
+               arrow = arrow(length = unit(0.8, "mm")),
+               color = "#B2182B", alpha = 0.25, linewidth = 0.2) +
+  facet_wrap(~z_layer, nrow = 1) +
+  coord_fixed() +
+  labs(title = "Ingressing Tracks (red) by Z Layer",
+       subtitle = "Track classified as ingressing if >60% of steps have upward residual velocity",
+       x = "X (µm)", y = "Y (µm)") +
+  theme_track(base_size = 8) + theme(strip.text = element_text(size = 7))
+
+# --- 13.7: Ingression speed & bar by Z layer ---
+
+p_ingress_speed_z <- ggplot(track_ingression %>% filter(is_ingressing_track, !is.na(z_layer)),
+                             aes(x = z_layer, y = mean_speed, fill = z_layer)) +
+  geom_violin(alpha = 0.5, draw_quantiles = c(0.25, 0.5, 0.75)) +
+  geom_jitter(width = 0.15, alpha = 0.2, size = 0.5) +
+  scale_fill_viridis_d(option = "C", end = 0.9, guide = "none") +
+  labs(title = "Ingressing Cell Speed by Z Layer",
+       x = NULL, y = "Mean speed (µm/min)") +
+  theme_track() + theme(axis.text.x = element_text(size = 7))
+
+p_ingress_bar <- ggplot(ingression_summary, aes(x = z_layer, y = pct, fill = pct)) +
+  geom_col() +
+  geom_text(aes(label = sprintf("%.0f%%\n(%d/%d)", pct, n_ingressing, n_total)),
+            vjust = -0.2, size = 2.8) +
+  scale_fill_gradient(low = "grey80", high = "#B2182B", guide = "none") +
+  labs(title = sprintf("Ingression Rate by Depth (after %d min)", INGRESSION_ONSET_MIN),
+       x = "Z layer", y = "% ingressing tracks") +
+  ylim(0, max(ingression_summary$pct, na.rm = TRUE) * 1.2) +
+  theme_track() + theme(axis.text.x = element_text(size = 7))
+
+# Combine ingression plots
+ingression_combined <- (p_ingress_time_z + p_ingress_conf) /
+                       p_ingress_field /
+                       p_ingress_map /
+                       (p_ingress_speed_z + p_ingress_bar) +
+  plot_annotation(
+    title = "Cell Ingression Analysis (Flow-Residual Method)",
+    subtitle = sprintf("Ingression = upward deviation from local bulk flow | Onset: %d min | Neighbor radius: %d µm",
+                        INGRESSION_ONSET_MIN, NEIGHBOR_RADIUS_UM),
+    theme = theme(
+      plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(size = 10, hjust = 0.5, color = "grey50")
+    )
+  )
+
+ggsave("analysis_output/24_ingression.pdf", ingression_combined, width = 18, height = 24)
+cat("  Saved: 24_ingression.pdf\n")
+
+# Export ingression data
+write_csv(track_ingression, "analysis_output/track_ingression.csv")
+cat("  Exported: track_ingression.csv\n")
+
+# =============================================================================
+# PART 14: FINAL SUMMARY
 # =============================================================================
 
 cat("\n")
@@ -2069,6 +2374,17 @@ cat(sprintf("  MSD exponent (α): %.2f → %s\n", alpha,
             ifelse(alpha < 0.8, "subdiffusive (confined)",
                    ifelse(alpha > 1.2, "superdiffusive (directed)", "normal diffusion"))))
 
+cat("\nCELL INGRESSION (after ", INGRESSION_ONSET_MIN, " min, flow-residual method):\n", sep = "")
+cat(sprintf("  Overall: %.1f%% steps ingressing | %.1f%% high confidence (+Y & +X)\n",
+            overall_pct, high_conf_pct))
+for (i in 1:nrow(ingression_summary)) {
+  cat(sprintf("  %s: %d/%d tracks ingressing (%.1f%%)\n",
+              ingression_summary$z_layer[i],
+              ingression_summary$n_ingressing[i],
+              ingression_summary$n_total[i],
+              ingression_summary$pct[i]))
+}
+
 cat("\nOUTPUT FILES:\n")
 cat("  Velocity & Biological Analysis:\n")
 cat("    analysis_output/01_velocity_analysis.pdf\n")
@@ -2097,6 +2413,8 @@ cat("    analysis_output/20_persistence.pdf\n")
 cat("    analysis_output/21_phase_space.pdf\n")
 cat("    analysis_output/22_density_vs_speed.pdf\n")
 cat("    analysis_output/23_neighbor_correlation.pdf\n")
+cat("  Cell Ingression:\n")
+cat("    analysis_output/24_ingression.pdf\n")
 cat("  Data Exports:\n")
 
 # Save processed data
@@ -2106,6 +2424,7 @@ cat("    analysis_output/tracks_analyzed.csv\n")
 cat("    analysis_output/spots_with_velocity.csv\n")
 cat("    analysis_output/tracks_3d_visualization.csv\n")
 cat("    analysis_output/track_centroids_3d.csv\n")
+cat("    analysis_output/track_ingression.csv\n")
 
 cat("\n", strrep("=", 70), "\n")
 cat("ANALYSIS COMPLETE\n")

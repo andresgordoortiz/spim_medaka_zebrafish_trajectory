@@ -1,8 +1,17 @@
 # =============================================================================
 # TrackMate 3D Cell Movement Analysis - Zebrafish/Medaka Embryo Nuclei Tracking
 # =============================================================================
-# Analysis pipeline for quality control, outlier detection, and characterization
-# of nuclear movement during embryonic development
+#
+# This is Step 3 of the production pipeline:
+#   Step 0: TrackMate → export ALL tracks (no filters)
+#   Step 1: orientation_interactive.R → orient embryo → oriented CSVs
+#   Step 2: trackmate_filter_and_validate.R → filter + validate → filtered CSVs
+# → Step 3: THIS SCRIPT → full biological analysis
+#
+# INPUT:
+#   - analysis_output/filtered_spots.csv   (from Step 2)
+#   - analysis_output/filtered_tracks.csv  (from Step 2)
+#   Data is already oriented and QC-filtered. No reorientation or filtering here.
 #
 # BIOLOGICAL CONTEXT:
 #   - Tracking nuclei in developing zebrafish/medaka embryos
@@ -31,39 +40,6 @@ library(htmlwidgets)
 FRAME_INTERVAL_SEC <- 30  # Each frame is 30 seconds
 FRAME_INTERVAL_MIN <- 0.5 # 30 sec = 0.5 min
 
-# =============================================================================
-# COORDINATE TRANSFORMATION OPTIONS
-# =============================================================================
-#
-# Microscopy coordinate systems may differ from image display conventions.
-# Use these options to flip/mirror coordinates to match your original images.
-#
-# Set to TRUE to flip the corresponding axis:
-#   - FLIP_X: mirrors left-right (multiplies X by -1)
-#   - FLIP_Y: mirrors top-bottom (multiplies Y by -1)
-#   - FLIP_Z: inverts depth (multiplies Z by -1)
-#   - SWAP_XY: swaps X and Y axes (rotates 90°)
-#
-# Common scenarios:
-#   - Image appears horizontally mirrored: set FLIP_X = TRUE
-#   - Image appears vertically flipped: set FLIP_Y = TRUE
-#   - Both mirrored and flipped: set FLIP_X = TRUE and FLIP_Y = TRUE
-#
-
-FLIP_X <- FALSE   # Set TRUE if image is horizontally mirrored
-FLIP_Y <- FALSE   # Set TRUE if image is vertically flipped
-FLIP_Z <- FALSE   # Set TRUE if Z-axis is inverted
-SWAP_XY <- FALSE  # Set TRUE to swap X and Y axes
-
-
-# Color palette for track categories
-track_colors <- c(
-  "High quality" = "#2166AC",
-  "Medium quality" = "#B2182B",
-  "Low quality" = "#762A83",
-  "Filtered" = "grey85"
-)
-
 # Movement type colors
 movement_colors <- c(
   "Directed" = "#2166AC",
@@ -90,385 +66,50 @@ theme_track <- function(base_size = 10) {
 }
 
 # =============================================================================
-# PART 1: DATA LOADING AND PREPROCESSING
+# PART 1: DATA LOADING
 # =============================================================================
 #
-# INTERPRETATION:
-#   TrackMate outputs spots (individual detections) and tracks (linked spots).
-#   Each spot is a nucleus detected at a specific (X, Y, Z, T) position.
-#   Tracks connect the same nucleus across time frames.
-#
-#   Quality control is essential because:
-#   - False detections (noise, debris) create spurious short tracks
-#   - Tracking errors (ID swaps) create unrealistically fast movements
-#   - Dividing cells may cause track splits/merges
+# Reads the pre-filtered, pre-oriented CSVs from trackmate_filter_and_validate.R.
+# No additional filtering or coordinate transforms are applied.
 #
 
 cat("\n=== PART 1: DATA LOADING ===\n")
 
-# Load data - skipping TrackMate metadata rows
-spots_raw <- read_csv("oriented_spots.csv", show_col_types = FALSE)[-c(1:3),]
-tracks_raw <- read_csv("oriented_tracks.csv", show_col_types = FALSE)[-c(1:3),]
+INPUT_DIR <- "analysis_output"
+OUTPUT_DIR <- "analysis_output"
+if (!dir.exists(OUTPUT_DIR)) dir.create(OUTPUT_DIR, recursive = TRUE)
 
-# Convert to numeric
-spots <- spots_raw %>%
-  mutate(across(c(ID, TRACK_ID, QUALITY, POSITION_X, POSITION_Y, POSITION_Z,
-                  POSITION_T, FRAME, RADIUS, MEAN_INTENSITY_CH1,
-                  MEDIAN_INTENSITY_CH1, MIN_INTENSITY_CH1, MAX_INTENSITY_CH1,
-                  TOTAL_INTENSITY_CH1, STD_INTENSITY_CH1, CONTRAST_CH1, SNR_CH1),
+spots_clean <- read_csv(file.path(INPUT_DIR, "filtered_spots.csv"), show_col_types = FALSE) %>%
+  mutate(across(c(ID, TRACK_ID, POSITION_X, POSITION_Y, POSITION_Z, FRAME),
                 ~as.numeric(.))) %>%
   filter(!is.na(TRACK_ID))
 
-tracks <- tracks_raw %>%
-  mutate(across(-LABEL, ~as.numeric(.)))
+tracks_clean <- read_csv(file.path(INPUT_DIR, "filtered_tracks.csv"), show_col_types = FALSE) %>%
+  mutate(across(-LABEL, ~suppressWarnings(as.numeric(.))))
 
-# =============================================================================
-# Apply coordinate transformations if requested
-# =============================================================================
+# Ensure converted speed columns exist (they should from filter script)
+SPEED_CONVERSION_FACTOR <- 60 / FRAME_INTERVAL_SEC  # 2 for 30-sec frames
 
-if (FLIP_X || FLIP_Y || FLIP_Z || SWAP_XY) {
-  cat("Applying coordinate transformations:\n")
-  if (FLIP_X) cat("  - Flipping X axis (horizontal mirror)\n")
-  if (FLIP_Y) cat("  - Flipping Y axis (vertical flip)\n")
-  if (FLIP_Z) cat("  - Flipping Z axis (depth inversion)\n")
-  if (SWAP_XY) cat("  - Swapping X and Y axes\n")
-
-  # Store original coordinates for reference
-  spots <- spots %>%
-    mutate(
-      POSITION_X_ORIG = POSITION_X,
-      POSITION_Y_ORIG = POSITION_Y,
-      POSITION_Z_ORIG = POSITION_Z
-    )
-
-  # Apply transformations
-  if (SWAP_XY) {
-    spots <- spots %>%
-      mutate(
-        temp_x = POSITION_X,
-        POSITION_X = POSITION_Y,
-        POSITION_Y = temp_x
-      ) %>%
-      select(-temp_x)
-  }
-
-  if (FLIP_X) spots <- spots %>% mutate(POSITION_X = -POSITION_X)
-  if (FLIP_Y) spots <- spots %>% mutate(POSITION_Y = -POSITION_Y)
-  if (FLIP_Z) spots <- spots %>% mutate(POSITION_Z = -POSITION_Z)
-
-  # Shift to positive coordinates (optional, for cleaner visualization)
-  spots <- spots %>%
-    mutate(
-      POSITION_X = POSITION_X - min(POSITION_X, na.rm = TRUE),
-      POSITION_Y = POSITION_Y - min(POSITION_Y, na.rm = TRUE),
-      POSITION_Z = POSITION_Z - min(POSITION_Z, na.rm = TRUE)
-    )
-
-  cat("\n")
+if (!"SPEED_MEAN_UM_MIN" %in% names(tracks_clean)) {
+  tracks_clean <- tracks_clean %>%
+    mutate(SPEED_MEAN_UM_MIN   = TRACK_MEAN_SPEED   * SPEED_CONVERSION_FACTOR,
+           SPEED_MAX_UM_MIN    = TRACK_MAX_SPEED    * SPEED_CONVERSION_FACTOR,
+           SPEED_MEDIAN_UM_MIN = TRACK_MEDIAN_SPEED * SPEED_CONVERSION_FACTOR)
+}
+if (!"DURATION_MIN" %in% names(tracks_clean)) {
+  tracks_clean <- tracks_clean %>%
+    mutate(DURATION_MIN = TRACK_DURATION * FRAME_INTERVAL_MIN)
 }
 
-# =============================================================================
-# CONVERT TIME UNITS: frames → real time
-# =============================================================================
-
-tracks <- tracks %>%
-  mutate(
-    # Convert duration from frames to minutes
-    DURATION_MIN = TRACK_DURATION * FRAME_INTERVAL_MIN,
-
-    # Convert speeds from µm/frame to µm/min
-    # Original: distance moved per frame; multiply by frames/min
-    SPEED_MEAN_UM_MIN = TRACK_MEAN_SPEED * (60 / FRAME_INTERVAL_SEC),
-    SPEED_MAX_UM_MIN = TRACK_MAX_SPEED * (60 / FRAME_INTERVAL_SEC),
-    SPEED_MEDIAN_UM_MIN = TRACK_MEDIAN_SPEED * (60 / FRAME_INTERVAL_SEC)
-  )
-
-cat("Data Summary:\n")
-cat("  Total tracks:", nrow(tracks), "\n")
-cat("  Total spots:", nrow(spots), "\n")
-cat("  Time covered:", max(spots$FRAME, na.rm = TRUE) * FRAME_INTERVAL_MIN, "min\n")
-cat("  Frame interval:", FRAME_INTERVAL_SEC, "sec\n\n")
+cat(sprintf("  Loaded %s tracks, %s spots (pre-filtered & oriented)\n",
+            format(nrow(tracks_clean), big.mark = ","),
+            format(nrow(spots_clean), big.mark = ",")))
+cat(sprintf("  Time covered: %.1f min\n", max(spots_clean$FRAME, na.rm = TRUE) * FRAME_INTERVAL_MIN))
+cat(sprintf("  Per-track mean speed median: %.2f µm/min\n",
+            median(tracks_clean$SPEED_MEAN_UM_MIN, na.rm = TRUE)))
 
 # =============================================================================
-# PART 2: DATA EXPLORATION
-# =============================================================================
-#
-# INTERPRETATION:
-#   Understanding the distribution of track properties helps identify:
-#   - Normal range of nuclear movement speeds
-#   - Typical track durations (how long nuclei can be followed)
-#   - Potential tracking artifacts (outliers)
-#
-
-cat("=== PART 2: DATA EXPLORATION ===\n\n")
-
-# Summary with converted units
-track_summary <- tracks %>%
-  summarise(
-    # Duration in minutes
-    duration_min_median = median(DURATION_MIN, na.rm = TRUE),
-    duration_min_mean = mean(DURATION_MIN, na.rm = TRUE),
-    duration_min_max = max(DURATION_MIN, na.rm = TRUE),
-
-    # Speed in µm/min
-    speed_um_min_median = median(SPEED_MEAN_UM_MIN, na.rm = TRUE),
-    speed_um_min_mean = mean(SPEED_MEAN_UM_MIN, na.rm = TRUE),
-    speed_um_min_max = max(SPEED_MAX_UM_MIN, na.rm = TRUE),
-
-    # Displacement and distance
-    displacement_median = median(TRACK_DISPLACEMENT, na.rm = TRUE),
-    total_dist_median = median(TOTAL_DISTANCE_TRAVELED, na.rm = TRUE),
-
-    # Confinement
-    confinement_median = median(CONFINEMENT_RATIO, na.rm = TRUE),
-
-    # Track length
-    n_spots_median = median(NUMBER_SPOTS, na.rm = TRUE)
-  )
-
-cat("Track Statistics (converted to real time):\n")
-cat(sprintf("  Median duration: %.1f min (%.0f frames)\n",
-            track_summary$duration_min_median,
-            track_summary$duration_min_median / FRAME_INTERVAL_MIN))
-cat(sprintf("  Median speed: %.2f µm/min\n", track_summary$speed_um_min_median))
-cat(sprintf("  Median displacement: %.1f µm\n", track_summary$displacement_median))
-cat(sprintf("  Median confinement ratio: %.2f\n", track_summary$confinement_median))
-cat(sprintf("  Median track length: %.0f spots\n\n", track_summary$n_spots_median))
-
-# =============================================================================
-# PART 3: QUALITY CONTROL AND FILTERING
-# =============================================================================
-#
-# BIOLOGICAL RATIONALE FOR FILTERS:
-#
-# 1. MINIMUM TRACK LENGTH (≥5 spots = ≥2.5 min):
-#    - Very short tracks are likely noise or transient detections
-#    - Need several timepoints to calculate meaningful velocities
-#    - 2.5 min is enough to capture directed movement vs random diffusion
-#
-# 2. MAXIMUM SPEED (≤10 µm/min):
-#    - Even fast-migrating cells rarely exceed 10 µm/min
-#    - Higher speeds usually indicate tracking errors (ID swaps)
-#    - Nuclear "jumps" between frames = linking errors
-#
-# 3. MINIMUM DURATION (≥1.5 min = 3 frames):
-#    - Single-frame "tracks" have no velocity information
-#    - Need multiple timepoints to assess movement pattern
-#
-# 4. QUALITY SCORE (TrackMate's detection confidence):
-#    - Low quality = dim/blurry nuclei, less reliable detection
-#    - Keep top 90% by quality
-#
-
-cat("=== PART 3: QUALITY CONTROL ===\n\n")
-
-
-
-
-# Define biologically sensible thresholds
-MIN_SPOTS <- 5
-MIN_DURATION_MIN <- 3
-QUALITY_PERCENTILE <- 0.10  # Remove bottom 10% quality
-MEAN_SPEED_THRESHOLD <- 5    # µm/min - tracks with MEAN above this are likely errors
-MEDIAN_SPEED_THRESHOLD <- 5   # µm/min - more robust estimate
-FAST_FRACTION_THRESHOLD <- 0.2 # Remove if >50% of steps are too fast
-STEP_SPEED_THRESHOLD <- 5     # µm/min - what counts as a "fast" step
-
-quality_threshold <- quantile(tracks$TRACK_MEAN_QUALITY, QUALITY_PERCENTILE, na.rm = TRUE)
-
-# First, calculate per-track speed statistics from spots
-# This gives us finer control than just using TRACK_MAX_SPEED
-spot_speed_stats <- spots %>%
-  arrange(TRACK_ID, FRAME) %>%
-  group_by(TRACK_ID) %>%
-  mutate(
-    dx = POSITION_X - lag(POSITION_X),
-    dy = POSITION_Y - lag(POSITION_Y),
-    dz = POSITION_Z - lag(POSITION_Z),
-    dt_frames = FRAME - lag(FRAME),
-    step_dist = sqrt(dx^2 + dy^2 + dz^2),
-    step_speed_um_min = (step_dist / dt_frames) * (60 / FRAME_INTERVAL_SEC)
-  ) %>%
-  filter(!is.na(step_speed_um_min) & dt_frames > 0) %>%
-  summarise(
-    n_steps = n(),
-    mean_step_speed = mean(step_speed_um_min, na.rm = TRUE),
-    median_step_speed = median(step_speed_um_min, na.rm = TRUE),
-    max_step_speed = max(step_speed_um_min, na.rm = TRUE),
-    sd_step_speed = sd(step_speed_um_min, na.rm = TRUE),
-    pct_fast_steps = mean(step_speed_um_min > STEP_SPEED_THRESHOLD, na.rm = TRUE),
-    .groups = "drop"
-  )
-
-# Merge speed stats back to tracks
-tracks <- tracks %>%
-  left_join(spot_speed_stats, by = "TRACK_ID")
-
-# Flag problematic tracks
-tracks <- tracks %>%
-  mutate(
-    # Individual flags
-    flag_too_short = NUMBER_SPOTS < MIN_SPOTS,
-    flag_too_brief = DURATION_MIN < MIN_DURATION_MIN,
-
-    # NEW: Consistently too fast (not just one fast moment)
-    flag_consistently_fast = (
-      mean_step_speed > MEAN_SPEED_THRESHOLD |
-      median_step_speed > MEDIAN_SPEED_THRESHOLD |
-      pct_fast_steps > FAST_FRACTION_THRESHOLD
-    ),
-    # Replace NA with FALSE for tracks with too few steps
-    flag_consistently_fast = ifelse(is.na(flag_consistently_fast), FALSE, flag_consistently_fast),
-
-    flag_low_quality = TRACK_MEAN_QUALITY < quality_threshold,
-
-    # Summary
-    n_flags = flag_too_short + flag_too_brief + flag_consistently_fast + flag_low_quality,
-    passes_qc = n_flags == 0
-  )
-
-# Summary of flags
-cat("Quality Control Flags:\n")
-cat(sprintf("  Too short (<%d spots): %d tracks (%.1f%%)\n",
-            MIN_SPOTS, sum(tracks$flag_too_short), 100 * mean(tracks$flag_too_short)))
-cat(sprintf("  Too brief (<%.1f min): %d tracks (%.1f%%)\n",
-            MIN_DURATION_MIN, sum(tracks$flag_too_brief), 100 * mean(tracks$flag_too_brief)))
-cat(sprintf("  Consistently too fast: %d tracks (%.1f%%)\n",
-            sum(tracks$flag_consistently_fast, na.rm = TRUE),
-            100 * mean(tracks$flag_consistently_fast, na.rm = TRUE)))
-cat("    (mean >%.0f OR median >%.0f OR >%.0f%% steps >%.0f µm/min)\n",
-    MEAN_SPEED_THRESHOLD, MEDIAN_SPEED_THRESHOLD,
-    100*FAST_FRACTION_THRESHOLD, STEP_SPEED_THRESHOLD)
-cat(sprintf("  Low quality (bottom 10%%): %d tracks (%.1f%%)\n",
-            sum(tracks$flag_low_quality), 100 * mean(tracks$flag_low_quality)))
-
-# Show what we're keeping vs filtering for fast tracks specifically
-cat("\nSpeed filtering details:\n")
-cat(sprintf("  Tracks with occasional fast burst (kept): %d\n",
-            sum(!tracks$flag_consistently_fast & tracks$max_step_speed > STEP_SPEED_THRESHOLD, na.rm = TRUE)))
-cat(sprintf("  Tracks consistently fast (removed): %d\n",
-            sum(tracks$flag_consistently_fast, na.rm = TRUE)))
-
-# Apply filters
-tracks_clean <- tracks %>% filter(passes_qc)
-spots_clean <- spots %>% filter(TRACK_ID %in% tracks_clean$TRACK_ID)
-
-cat(sprintf("\nFiltering Results:\n"))
-cat(sprintf("  Original: %d tracks, %d spots\n", nrow(tracks), nrow(spots)))
-cat(sprintf("  Filtered: %d tracks (%.1f%%), %d spots\n",
-            nrow(tracks_clean), 100 * nrow(tracks_clean) / nrow(tracks), nrow(spots_clean)))
-
-# =============================================================================
-# PART 4: QUALITY CONTROL VISUALIZATIONS
-# =============================================================================
-#
-# INTERPRETATION:
-#   These plots help verify that our filtering is sensible:
-#   - Distribution shifts show what we're removing
-#   - Outliers in speed plot = tracking errors
-#   - Duration vs spots should be linear (lost tracks = deviations)
-#
-
-cat("\n=== PART 4: QC VISUALIZATIONS ===\n")
-
-if (!dir.exists("analysis_output")) dir.create("analysis_output")
-
-# Plot 1: Track length distribution (before/after)
-p1 <- ggplot() +
-  geom_histogram(data = tracks, aes(x = NUMBER_SPOTS, fill = "Before filtering"),
-                 alpha = 0.5, bins = 50) +
-  geom_histogram(data = tracks_clean, aes(x = NUMBER_SPOTS, fill = "After filtering"),
-                 alpha = 0.5, bins = 50) +
-  geom_vline(xintercept = MIN_SPOTS, linetype = "dashed", color = "grey50", linewidth = 0.3) +
-  scale_fill_manual(values = c("Before filtering" = "grey50", "After filtering" = "#2166AC")) +
-  scale_x_log10() +
-  labs(
-    title = "Track Length Distribution",
-    subtitle = sprintf("Dashed line: minimum %d spots (%.1f min)", MIN_SPOTS, MIN_SPOTS * FRAME_INTERVAL_MIN),
-    x = "Number of spots per track (log scale)",
-    y = "Count",
-    fill = NULL
-  ) +
-  theme_track() +
-  theme(legend.position = "top")
-
-# Plot 2: Speed distribution
-#
-# INTERPRETATION:
-#   - Main peak = typical nuclear movement speed
-#   - Long tail = tracking errors or fast migrations
-#   - Compare to known nuclear speeds (0.5-5 µm/min typical)
-#
-p2 <- ggplot(tracks_clean, aes(x = SPEED_MEAN_UM_MIN)) +
-  geom_histogram(aes(y = after_stat(density)), bins = 50, fill = "#2166AC", alpha = 0.7) +
-  geom_density(color = "#B2182B", linewidth = 1) +
-  geom_vline(xintercept = median(tracks_clean$SPEED_MEAN_UM_MIN, na.rm = TRUE),
-             linetype = "dashed", color = "grey30", linewidth = 0.4) +
-  labs(
-    title = "Nuclear Migration Speed Distribution (3D)",
-    subtitle = sprintf("Median: %.2f µm/min (XYZ)",
-                      median(tracks_clean$SPEED_MEAN_UM_MIN, na.rm = TRUE)),
-    x = "Mean speed (µm/min)",
-    y = "Density"
-  ) +
-  theme_track()
-
-# Plot 3: Duration vs Max Speed (identify outliers)
-#
-# INTERPRETATION:
-#   - Most tracks cluster at moderate speeds
-#   - Points in upper region = suspiciously fast (tracking errors)
-#   - Filtering removes these outliers
-#
-p3 <- ggplot(tracks, aes(x = DURATION_MIN, y = SPEED_MAX_UM_MIN)) +
-  geom_point(aes(color = ifelse(passes_qc, "Kept", "Filtered")),
-             alpha = 0.3, size = 0.5) +
-  geom_hline(yintercept = MEAN_SPEED_THRESHOLD, linetype = "dashed", color = "#B2182B", linewidth = 0.3) +
-  geom_vline(xintercept = MIN_DURATION_MIN, linetype = "dashed", color = "#B2182B", linewidth = 0.3) +
-  scale_color_manual(values = c("Kept" = "#2166AC", "Filtered" = "grey70"),
-                     breaks = c("Kept", "Filtered")) +
-  scale_x_log10() +
-  labs(
-    title = "Track Duration vs Maximum Speed",
-    subtitle = "Red dashed lines: filtering thresholds",
-    x = "Duration (min, log scale)",
-    y = "Max speed (µm/min)",
-    color = NULL
-  ) +
-  theme_track()
-
-# Plot 4: Quality score distribution
-p4 <- ggplot(tracks, aes(x = TRACK_MEAN_QUALITY, fill = passes_qc)) +
-  geom_histogram(bins = 50, alpha = 0.7, position = "identity") +
-  geom_vline(xintercept = quality_threshold, linetype = "dashed", color = "#B2182B", linewidth = 0.3) +
-  scale_fill_manual(values = c("TRUE" = "#2166AC", "FALSE" = "grey70"),
-                    labels = c("TRUE" = "Kept", "FALSE" = "Filtered")) +
-  labs(
-    title = "Detection Quality Score",
-    subtitle = "TrackMate confidence in nucleus detection",
-    x = "Mean quality score",
-    y = "Count",
-    fill = NULL
-  ) +
-  theme_track()
-
-# Combine QC plots
-qc_combined <- (p1 + p2) / (p3 + p4) +
-  plot_annotation(
-    title = "Quality Control Summary",
-    subtitle = sprintf("Kept %d of %d tracks (%.1f%%)",
-                      nrow(tracks_clean), nrow(tracks), 100 * nrow(tracks_clean) / nrow(tracks)),
-    theme = theme(
-      plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
-      plot.subtitle = element_text(size = 10, hjust = 0.5, color = "grey40")
-    )
-  )
-
-ggsave("analysis_output/01_quality_control.pdf", qc_combined, width = 10, height = 10)
-cat("  Saved: 01_quality_control.pdf\n")
-
-# =============================================================================
-# PART 5: VELOCITY ANALYSIS
+# PART 2: VELOCITY ANALYSIS
 # =============================================================================
 #
 # BIOLOGICAL INTERPRETATION:
@@ -480,9 +121,12 @@ cat("  Saved: 01_quality_control.pdf\n")
 #   We calculate instantaneous velocities from spot-to-spot displacements.
 #
 
-cat("\n=== PART 5: VELOCITY ANALYSIS ===\n")
+cat("\n=== PART 2: VELOCITY ANALYSIS ===\n")
 
-# Calculate instantaneous velocities
+# Calculate INSTANTANEOUS (per-step) velocities from spot positions
+# This is different from SPEED_MEAN_UM_MIN (per-track averages from TrackMate).
+# inst_speed_um_min = displacement between consecutive spots / time interval
+# All speeds in µm/min.
 spots_velocity <- spots_clean %>%
   arrange(TRACK_ID, FRAME) %>%
   group_by(TRACK_ID) %>%
@@ -490,13 +134,13 @@ spots_velocity <- spots_clean %>%
     # Time difference (in minutes)
     dt_min = (FRAME - lag(FRAME)) * FRAME_INTERVAL_MIN,
 
-    # Displacements
+    # Displacements (µm)
     dx = POSITION_X - lag(POSITION_X),
     dy = POSITION_Y - lag(POSITION_Y),
     dz = POSITION_Z - lag(POSITION_Z),
     displacement = sqrt(dx^2 + dy^2 + dz^2),
 
-    # Instantaneous speed (µm/min)
+    # Instantaneous speed (µm/min) — this is per-step, NOT per-track
     inst_speed_um_min = displacement / dt_min,
 
     # Velocity components (µm/min)
@@ -509,9 +153,9 @@ spots_velocity <- spots_clean %>%
   ) %>%
   ungroup()
 
-# Speed statistics
+# Instantaneous speed statistics (per-step, not per-track)
 speed_stats <- spots_velocity %>%
-  filter(!is.na(inst_speed_um_min) ) %>%  # Remove outliers
+  filter(!is.na(inst_speed_um_min)) %>%
   summarise(
     mean = mean(inst_speed_um_min),
     median = median(inst_speed_um_min),
@@ -519,10 +163,14 @@ speed_stats <- spots_velocity %>%
     q95 = quantile(inst_speed_um_min, 0.95)
   )
 
-cat(sprintf("Instantaneous Speed Statistics:\n"))
-cat(sprintf("  Mean: %.2f µm/min\n", speed_stats$mean))
-cat(sprintf("  Median: %.2f µm/min\n", speed_stats$median))
-cat(sprintf("  95th percentile: %.2f µm/min\n", speed_stats$q95))
+cat(sprintf("Instantaneous (per-step) Speed Statistics (µm/min):\n"))
+cat(sprintf("  Mean: %.2f\n", speed_stats$mean))
+cat(sprintf("  Median: %.2f\n", speed_stats$median))
+cat(sprintf("  95th percentile: %.2f\n", speed_stats$q95))
+cat(sprintf("  Compare to per-track mean: %.2f µm/min (median of SPEED_MEAN_UM_MIN)\n",
+            median(tracks_clean$SPEED_MEAN_UM_MIN, na.rm = TRUE)))
+cat("  (Per-step median is typically higher than per-track mean because\n")
+cat("   averaging within each track smooths out fast steps)\n")
 
 # Plot 5: Instantaneous speed distribution
 #
@@ -537,10 +185,10 @@ p5 <- ggplot(spots_velocity %>% filter(!is.na(inst_speed_um_min)),
   geom_density(color = "#B2182B", linewidth = 1) +
   geom_vline(xintercept = speed_stats$median, linetype = "dashed", color = "grey30", linewidth = 0.4) +
   labs(
-    title = "Instantaneous Nuclear Speed (3D)",
-    subtitle = sprintf("Median: %.2f µm/min | 95th pct: %.2f µm/min (XYZ displacement)",
+    title = "Instantaneous Nuclear Speed (per-step, 3D)",
+    subtitle = sprintf("Median: %.2f µm/min | 95th pct: %.2f µm/min",
                        speed_stats$median, speed_stats$q95),
-    x = "Speed (µm/min)",
+    x = "Instantaneous speed (µm/min)",
     y = "Density"
   ) +
   theme_track()
@@ -561,10 +209,10 @@ p6 <- ggplot(speed_over_time, aes(x = time_bin_min, y = mean_speed)) +
               alpha = 0.3, fill = "#2166AC") +
   geom_line(color = "#2166AC", linewidth = 1) +
   labs(
-    title = "Mean Instantenous Speed Over Time",
-    subtitle = "Shaded: SE | Speed computed from XYZ displacements",
+    title = "Mean Instantaneous Speed Over Time",
+    subtitle = "Shaded: SE | Per-step speed from XYZ displacements (µm/min)",
     x = "Time (min from start)",
-    y = "Mean speed (µm/min)"
+    y = "Mean instantaneous speed (µm/min)"
   ) +
   theme_track()
 
@@ -577,11 +225,11 @@ velocity_combined <- (p5 + p6) +
     )
   )
 
-ggsave("analysis_output/02_velocity_analysis.pdf", velocity_combined, width = 18, height = 5)
-cat("  Saved: 02_velocity_analysis.pdf\n")
+ggsave("analysis_output/01_velocity_analysis.pdf", velocity_combined, width = 18, height = 5)
+cat("  Saved: 01_velocity_analysis.pdf\n")
 
 # =============================================================================
-# PART 6: DIRECTIONALITY ANALYSIS
+# PART 3: DIRECTIONALITY ANALYSIS
 # =============================================================================
 #
 # BIOLOGICAL INTERPRETATION:
@@ -596,7 +244,7 @@ cat("  Saved: 02_velocity_analysis.pdf\n")
 #   - 180° = reversal (oscillatory)
 #
 
-cat("\n=== PART 6: DIRECTIONALITY ANALYSIS ===\n")
+cat("\n=== PART 3: DIRECTIONALITY ANALYSIS ===\n")
 
 # Calculate turning angles
 spots_direction <- spots_velocity %>%
@@ -684,11 +332,11 @@ direction_combined <- (p7 + p8) +
     )
   )
 
-ggsave("analysis_output/03_directionality.pdf", direction_combined, width = 12, height = 5)
-cat("  Saved: 03_directionality.pdf\n")
+ggsave("analysis_output/02_directionality.pdf", direction_combined, width = 12, height = 5)
+cat("  Saved: 02_directionality.pdf\n")
 
 # =============================================================================
-# PART 7: SPATIAL VELOCITY PATTERNS
+# PART 4: SPATIAL VELOCITY PATTERNS
 # =============================================================================
 #
 # BIOLOGICAL INTERPRETATION:
@@ -698,7 +346,7 @@ cat("  Saved: 03_directionality.pdf\n")
 #   - Tissue organization (convergent/divergent flows)
 #
 
-cat("\n=== PART 7: SPATIAL VELOCITY PATTERNS ===\n")
+cat("\n=== PART 4: SPATIAL VELOCITY PATTERNS ===\n")
 
 # Bin space for local velocity statistics
 spatial_velocity <- spots_velocity %>%
@@ -773,11 +421,11 @@ spatial_combined <- (p9 + p10) +
     )
   )
 
-ggsave("analysis_output/04_spatial_velocity.pdf", spatial_combined, width = 12, height = 6)
-cat("  Saved: 04_spatial_velocity.pdf\n")
+ggsave("analysis_output/03_spatial_velocity.pdf", spatial_combined, width = 12, height = 6)
+cat("  Saved: 03_spatial_velocity.pdf\n")
 
 # =============================================================================
-# PART 8: MEAN SQUARED DISPLACEMENT (MSD) ANALYSIS
+# PART 5: MEAN SQUARED DISPLACEMENT (MSD) ANALYSIS
 # =============================================================================
 #
 # BIOLOGICAL INTERPRETATION:
@@ -793,7 +441,7 @@ cat("  Saved: 04_spatial_velocity.pdf\n")
 #   - Actively migrating with a bias
 #
 
-cat("\n=== PART 8: MSD ANALYSIS ===\n")
+cat("\n=== PART 5: MSD ANALYSIS ===\n")
 
 # Calculate MSD for each track
 calculate_msd <- function(df, max_lag = 30) {
@@ -881,11 +529,11 @@ p11 <- ggplot() +
   ) +
   theme_track()
 
-ggsave("analysis_output/05_msd_analysis.pdf", p11, width = 8, height = 6)
-cat("  Saved: 05_msd_analysis.pdf\n")
+ggsave("analysis_output/04_msd_analysis.pdf", p11, width = 8, height = 6)
+cat("  Saved: 04_msd_analysis.pdf\n")
 
 # =============================================================================
-# PART 9: TRACK CLASSIFICATION BY MOVEMENT TYPE
+# PART 6: TRACK CLASSIFICATION BY MOVEMENT TYPE
 # =============================================================================
 #
 # BIOLOGICAL INTERPRETATION:
@@ -897,7 +545,7 @@ cat("  Saved: 05_msd_analysis.pdf\n")
 #   We classify based on confinement ratio and linearity.
 #
 
-cat("\n=== PART 9: MOVEMENT TYPE CLASSIFICATION ===\n")
+cat("\n=== PART 6: MOVEMENT TYPE CLASSIFICATION ===\n")
 
 # Classify tracks based on movement metrics
 tracks_classified <- tracks_clean %>%
@@ -977,11 +625,11 @@ classification_combined <- (p12 + p13) +
     )
   )
 
-ggsave("analysis_output/06_movement_classification.pdf", classification_combined, width = 12, height = 5)
-cat("  Saved: 06_movement_classification.pdf\n")
+ggsave("analysis_output/05_movement_classification.pdf", classification_combined, width = 12, height = 5)
+cat("  Saved: 05_movement_classification.pdf\n")
 
 # =============================================================================
-# PART 10: CLUSTERING ANALYSIS (memory-efficient)
+# PART 7: CLUSTERING ANALYSIS (memory-efficient)
 # =============================================================================
 #
 # BIOLOGICAL INTERPRETATION:
@@ -993,9 +641,10 @@ cat("  Saved: 06_movement_classification.pdf\n")
 #   We use k-means on a sample to avoid memory issues.
 #
 
-cat("\n=== PART 10: CLUSTERING ANALYSIS ===\n")
+cat("\n=== PART 7: CLUSTERING ANALYSIS ===\n")
 
 # Prepare features for clustering
+# NOTE: Using SPEED_MEAN_UM_MIN (per-track mean speed in µm/min)
 clustering_features <- tracks_classified %>%
   select(TRACK_ID, SPEED_MEAN_UM_MIN, CONFINEMENT_RATIO,
          LINEARITY_OF_FORWARD_PROGRESSION, MEAN_DIRECTIONAL_CHANGE_RATE,
@@ -1064,11 +713,11 @@ p14 <- ggplot(cluster_long, aes(x = cluster, y = value, fill = cluster)) +
   theme_track() +
   theme(legend.position = "none")
 
-ggsave("analysis_output/07_clustering.pdf", p14, width = 10, height = 5)
-cat("  Saved: 07_clustering.pdf\n")
+ggsave("analysis_output/06_clustering.pdf", p14, width = 10, height = 5)
+cat("  Saved: 06_clustering.pdf\n")
 
 # =============================================================================
-# PART 11: CONFINEMENT AND DISPLACEMENT ANALYSIS
+# PART 8: CONFINEMENT AND DISPLACEMENT ANALYSIS
 # =============================================================================
 #
 # BIOLOGICAL INTERPRETATION:
@@ -1082,7 +731,7 @@ cat("  Saved: 07_clustering.pdf\n")
 #   - Random exploration: CR ~ 0.3-0.5
 #
 
-cat("\n=== PART 11: CONFINEMENT ANALYSIS ===\n")
+cat("\n=== PART 8: CONFINEMENT ANALYSIS ===\n")
 
 # Plot 15: Confinement ratio distribution
 #
@@ -1109,6 +758,7 @@ p15 <- ggplot(tracks_clean, aes(x = CONFINEMENT_RATIO)) +
 #   - Slow + low confinement = stationary/confined
 #   - Correlation indicates coupling between speed and directionality
 #
+# NOTE: Using SPEED_MEAN_UM_MIN (per-track mean from TrackMate, converted to µm/min)
 p16 <- ggplot(tracks_clean, aes(x = CONFINEMENT_RATIO, y = SPEED_MEAN_UM_MIN)) +
   geom_point(alpha = 0.2, size = 0.5, color = "#2166AC") +
   geom_smooth(method = "loess", color = "#B2182B", linewidth = 1, se = FALSE) +
@@ -1116,7 +766,7 @@ p16 <- ggplot(tracks_clean, aes(x = CONFINEMENT_RATIO, y = SPEED_MEAN_UM_MIN)) +
     title = "Confinement vs Speed",
     subtitle = "Are faster nuclei more directed?",
     x = "Confinement ratio",
-    y = "Mean speed (µm/min)"
+    y = "Mean track speed (µm/min)"
   ) +
   theme_track()
 
@@ -1129,11 +779,11 @@ confinement_combined <- (p15 + p16) +
     )
   )
 
-ggsave("analysis_output/08_confinement.pdf", confinement_combined, width = 12, height = 5)
-cat("  Saved: 08_confinement.pdf\n")
+ggsave("analysis_output/07_confinement.pdf", confinement_combined, width = 12, height = 5)
+cat("  Saved: 07_confinement.pdf\n")
 
 # =============================================================================
-# PART 12: Z-DEPTH ANALYSIS
+# PART 9: Z-DEPTH ANALYSIS
 # =============================================================================
 #
 # BIOLOGICAL INTERPRETATION:
@@ -1143,7 +793,7 @@ cat("  Saved: 08_confinement.pdf\n")
 #   - Different cell types stratify by depth
 #
 
-cat("\n=== PART 12: Z-DEPTH ANALYSIS ===\n")
+cat("\n=== PART 9: Z-DEPTH ANALYSIS ===\n")
 
 # Bin by Z-depth
 z_analysis <- spots_velocity %>%
@@ -1179,11 +829,11 @@ p17 <- ggplot(z_analysis, aes(x = z_layer, y = inst_speed_um_min, fill = z_layer
   theme_track() +
   theme(legend.position = "none")
 
-ggsave("analysis_output/09_z_depth_basic.pdf", p17, width = 8, height = 5)
-cat("  Saved: 09_z_depth_basic.pdf\n")
+ggsave("analysis_output/08_z_depth_basic.pdf", p17, width = 8, height = 5)
+cat("  Saved: 08_z_depth_basic.pdf\n")
 
 # =============================================================================
-# PART 12B: COMPREHENSIVE 4D SPATIAL-TEMPORAL ANALYSIS
+# PART 10: COMPREHENSIVE 4D SPATIAL-TEMPORAL ANALYSIS
 # =============================================================================
 #
 # BIOLOGICAL INTERPRETATION:
@@ -1200,7 +850,7 @@ cat("  Saved: 09_z_depth_basic.pdf\n")
 #   4. Interactive/3D visualizations
 #
 
-cat("\n=== PART 12B: COMPREHENSIVE 4D ANALYSIS ===\n")
+cat("\n=== PART 10: COMPREHENSIVE 4D ANALYSIS ===\n")
 
 # -----------------------------------------------------------------------------
 # 12B.1: Spatial binning for 4D analysis
@@ -1316,8 +966,8 @@ z_xy_combined <- p_z_xy_heat / p_z_xy_vector +
     )
   )
 
-ggsave("analysis_output/10_z_layer_xy_patterns.pdf", z_xy_combined, width = 14, height = 12)
-cat("  Saved: 10_z_layer_xy_patterns.pdf\n")
+ggsave("analysis_output/09_z_layer_xy_patterns.pdf", z_xy_combined, width = 14, height = 12)
+cat("  Saved: 09_z_layer_xy_patterns.pdf\n")
 
 # -----------------------------------------------------------------------------
 # 12B.3: Z-movement analysis (vertical migration)
@@ -1382,8 +1032,8 @@ z_movement_combined <- (p_vz_layer | p_vz_dist) +
     theme = theme(plot.title = element_text(size = 14, face = "bold", hjust = 0.5))
   )
 
-ggsave("analysis_output/11_z_velocity_analysis.pdf", z_movement_combined, width = 12, height = 8)
-cat("  Saved: 11_z_velocity_analysis.pdf\n")
+ggsave("analysis_output/10_z_velocity_analysis.pdf", z_movement_combined, width = 12, height = 8)
+cat("  Saved: 10_z_velocity_analysis.pdf\n")
 
 # -----------------------------------------------------------------------------
 # 12B.4: Temporal evolution of spatial patterns
@@ -1465,8 +1115,8 @@ temporal_combined <- p_speed_time_z / p_speed_xy_time +
     theme = theme(plot.title = element_text(size = 14, face = "bold", hjust = 0.5))
   )
 
-ggsave("analysis_output/12_temporal_evolution.pdf", temporal_combined, width = 12, height = 14)
-cat("  Saved: 12_temporal_evolution.pdf\n")
+ggsave("analysis_output/11_temporal_evolution.pdf", temporal_combined, width = 12, height = 14)
+cat("  Saved: 11_temporal_evolution.pdf\n")
 
 # -----------------------------------------------------------------------------
 # 12B.5: XZ and YZ projections (sagittal and coronal views)
@@ -1571,8 +1221,8 @@ projections_combined <- (p_xz_heat + p_xz_vector) / (p_yz_heat + p_yz_vector) +
     )
   )
 
-ggsave("analysis_output/13_xz_yz_projections.pdf", projections_combined, width = 14, height = 12)
-cat("  Saved: 13_xz_yz_projections.pdf\n")
+ggsave("analysis_output/12_xz_yz_projections.pdf", projections_combined, width = 14, height = 12)
+cat("  Saved: 12_xz_yz_projections.pdf\n")
 
 # -----------------------------------------------------------------------------
 # 12B.6: 4D Parameter Exploration - Correlations
@@ -1651,8 +1301,8 @@ p_cor <- ggplot(cor_long, aes(x = var1, y = var2, fill = correlation)) +
     legend.position = "right"
   )
 
-ggsave("analysis_output/14_parameter_correlations.pdf", p_cor, width = 10, height = 8)
-cat("  Saved: 14_parameter_correlations.pdf\n")
+ggsave("analysis_output/13_parameter_correlations.pdf", p_cor, width = 10, height = 8)
+cat("  Saved: 13_parameter_correlations.pdf\n")
 
 # -----------------------------------------------------------------------------
 # 12B.7: Movement type spatial distribution
@@ -1766,8 +1416,8 @@ movetype_spatial_combined <- (p_movetype_xy | p_movetype_xz) / (p_movetype_z | p
     theme = theme(plot.title = element_text(size = 14, face = "bold", hjust = 0.5))
   )
 
-ggsave("analysis_output/15_movement_type_4d.pdf", movetype_spatial_combined, width = 14, height = 16)
-cat("  Saved: 15_movement_type_4d.pdf\n")
+ggsave("analysis_output/14_movement_type_4d.pdf", movetype_spatial_combined, width = 14, height = 16)
+cat("  Saved: 14_movement_type_4d.pdf\n")
 
 # -----------------------------------------------------------------------------
 # 12B.8: 3D Track Visualization Data Export
@@ -1874,11 +1524,11 @@ pseudo_3d <- (p_3d_xy | p_3d_xy_time) / (p_3d_xz | p_3d_yz) +
     )
   )
 
-ggsave("analysis_output/16_pseudo_3d_tracks.pdf", pseudo_3d, width = 16, height = 14)
-cat("  Saved: 16_pseudo_3d_tracks.pdf\n")
+ggsave("analysis_output/15_pseudo_3d_tracks.pdf", pseudo_3d, width = 16, height = 14)
+cat("  Saved: 15_pseudo_3d_tracks.pdf\n")
 
 # =============================================================================
-# PART 14: INTERACTIVE 4D VISUALIZATION WITH PLOTLY
+# PART 11: INTERACTIVE 4D VISUALIZATION WITH PLOTLY
 # =============================================================================
 #
 # BIOLOGICAL INTERPRETATION:
@@ -1891,10 +1541,10 @@ cat("  Saved: 16_pseudo_3d_tracks.pdf\n")
 #   We create multiple HTML files for different views.
 #
 
-cat("\n=== PART 14: INTERACTIVE 4D VISUALIZATION ===\n")
+cat("\n=== PART 11: INTERACTIVE 4D VISUALIZATION ===\n")
 
 # -----------------------------------------------------------------------------
-# 14.1: Interactive 3D track plot (static snapshot with rotation)
+# 11.1: Interactive 3D track plot (static snapshot with rotation)
 # -----------------------------------------------------------------------------
 
 cat("  Creating interactive 3D visualizations...\n")
@@ -1943,9 +1593,9 @@ fig_3d_movetype <- plot_ly(
     legend = list(title = list(text = "Movement Type"))
   )
 
-htmlwidgets::saveWidget(fig_3d_movetype, "analysis_output/17_interactive_3d_movetype.html",
+htmlwidgets::saveWidget(fig_3d_movetype, "analysis_output/16_interactive_3d_movetype.html",
                         selfcontained = TRUE)
-cat("    Saved: 17_interactive_3d_movetype.html\n")
+cat("    Saved: 16_interactive_3d_movetype.html\n")
 
 # 3D scatter colored by speed
 fig_3d_speed <- plot_ly(
@@ -1972,12 +1622,12 @@ fig_3d_speed <- plot_ly(
     )
   )
 
-htmlwidgets::saveWidget(fig_3d_speed, "analysis_output/18_interactive_3d_speed.html",
+htmlwidgets::saveWidget(fig_3d_speed, "analysis_output/17_interactive_3d_speed.html",
                         selfcontained = TRUE)
-cat("    Saved: 18_interactive_3d_speed.html\n")
+cat("    Saved: 17_interactive_3d_speed.html\n")
 
 # -----------------------------------------------------------------------------
-# 14.2: 3D track lines (showing actual trajectories)
+# 11.2: 3D track lines (showing actual trajectories)
 # -----------------------------------------------------------------------------
 
 # Create line traces for each track
@@ -2039,12 +1689,12 @@ fig_3d_lines <- fig_3d_lines %>%
     )
   )
 
-htmlwidgets::saveWidget(fig_3d_lines, "analysis_output/19_interactive_3d_tracks.html",
+htmlwidgets::saveWidget(fig_3d_lines, "analysis_output/18_interactive_3d_tracks.html",
                         selfcontained = TRUE)
-cat("    Saved: 19_interactive_3d_tracks.html\n")
+cat("    Saved: 18_interactive_3d_tracks.html\n")
 
 # -----------------------------------------------------------------------------
-# 14.3: 4D Animation (3D + Time slider)
+# 11.3: 4D Animation (3D + Time slider)
 # -----------------------------------------------------------------------------
 
 cat("  Creating 4D time-lapse animation...\n")
@@ -2088,21 +1738,21 @@ fig_4d <- plot_ly(
     currentvalue = list(prefix = "Time: ")
   )
 
-htmlwidgets::saveWidget(fig_4d, "analysis_output/20_interactive_4d_timelapse.html",
+htmlwidgets::saveWidget(fig_4d, "analysis_output/19_interactive_4d_timelapse.html",
                         selfcontained = TRUE)
-cat("    Saved: 20_interactive_4d_timelapse.html\n")
+cat("    Saved: 19_interactive_4d_timelapse.html\n")
 
 # =============================================================================
-# PART 15: ADDITIONAL ANALYSES
+# PART 12: ADDITIONAL ANALYSES
 # =============================================================================
 #
 # Additional analyses that provide deeper biological insights:
 #
 
-cat("\n=== PART 15: ADDITIONAL ANALYSES ===\n")
+cat("\n=== PART 12: ADDITIONAL ANALYSES ===\n")
 
 # -----------------------------------------------------------------------------
-# 15.1: Track persistence (how long do tracks maintain direction?)
+# 12.1: Track persistence (how long do tracks maintain direction?)
 # -----------------------------------------------------------------------------
 
 cat("  Computing track persistence...\n")
@@ -2161,11 +1811,11 @@ p_persistence <- ggplot(track_persistence %>% filter(!is.na(movement_type)),
   theme_track() +
   theme(legend.position = "none")
 
-ggsave("analysis_output/21_persistence.pdf", p_persistence, width = 8, height = 6)
-cat("    Saved: 21_persistence.pdf\n")
+ggsave("analysis_output/20_persistence.pdf", p_persistence, width = 8, height = 6)
+cat("    Saved: 20_persistence.pdf\n")
 
 # -----------------------------------------------------------------------------
-# 15.2: Speed-confinement phase space
+# 12.2: Speed-confinement phase space
 # -----------------------------------------------------------------------------
 #
 # INTERPRETATION:
@@ -2190,11 +1840,11 @@ p_phase_space <- ggplot(tracks_classified,
   ) +
   theme_track()
 
-ggsave("analysis_output/22_phase_space.pdf", p_phase_space, width = 10, height = 8)
-cat("    Saved: 22_phase_space.pdf\n")
+ggsave("analysis_output/21_phase_space.pdf", p_phase_space, width = 10, height = 8)
+cat("    Saved: 21_phase_space.pdf\n")
 
 # -----------------------------------------------------------------------------
-# 15.3: Local density vs speed analysis
+# 12.3: Local density vs speed analysis
 # -----------------------------------------------------------------------------
 #
 # INTERPRETATION:
@@ -2251,11 +1901,11 @@ p_density_speed <- ggplot(density_speed_summary, aes(x = mean_density, y = mean_
   ) +
   theme_track()
 
-ggsave("analysis_output/23_density_vs_speed.pdf", p_density_speed, width = 10, height = 7)
-cat("    Saved: 23_density_vs_speed.pdf\n")
+ggsave("analysis_output/22_density_vs_speed.pdf", p_density_speed, width = 10, height = 7)
+cat("    Saved: 22_density_vs_speed.pdf\n")
 
 # -----------------------------------------------------------------------------
-# 15.4: Neighbor correlation analysis
+# 12.4: Neighbor correlation analysis
 # -----------------------------------------------------------------------------
 #
 # INTERPRETATION:
@@ -2338,8 +1988,8 @@ if (nrow(neighbor_corr) > 0) {
     ) +
     theme_track()
 
-  ggsave("analysis_output/24_neighbor_correlation.pdf", p_neighbor, width = 10, height = 6)
-  cat("    Saved: 24_neighbor_correlation.pdf\n")
+  ggsave("analysis_output/23_neighbor_correlation.pdf", p_neighbor, width = 10, height = 6)
+  cat("    Saved: 23_neighbor_correlation.pdf\n")
 }
 
 # -----------------------------------------------------------------------------
@@ -2398,10 +2048,10 @@ cat("ANALYSIS SUMMARY\n")
 cat(strrep("=", 70), "\n\n")
 
 cat("DATASET:\n")
-cat(sprintf("  Filtered tracks: %d (from %d original)\n", nrow(tracks_clean), nrow(tracks)))
+cat(sprintf("  Tracks analyzed: %d\n", nrow(tracks_clean)))
 cat(sprintf("  Total imaging time: %.1f min (%.1f hours)\n",
-            max(spots$FRAME) * FRAME_INTERVAL_MIN,
-            max(spots$FRAME) * FRAME_INTERVAL_MIN / 60))
+            max(spots_clean$FRAME) * FRAME_INTERVAL_MIN,
+            max(spots_clean$FRAME) * FRAME_INTERVAL_MIN / 60))
 cat(sprintf("  Temporal resolution: %d sec/frame\n", FRAME_INTERVAL_SEC))
 
 cat("\nNUCLEAR MOVEMENT:\n")
@@ -2420,34 +2070,33 @@ cat(sprintf("  MSD exponent (α): %.2f → %s\n", alpha,
                    ifelse(alpha > 1.2, "superdiffusive (directed)", "normal diffusion"))))
 
 cat("\nOUTPUT FILES:\n")
-cat("  Quality Control & Basic Analysis:\n")
-cat("    analysis_output/01_quality_control.pdf\n")
-cat("    analysis_output/02_velocity_analysis.pdf\n")
-cat("    analysis_output/03_directionality.pdf\n")
-cat("    analysis_output/04_spatial_velocity.pdf\n")
-cat("    analysis_output/05_msd_analysis.pdf\n")
-cat("    analysis_output/06_movement_classification.pdf\n")
-cat("    analysis_output/07_clustering.pdf\n")
-cat("    analysis_output/08_confinement.pdf\n")
+cat("  Velocity & Biological Analysis:\n")
+cat("    analysis_output/01_velocity_analysis.pdf\n")
+cat("    analysis_output/02_directionality.pdf\n")
+cat("    analysis_output/03_spatial_velocity.pdf\n")
+cat("    analysis_output/04_msd_analysis.pdf\n")
+cat("    analysis_output/05_movement_classification.pdf\n")
+cat("    analysis_output/06_clustering.pdf\n")
+cat("    analysis_output/07_confinement.pdf\n")
 cat("  4D Spatial-Temporal Analysis:\n")
-cat("    analysis_output/09_z_depth_basic.pdf\n")
-cat("    analysis_output/10_z_layer_xy_patterns.pdf\n")
-cat("    analysis_output/11_z_velocity_analysis.pdf\n")
-cat("    analysis_output/12_temporal_evolution.pdf\n")
-cat("    analysis_output/13_xz_yz_projections.pdf\n")
-cat("    analysis_output/14_parameter_correlations.pdf\n")
-cat("    analysis_output/15_movement_type_4d.pdf\n")
-cat("    analysis_output/16_pseudo_3d_tracks.pdf\n")
+cat("    analysis_output/08_z_depth_basic.pdf\n")
+cat("    analysis_output/09_z_layer_xy_patterns.pdf\n")
+cat("    analysis_output/10_z_velocity_analysis.pdf\n")
+cat("    analysis_output/11_temporal_evolution.pdf\n")
+cat("    analysis_output/12_xz_yz_projections.pdf\n")
+cat("    analysis_output/13_parameter_correlations.pdf\n")
+cat("    analysis_output/14_movement_type_4d.pdf\n")
+cat("    analysis_output/15_pseudo_3d_tracks.pdf\n")
 cat("  Interactive 4D Visualizations (open in browser):\n")
-cat("    analysis_output/17_interactive_3d_movetype.html\n")
-cat("    analysis_output/18_interactive_3d_speed.html\n")
-cat("    analysis_output/19_interactive_3d_tracks.html\n")
-cat("    analysis_output/20_interactive_4d_timelapse.html\n")
+cat("    analysis_output/16_interactive_3d_movetype.html\n")
+cat("    analysis_output/17_interactive_3d_speed.html\n")
+cat("    analysis_output/18_interactive_3d_tracks.html\n")
+cat("    analysis_output/19_interactive_4d_timelapse.html\n")
 cat("  Additional Analyses:\n")
-cat("    analysis_output/21_persistence.pdf\n")
-cat("    analysis_output/22_phase_space.pdf\n")
-cat("    analysis_output/23_density_vs_speed.pdf\n")
-cat("    analysis_output/24_neighbor_correlation.pdf\n")
+cat("    analysis_output/20_persistence.pdf\n")
+cat("    analysis_output/21_phase_space.pdf\n")
+cat("    analysis_output/22_density_vs_speed.pdf\n")
+cat("    analysis_output/23_neighbor_correlation.pdf\n")
 cat("  Data Exports:\n")
 
 # Save processed data

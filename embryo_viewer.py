@@ -889,10 +889,6 @@ class EmbryoViewer:
             None  # indices into self.spots for displayed subset
         )
         self._track_width: float = 2.0  # track line width
-        self._bg_rebuilding_tracks: bool = False
-        self._rebuild_tracks_pending: bool = False
-        self._bg_refreshing_points: bool = False
-        self._refresh_points_pending: bool = False
 
         # Create viewer
         self.viewer = napari.Viewer(title="Embryo 4D Viewer", ndisplay=3)
@@ -1146,7 +1142,7 @@ class EmbryoViewer:
         return tracks, df
 
     def _rebuild_tracks(self):
-        """Rebuild the tracks layer(s) — background data build, main-thread render.
+        """Rebuild the tracks layer(s) with all active filters + current colour.
 
         In 'ingressing' colour mode, creates TWO layers:
           - "Other Tracks" (grey, thin, translucent)
@@ -1155,31 +1151,17 @@ class EmbryoViewer:
         """
         if self._drawing_roi:
             return  # suppress rebuilds during ROI drawing
-        if self._bg_rebuilding_tracks:
-            self._rebuild_tracks_pending = True
+        self._remove_layer("tracks_layer")
+        self._remove_layer("_tracks_layer_secondary")
+
+        result = self._build_tracks_data()
+        if result is None or result[0] is None:
             return
-        self._bg_rebuilding_tracks = True
+        tracks, df_t = result
+        if len(tracks) == 0:
+            return
+
         mode = self._current_color_mode
-
-        def _bg():
-            return self._build_tracks_data()
-
-        def _finish(result):
-            self._bg_rebuilding_tracks = False
-            self._remove_layer("tracks_layer")
-            self._remove_layer("_tracks_layer_secondary")
-            if result is not None and result[0] is not None:
-                tracks, df_t = result
-                if len(tracks) > 0:
-                    self._apply_tracks_layers(tracks, df_t, mode)
-            if self._rebuild_tracks_pending:
-                self._rebuild_tracks_pending = False
-                self._rebuild_tracks()
-
-        self._run_background("Building tracks", _bg, _finish)
-
-    def _apply_tracks_layers(self, tracks, df_t, mode):
-        """Create napari track layers from pre-built data (main thread)."""
 
         # ── Dual-layer mode for ingression classification view ──
         #
@@ -1355,41 +1337,6 @@ class EmbryoViewer:
             except (ValueError, KeyError):
                 pass
             setattr(self, attr_name, None)
-
-    def _run_background(self, label, bg_func, finish_func):
-        """Run bg_func in a daemon thread; call finish_func(result) on the main thread.
-
-        Parameters
-        ----------
-        label : str — human-readable description shown in the status bar
-        bg_func : callable returning a result (runs in a daemon thread)
-        finish_func : callable(result) — invoked via QTimer on the main thread
-        """
-        from qtpy.QtCore import QTimer
-
-        self.viewer.status = f"⏳ {label}..."
-
-        holder = {"result": None, "error": None}
-
-        def _bg():
-            try:
-                holder["result"] = bg_func()
-            except Exception as e:
-                holder["error"] = str(e)
-
-        t = threading.Thread(target=_bg, daemon=True)
-        t.start()
-
-        def _poll():
-            if t.is_alive():
-                QTimer.singleShot(200, _poll)
-                return
-            if holder["error"]:
-                self.viewer.status = f"Error in {label}: {holder['error']}"
-                return
-            finish_func(holder["result"])
-
-        QTimer.singleShot(200, _poll)
 
     def _reset_downstream(self):
         """Clear orientation / sphere / ROI state after new data load."""
@@ -1837,7 +1784,7 @@ class EmbryoViewer:
     # ── Orientation ───────────────────────────────────────────────────
 
     def _orient(self):
-        """Apply AP → +Y, Dorsal → +X rotation (background thread)."""
+        """Apply AP → +Y, Dorsal → +X rotation."""
         if self.animal_pole is None or self.dorsal_mark is None:
             self.viewer.status = "Set both Animal Pole and Dorsal landmarks first!"
             return
@@ -1845,36 +1792,34 @@ class EmbryoViewer:
             self.viewer.status = "Load spots first!"
             return
 
-        pos = self.spots[["POSITION_X", "POSITION_Y", "POSITION_Z"]].values.copy()
-        ap_copy = self.animal_pole.copy()
-        dorsal_copy = self.dorsal_mark.copy()
+        self.viewer.status = "Orienting embryo..."
+        pos = self.spots[["POSITION_X", "POSITION_Y", "POSITION_Z"]].values
+        pos_new, params = orient_embryo(pos, self.animal_pole, self.dorsal_mark)
 
-        def _bg():
-            pos_new, params = orient_embryo(pos, ap_copy, dorsal_copy)
-            mid = params["center"]
-            R1, R2 = params["R1"], params["R2"]
-            new_ap = R2 @ (R1 @ (ap_copy - mid))
-            new_dorsal = R2 @ (R1 @ (dorsal_copy - mid))
-            return pos_new, params, new_ap, new_dorsal
+        self.spots["POSITION_X"] = pos_new[:, 0]
+        self.spots["POSITION_Y"] = pos_new[:, 1]
+        self.spots["POSITION_Z"] = pos_new[:, 2]
+        self.transform_params = params
+        self.oriented = True
 
-        def _finish(result):
-            pos_new, params, new_ap, new_dorsal = result
-            self.spots["POSITION_X"] = pos_new[:, 0]
-            self.spots["POSITION_Y"] = pos_new[:, 1]
-            self.spots["POSITION_Z"] = pos_new[:, 2]
-            self.transform_params = params
-            self.oriented = True
-            self.animal_pole = new_ap
-            self.dorsal_mark = new_dorsal
-            self._refresh_points()
-            self._refresh_tracks()
-            self._update_landmarks()
-            self.viewer.reset_view()
-            self.viewer.status = (
-                "Oriented: AP → top (-Y), Dorsal → right (+X). Camera reset."
-            )
+        # Transform landmark positions into the new coordinate system
+        mid = params["center"]
+        R1, R2 = params["R1"], params["R2"]
+        if self.animal_pole is not None:
+            self.animal_pole = R2 @ (R1 @ (self.animal_pole - mid))
+        if self.dorsal_mark is not None:
+            self.dorsal_mark = R2 @ (R1 @ (self.dorsal_mark - mid))
 
-        self._run_background("Orienting embryo", _bg, _finish)
+        # Update layers
+        self._refresh_points()
+        self._refresh_tracks()
+        self._update_landmarks()
+
+        # Reset camera to centre on the reoriented data
+        self.viewer.reset_view()
+        self.viewer.status = (
+            "Oriented: AP → top (-Y), Dorsal → right (+X). Camera reset."
+        )
 
     # ── Sphere fitting ────────────────────────────────────────────────
 
@@ -2028,51 +1973,33 @@ class EmbryoViewer:
     # ── Ingression analysis ───────────────────────────────────────────
 
     def _compute_radial_velocity(self):
-        """Compute per-spot radial velocity relative to the fitted sphere (background)."""
+        """Compute per-spot radial velocity relative to the fitted sphere."""
         if self.sphere_fit_result is None:
             self.viewer.status = "Fit sphere first!"
             return
         if self.spots is None:
             return
 
-        center = self.sphere_fit_result["center"].copy()
-        spots_copy = self.spots.copy()
+        center = self.sphere_fit_result["center"]
+        self.viewer.status = "Computing smoothed radial velocity..."
+        self.spots = compute_radial_velocity(self.spots, center, smooth_window=5)
 
-        def _bg():
-            return compute_radial_velocity(spots_copy, center, smooth_window=5)
-
-        def _finish(result):
-            # Patch new columns into live spots (preserves concurrent edits)
-            for col in [
-                "RADIAL_DIST_TO_CENTER",
-                "RADIAL_VELOCITY",
-                "RADIAL_VELOCITY_SMOOTH",
-                "TRACK_MEDIAN_RADIAL_VEL",
-                "TRACK_MEAN_RADIAL_VEL",
-                "TRACK_INWARD_FRACTION",
-                "TRACK_MAX_INWARD_VEL",
-            ]:
-                if col in result.columns:
-                    self.spots[col] = result[col].values
-
-            rv = self.spots["RADIAL_VELOCITY_SMOOTH"].values
-            valid = ~np.isnan(rv)
-            if valid.any():
-                med = np.nanmedian(rv)
-                q10 = np.nanpercentile(rv, 10)
-                q90 = np.nanpercentile(rv, 90)
-                self.lbl_ingression.value = (
-                    f"V_r(smooth): med={med:.3f} µm/f  [{q10:.2f}, {q90:.2f}]"
-                )
-            else:
-                self.lbl_ingression.value = "V_r: no track data"
-
-            self.viewer.status = (
-                "Radial velocity computed (smoothed, window=5). "
-                "Use 'Auto-Detect Threshold' or 'Flag Ingressing Cells' next."
+        rv = self.spots["RADIAL_VELOCITY_SMOOTH"].values
+        valid = ~np.isnan(rv)
+        if valid.any():
+            med = np.nanmedian(rv)
+            q10 = np.nanpercentile(rv, 10)
+            q90 = np.nanpercentile(rv, 90)
+            self.lbl_ingression.value = (
+                f"V_r(smooth): med={med:.3f} µm/f  [{q10:.2f}, {q90:.2f}]"
             )
+        else:
+            self.lbl_ingression.value = "V_r: no track data"
 
-        self._run_background("Computing radial velocity", _bg, _finish)
+        self.viewer.status = (
+            "Radial velocity computed (smoothed, window=5). "
+            "Use 'Auto-Detect Threshold' or 'Flag Ingressing Cells' next."
+        )
 
     def _auto_detect_threshold(self):
         """Auto-detect the ingression V_r threshold using Otsu's method."""
@@ -2090,7 +2017,7 @@ class EmbryoViewer:
         self.viewer.status = f"Auto-threshold: {desc}"
 
     def _flag_ingression(self):
-        """Flag ingressing cells based on multi-criteria detection (background)."""
+        """Flag ingressing cells based on multi-criteria detection."""
         if "RADIAL_VELOCITY" not in self.spots.columns:
             self.viewer.status = "Compute radial velocity first!"
             return
@@ -2098,65 +2025,62 @@ class EmbryoViewer:
         thresh = self.ingression_threshold.value
         min_f = int(self.ingression_min_frames.value)
         inward_frac = self.ingression_inward_frac.value
-        roi_only = self.ingression_roi_only.value
-        roi_bounds = dict(self._roi_bounds) if self._roi_bounds is not None else None
-        spots_copy = self.spots.copy()
+        self.spots = flag_ingressing(
+            self.spots,
+            threshold=thresh,
+            min_track_frames=min_f,
+            min_inward_fraction=inward_frac,
+        )
 
-        def _bg():
-            result = flag_ingressing(
-                spots_copy,
-                threshold=thresh,
-                min_track_frames=min_f,
-                min_inward_fraction=inward_frac,
+        # If "Flag only within ROI" is checked, apply two spatial filters:
+        #
+        #  (1) ROI PRESENCE — the track must have ≥1 spot inside the ROI
+        #      box.  This removes false positives near the animal pole
+        #      (entirely above the box) while preserving tracks that start
+        #      outside the ROI and later migrate down into the marginal
+        #      zone during ingression.
+        #
+        #  (2) VEGETAL BREACH — any track where ANY spot crosses past the
+        #      vegetal boundary (y_max, after orientation +Y = vegetal) is
+        #      epiboly / spreading, not ingression, so it is excluded.
+        #
+        if self.ingression_roi_only.value and self._roi_bounds is not None:
+            b = self._roi_bounds
+            df = self.spots
+
+            # (1) Track must touch the ROI at least once
+            in_box = (
+                (df["POSITION_X"] >= b["x_min"])
+                & (df["POSITION_X"] <= b["x_max"])
+                & (df["POSITION_Y"] >= b["y_min"])
+                & (df["POSITION_Y"] <= b["y_max"])
             )
-            if roi_only and roi_bounds is not None:
-                b = roi_bounds
-                in_box = (
-                    (result["POSITION_X"] >= b["x_min"])
-                    & (result["POSITION_X"] <= b["x_max"])
-                    & (result["POSITION_Y"] >= b["y_min"])
-                    & (result["POSITION_Y"] <= b["y_max"])
-                )
-                track_ever_in_box = in_box.groupby(result["TRACK_ID"]).transform("any")
-                result.loc[~track_ever_in_box, "INGRESSING"] = False
-                vegetal_breach = (
-                    result.groupby("TRACK_ID")["POSITION_Y"].transform("max")
-                    > b["y_max"]
-                )
-                result.loc[vegetal_breach, "INGRESSING"] = False
-            return result
+            track_ever_in_box = in_box.groupby(df["TRACK_ID"]).transform("any")
+            self.spots.loc[~track_ever_in_box, "INGRESSING"] = False
 
-        def _finish(result):
-            # Patch ingression columns into live spots
-            for col in [
-                "INGRESSING",
-                "INGRESSION_SCORE",
-                "INGRESSION_ONSET_FRAME",
-                "TRACK_NET_RADIAL_DISP",
-                "TRACK_SUSTAINED_INWARD",
-            ]:
-                if col in result.columns:
-                    self.spots[col] = result[col].values
-
-            n_ing = int(self.spots["INGRESSING"].sum())
-            n_total = len(self.spots)
-            n_tracks = 0
-            if "TRACK_ID" in self.spots.columns:
-                n_tracks = int(
-                    self.spots.loc[self.spots["INGRESSING"], "TRACK_ID"].nunique()
-                )
-            pct = n_ing / max(n_total, 1) * 100
-            roi_tag = " [ROI-only]" if roi_only else ""
-            self.lbl_ingression.value = (
-                f"Ingressing: {n_ing:,} spots ({n_tracks} tracks, {pct:.1f}%){roi_tag}\n"
-                f"V_r≤{thresh:.3f}, inward≥{inward_frac:.0%}, ≥{min_f}f, net-in+sustained"
+            # (2) Exclude tracks breaching the vegetal boundary
+            vegetal_breach = (
+                df.groupby("TRACK_ID")["POSITION_Y"].transform("max") > b["y_max"]
             )
-            self.viewer.status = (
-                f"Flagged {n_ing:,} ingressing spots ({n_tracks} tracks){roi_tag}. "
-                f"Use 'Colour Ingressing' to visualise."
-            )
+            self.spots.loc[vegetal_breach, "INGRESSING"] = False
 
-        self._run_background("Flagging ingression", _bg, _finish)
+        n_ing = int(self.spots["INGRESSING"].sum())
+        n_total = len(self.spots)
+        n_tracks = 0
+        if "TRACK_ID" in self.spots.columns:
+            n_tracks = int(
+                self.spots.loc[self.spots["INGRESSING"], "TRACK_ID"].nunique()
+            )
+        pct = n_ing / max(n_total, 1) * 100
+        roi_tag = " [ROI-only]" if self.ingression_roi_only.value else ""
+        self.lbl_ingression.value = (
+            f"Ingressing: {n_ing:,} spots ({n_tracks} tracks, {pct:.1f}%){roi_tag}\n"
+            f"V_r≤{thresh:.3f}, inward≥{inward_frac:.0%}, ≥{min_f}f, net-in+sustained"
+        )
+        self.viewer.status = (
+            f"Flagged {n_ing:,} ingressing spots ({n_tracks} tracks){roi_tag}. "
+            f"Use 'Colour Ingressing' to visualise."
+        )
 
     def _on_ingression_tracks_toggle(self):
         """Show only tracks/spots of ingressing cells, or all."""
@@ -2172,29 +2096,14 @@ class EmbryoViewer:
     # ── Refresh layers ────────────────────────────────────────────────
 
     def _refresh_points(self):
-        """Update the points layer data after orientation or slider change (background)."""
+        """Update the points layer data after orientation or slider change."""
         if self.spots_layer is None:
             return
-        if self._bg_refreshing_points:
-            self._refresh_points_pending = True
-            return
-        self._bg_refreshing_points = True
-
-        def _bg():
-            return self._build_display_points()
-
-        def _finish(result):
-            self._bg_refreshing_points = False
-            data, idx = result
-            self._display_idx = idx
-            colors = self._get_display_colors()
-            self.spots_layer.data = data
-            self.spots_layer.face_color = colors
-            if self._refresh_points_pending:
-                self._refresh_points_pending = False
-                self._refresh_points()
-
-        self._run_background("Refreshing display", _bg, _finish)
+        data, idx = self._build_display_points()
+        self._display_idx = idx
+        colors = self._get_display_colors()
+        self.spots_layer.data = data
+        self.spots_layer.face_color = colors
 
     def _refresh_tracks(self):
         """Update the tracks layer after orientation or slider change."""

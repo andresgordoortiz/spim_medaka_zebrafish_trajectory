@@ -1,25 +1,53 @@
 # =============================================================================
-# TrackMate 3D Cell Movement Analysis - Zebrafish/Medaka Embryo Nuclei Tracking
+# TrackMate Analysis — Comprehensive Per-Species 4D Embryo Nuclei Tracking
 # =============================================================================
 #
-# This is Step 3 of the production pipeline:
-#   Step 0: TrackMate → export ALL tracks (no filters)
-#   Step 1: orientation_interactive.R → orient embryo → oriented CSVs
-#   Step 2: trackmate_filter_and_validate.R → filter + validate → filtered CSVs
-# → Step 3: THIS SCRIPT → full biological analysis
+# PURPOSE:
+#   Step 3 of the production pipeline:
+#     Step 0: TrackMate → export ALL tracks (no filters)
+#     Step 1: embryo_viewer.py → orient, sphere-fit, ROI, ingression detection
+#     Step 2: trackmate_filter_and_validate.R → filter + validate (medaka only)
+#   → Step 3: THIS SCRIPT → comprehensive per-species biological analysis
 #
-# INPUT:
-#   - analysis_output/filtered_spots.csv   (from Step 2)
-#   - analysis_output/filtered_tracks.csv  (from Step 2)
-#   Data is already oriented and QC-filtered. No reorientation or filtering here.
+# DESIGN:
+#   • SEPARATE per-species PDFs (not combined) — each species gets its own set
+#   • Cross-species comparison dashboard as a final integrative section
+#   • Uses enriched columns from napari viewer: radial/tangential velocity,
+#     spherical depth, ingression labels, ROI flags
+#   • Computes instantaneous 3D velocity, MSD, turning angles from raw positions
+#   • Comprehensive ingression analysis for zebrafish (validated labels)
+#   • Margin/ROI density analysis for ingression characterisation
 #
-# BIOLOGICAL CONTEXT:
-#   - Tracking nuclei in developing zebrafish/medaka embryos
-#   - 3D imaging (SPIM) captures nuclear positions over time
-#   - 1 frame = 30 seconds temporal resolution
-#   - Nuclei move during cell division, migration, and morphogenesis
-#   - Expected speeds: 0.5-5 µm/min for normal nuclear movement
+# INPUTS (per species, from analysis_output_{species}/):
+#   - oriented_spots.csv      38-col enriched spot data
+#   - track_summary.csv       20-col per-track aggregates
+#   - sphere_params.csv       Fitted sphere centre & radius
+#   - roi_bounds.csv          ROI bounding box
+#   - ingression_params.csv   Ingression detection parameters
+#   - analysis_metadata.json  Viewer session metadata
+#   For medaka (filtered): analysis_output/filtered_spots.csv, filtered_track_summary.csv
+#
+# OUTPUTS (in analysis_output/):
+#   Per species ({zf,mk}_):
+#     01_overview_qc.pdf        — nuclei count, rate of change, summary
+#     02_spatial.pdf            — theta-phi, XY, depth, angular coverage
+#     03_track_topology.pdf     — length, duration, birth/death, active
+#     04_density.pdf            — 3D voxel density, ROI density
+#     05_velocity.pdf           — radial, tangential, instantaneous speed
+#     06_flow_fields.pdf        — velocity vector fields (theta-phi, XY)
+#     07_physical_properties.pdf — MSD, confinement, displacement, diffusion
+#     08_directionality.pdf     — inward fraction, sustained, turning angles
+#     09_intensity_qc.pdf       — intensity, SNR, quality
+#   Zebrafish only:
+#     zf_10_ingression.pdf      — onset timing, spatial, pseudo-trajectories
+#     zf_11_margin_density.pdf  — cell density in/near ingression margin
+#   Cross-species:
+#     12_cross_species.pdf      — normalised comparisons
+#   Data:
+#     analysis_summary.csv
 # =============================================================================
+
+source("renv/activate.R")
 
 library(dplyr)
 library(ggplot2)
@@ -29,2608 +57,1831 @@ library(viridis)
 library(purrr)
 library(tibble)
 library(patchwork)
-library(cluster)
-library(plotly)
-library(htmlwidgets)
+library(scales)
+library(data.table)
+library(jsonlite)
 
 # =============================================================================
-# GLOBAL PARAMETERS
+# PARAMETERS
 # =============================================================================
 
-FRAME_INTERVAL_SEC <- 30  # Each frame is 30 seconds
-FRAME_INTERVAL_MIN <- 0.5 # 30 sec = 0.5 min
+FRAME_INTERVAL_SEC <- 30
+FRAME_INTERVAL_MIN <- FRAME_INTERVAL_SEC / 60
+SPEED_CONVERSION   <- 60 / FRAME_INTERVAL_SEC   # µm/frame → µm/min
 
-# Movement type colors
-movement_colors <- c(
-  "Directed" = "#2166AC",
-  "Confined" = "#B2182B",
-  "Random" = "#762A83",
-  "NS" = "grey85"
+OUTPUT_DIR <- "analysis_output"
+
+SPECIES <- list(
+  zebrafish = list(
+    name      = "Zebrafish",
+    short     = "ZF",
+    prefix    = "zf",
+    color     = "#2166AC",
+    data_dir  = "analysis_output_zebrafish",
+    has_ingression = TRUE
+  ),
+  medaka = list(
+    name      = "Medaka",
+    short     = "MK",
+    prefix    = "mk",
+    color     = "#B2182B",
+    data_dir  = "analysis_output_medaka",
+    filter_dir = "analysis_output",
+    has_ingression = FALSE
+  )
 )
 
-# Cluster colors (using viridis for many categories)
-cluster_pal <- viridis::viridis(6)
+# Voxel density
+VOXEL_SIZE_UM <- 50
 
-# Base plotting theme
-theme_track <- function(base_size = 10) {
-  theme_minimal(base_size = base_size) +
-    theme(
-      plot.title = element_text(hjust = 0.5, face = "bold", size = base_size + 1),
-      plot.subtitle = element_text(hjust = 0.5, size = base_size - 1, color = "grey50"),
-      legend.position = "bottom",
-      legend.key.size = unit(0.3, "cm"),
-      legend.text = element_text(size = base_size - 2),
-      panel.grid.minor = element_blank(),
-      axis.text = element_text(size = base_size - 1)
-    )
-}
+# Depth bins (µm from surface)
+DEPTH_BREAKS <- c(-Inf, 0, 10, 20, 40, 60, Inf)
+DEPTH_LABELS <- c("Outside (<0)", "Surface (0-10)", "Shallow (10-20)",
+                   "Mid (20-40)", "Deep (40-60)", "Very deep (>60)")
 
-# =============================================================================
-# PART 1: DATA LOADING
-# =============================================================================
-#
-# Reads the pre-filtered, pre-oriented CSVs from trackmate_filter_and_validate.R.
-# No additional filtering or coordinate transforms are applied.
-#
+# MSD analysis
+MSD_MAX_LAG    <- 30   # max lag in frames
+MSD_N_TRACKS   <- 8000 # max tracks to sample for MSD
 
-cat("\n=== PART 1: DATA LOADING ===\n")
+# Velocity field grid
+FLOW_BIN_THETA <- 10   # degrees
+FLOW_BIN_PHI   <- 10
+FLOW_BIN_XY    <- 30   # µm
+FLOW_MIN_N     <- 20   # minimum spots per bin for flow field
 
-INPUT_DIR <- "analysis_output"
-OUTPUT_DIR <- "analysis_output"
 if (!dir.exists(OUTPUT_DIR)) dir.create(OUTPUT_DIR, recursive = TRUE)
 
-spots_clean <- read_csv(file.path(INPUT_DIR, "filtered_spots.csv"), show_col_types = FALSE) %>%
-  mutate(across(c(ID, TRACK_ID, POSITION_X, POSITION_Y, POSITION_Z, FRAME),
-                ~as.numeric(.))) %>%
-  filter(!is.na(TRACK_ID))
-
-tracks_clean <- read_csv(file.path(INPUT_DIR, "filtered_tracks.csv"), show_col_types = FALSE) %>%
-  mutate(across(-LABEL, ~suppressWarnings(as.numeric(.))))
-
-# Ensure converted speed columns exist (they should from filter script)
-SPEED_CONVERSION_FACTOR <- 60 / FRAME_INTERVAL_SEC  # 2 for 30-sec frames
-
-if (!"SPEED_MEAN_UM_MIN" %in% names(tracks_clean)) {
-  tracks_clean <- tracks_clean %>%
-    mutate(SPEED_MEAN_UM_MIN   = TRACK_MEAN_SPEED   * SPEED_CONVERSION_FACTOR,
-           SPEED_MAX_UM_MIN    = TRACK_MAX_SPEED    * SPEED_CONVERSION_FACTOR,
-           SPEED_MEDIAN_UM_MIN = TRACK_MEDIAN_SPEED * SPEED_CONVERSION_FACTOR)
-}
-if (!"DURATION_MIN" %in% names(tracks_clean)) {
-  tracks_clean <- tracks_clean %>%
-    mutate(DURATION_MIN = TRACK_DURATION * FRAME_INTERVAL_MIN)
-}
-
-cat(sprintf("  Loaded %s tracks, %s spots (pre-filtered & oriented)\n",
-            format(nrow(tracks_clean), big.mark = ","),
-            format(nrow(spots_clean), big.mark = ",")))
-cat(sprintf("  Time covered: %.1f min\n", max(spots_clean$FRAME, na.rm = TRUE) * FRAME_INTERVAL_MIN))
-cat(sprintf("  Per-track mean speed median: %.2f µm/min\n",
-            median(tracks_clean$SPEED_MEAN_UM_MIN, na.rm = TRUE)))
-
 # =============================================================================
-# PART 2: VELOCITY ANALYSIS
+# THEME & HELPERS
 # =============================================================================
-#
-# BIOLOGICAL INTERPRETATION:
-#   Nuclear velocities reflect cell behavior:
-#   - Constant speed → directed migration (e.g., during gastrulation)
-#   - Variable speed → random movement or confined exploration
-#   - Speed changes over time → developmental transitions
-#
-#   We calculate instantaneous velocities from spot-to-spot displacements.
-#
 
-cat("\n=== PART 2: VELOCITY ANALYSIS ===\n")
-
-# Calculate INSTANTANEOUS (per-step) velocities from spot positions
-# This is different from SPEED_MEAN_UM_MIN (per-track averages from TrackMate).
-# inst_speed_um_min = displacement between consecutive spots / time interval
-# All speeds in µm/min.
-spots_velocity <- spots_clean %>%
-  arrange(TRACK_ID, FRAME) %>%
-  group_by(TRACK_ID) %>%
-  mutate(
-    # Time difference (in minutes)
-    dt_min = (FRAME - lag(FRAME)) * FRAME_INTERVAL_MIN,
-
-    # Displacements (µm)
-    dx = POSITION_X - lag(POSITION_X),
-    dy = POSITION_Y - lag(POSITION_Y),
-    dz = POSITION_Z - lag(POSITION_Z),
-    displacement = sqrt(dx^2 + dy^2 + dz^2),
-
-    # Instantaneous speed (µm/min) — this is per-step, NOT per-track
-    inst_speed_um_min = displacement / dt_min,
-
-    # Velocity components (µm/min)
-    vx = dx / dt_min,
-    vy = dy / dt_min,
-    vz = dz / dt_min,
-
-    # Time from track start (minutes)
-    time_min = (FRAME - min(FRAME)) * FRAME_INTERVAL_MIN
-  ) %>%
-  ungroup()
-
-# Instantaneous speed statistics (per-step, not per-track)
-speed_stats <- spots_velocity %>%
-  filter(!is.na(inst_speed_um_min)) %>%
-  summarise(
-    mean = mean(inst_speed_um_min),
-    median = median(inst_speed_um_min),
-    sd = sd(inst_speed_um_min),
-    q95 = quantile(inst_speed_um_min, 0.95)
-  )
-
-cat(sprintf("Instantaneous (per-step) Speed Statistics (µm/min):\n"))
-cat(sprintf("  Mean: %.2f\n", speed_stats$mean))
-cat(sprintf("  Median: %.2f\n", speed_stats$median))
-cat(sprintf("  95th percentile: %.2f\n", speed_stats$q95))
-cat(sprintf("  Compare to per-track mean: %.2f µm/min (median of SPEED_MEAN_UM_MIN)\n",
-            median(tracks_clean$SPEED_MEAN_UM_MIN, na.rm = TRUE)))
-cat("  (Per-step median is typically higher than per-track mean because\n")
-cat("   averaging within each track smooths out fast steps)\n")
-
-# Plot 5: Instantaneous speed distribution
-#
-# INTERPRETATION:
-#   - Peak location = typical nuclear speed
-#   - Width = variability in movement
-#   - Tail = fast movements (division, migration)
-#
-p5 <- ggplot(spots_velocity %>% filter(!is.na(inst_speed_um_min)),
-             aes(x = inst_speed_um_min)) +
-  geom_histogram(aes(y = after_stat(density)), bins = 50, fill = "#2166AC", alpha = 0.7) +
-  geom_density(color = "#B2182B", linewidth = 1) +
-  geom_vline(xintercept = speed_stats$median, linetype = "dashed", color = "grey30", linewidth = 0.4) +
-  labs(
-    title = "Instantaneous Nuclear Speed (per-step, 3D)",
-    subtitle = sprintf("Median: %.2f µm/min | 95th pct: %.2f µm/min",
-                       speed_stats$median, speed_stats$q95),
-    x = "Instantaneous speed (µm/min)",
-    y = "Density"
-  ) +
-  theme_track()
-
-# Plot 6: Speed over developmental time (10-min bins)
-speed_over_time <- spots_velocity %>%
-  filter(!is.na(inst_speed_um_min)) %>%
-  mutate(time_bin_min = floor(FRAME * FRAME_INTERVAL_MIN / 10) * 10) %>%
-  group_by(time_bin_min) %>%
-  summarise(
-    mean_speed = mean(inst_speed_um_min, na.rm = TRUE),
-    se_speed = sd(inst_speed_um_min, na.rm = TRUE) / sqrt(n()),
-    n = n()
-  )
-
-p6 <- ggplot(speed_over_time, aes(x = time_bin_min, y = mean_speed)) +
-  geom_ribbon(aes(ymin = mean_speed - se_speed, ymax = mean_speed + se_speed),
-              alpha = 0.3, fill = "#2166AC") +
-  geom_line(color = "#2166AC", linewidth = 1) +
-  labs(
-    title = "Mean Instantaneous Speed Over Time",
-    subtitle = "Shaded: SE | Per-step speed from XYZ displacements (µm/min)",
-    x = "Time (min from start)",
-    y = "Mean instantaneous speed (µm/min)"
-  ) +
-  theme_track()
-
-# Plot 7: Number of detected spots per developmental time
-# Shows how many nuclei are tracked at each time point
-spots_per_time <- spots_clean %>%
-  mutate(time_min = FRAME * FRAME_INTERVAL_MIN) %>%
-  group_by(time_min) %>%
-  summarise(n_spots = n(), .groups = "drop")
-
-p7 <- ggplot(spots_per_time, aes(x = time_min, y = n_spots)) +
-  geom_line(color = "#2166AC", linewidth = 0.6) +
-  geom_smooth(method = "loess", span = 0.3, color = "#B2182B", linewidth = 1, se = FALSE) +
-  labs(
-    title = "Detected Spots per Time Point",
-    subtitle = sprintf("Total frames: %d | Mean: %.0f spots/frame",
-                       n_distinct(spots_clean$FRAME), mean(spots_per_time$n_spots)),
-    x = "Time (min from start)",
-    y = "Number of spots"
-  ) +
-  theme_track()
-
-cat(sprintf("  Spots per frame — mean: %.0f, range: %d–%d\n",
-            mean(spots_per_time$n_spots),
-            min(spots_per_time$n_spots), max(spots_per_time$n_spots)))
-
-# Combine velocity plots
-velocity_combined <- (p5 + p6) / (p7 + plot_spacer()) +
-  plot_annotation(
-    title = "Nuclear Velocity & Detection Overview",
-    theme = theme(
-      plot.title = element_text(size = 14, face = "bold", hjust = 0.5)
-    )
-  )
-
-ggsave("analysis_output/01_velocity_analysis.pdf", velocity_combined, width = 18, height = 10)
-cat("  Saved: 01_velocity_analysis.pdf\n")
-
-# =============================================================================
-# PART 3: DIRECTIONALITY ANALYSIS
-# =============================================================================
-#
-# BIOLOGICAL INTERPRETATION:
-#   Nuclear movement directionality reveals:
-#   - Random movement (high turning angles) → confined/exploratory behavior
-#   - Persistent movement (low turning angles) → directed migration
-#   - Preferred directions → tissue-level organization forces
-#
-#   Turning angle: angle between consecutive displacement vectors
-#   - 0° = straight line (persistent)
-#   - 90° = random (no correlation)
-#   - 180° = reversal (oscillatory)
-#
-
-cat("\n=== PART 3: DIRECTIONALITY ANALYSIS ===\n")
-
-# Calculate turning angles
-spots_direction <- spots_velocity %>%
-  filter(!is.na(dx) & !is.na(dy) & !is.na(dz)) %>%
-  group_by(TRACK_ID) %>%
-  mutate(
-    # Previous displacement vector
-    prev_dx = lag(dx),
-    prev_dy = lag(dy),
-    prev_dz = lag(dz),
-
-    # Dot product and magnitudes
-    dot_product = dx * prev_dx + dy * prev_dy + dz * prev_dz,
-    mag_current = sqrt(dx^2 + dy^2 + dz^2),
-    mag_prev = sqrt(prev_dx^2 + prev_dy^2 + prev_dz^2),
-
-    # Turning angle (radians → degrees)
-    turning_angle = acos(pmin(1, pmax(-1, dot_product / (mag_current * mag_prev + 1e-10)))) * 180 / pi,
-
-    # XY direction (azimuthal angle)
-    direction_xy = atan2(dy, dx) * 180 / pi
-  ) %>%
-  ungroup()
-
-# Turning angle summary
-turning_stats <- spots_direction %>%
-  filter(!is.na(turning_angle)) %>%
-  summarise(
-    mean_angle = mean(turning_angle),
-    median_angle = median(turning_angle)
-  )
-
-cat(sprintf("Turning Angle Statistics:\n"))
-cat(sprintf("  Mean: %.1f°\n", turning_stats$mean_angle))
-cat(sprintf("  Median: %.1f°\n", turning_stats$median_angle))
-cat("  (90° = random; <90° = persistent; >90° = reversing)\n")
-
-# Plot 7: Turning angle distribution
-#
-# INTERPRETATION:
-#   - Peak near 90° → random/diffusive movement
-#   - Peak below 90° → directed/persistent movement
-#   - Bimodal → mixed populations (some directed, some random)
-#
-p7 <- ggplot(spots_direction %>% filter(!is.na(turning_angle)),
-             aes(x = turning_angle)) +
-  geom_histogram(aes(y = after_stat(density)), bins = 36, fill = "#2166AC", alpha = 0.7) +
-  geom_vline(xintercept = 90, linetype = "dashed", color = "#B2182B", linewidth = 0.4) +
-  labs(
-    title = "Distribution of Turning Angles",
-    subtitle = "90° = random; <90° = persistent; >90° = reversing",
-    x = "Turning angle (degrees)",
-    y = "Density"
-  ) +
-  theme_track()
-
-# Plot 8: Rose diagram of XY directions
-#
-# INTERPRETATION:
-#   - Uniform → no preferred direction (isotropic movement)
-#   - Peaks → preferred migration axes (tissue polarity)
-#
-p8 <- ggplot(spots_direction %>% filter(!is.na(direction_xy)),
-             aes(x = direction_xy)) +
-  geom_histogram(bins = 36, fill = "#2166AC", color = "white", alpha = 0.7) +
-  coord_polar(start = 0) +
-  scale_x_continuous(limits = c(-180, 180), breaks = seq(-180, 135, 45)) +
-  labs(
-    title = "Movement Direction (XY plane)",
-    subtitle = "Rose diagram of migration angles",
-    x = "Direction (degrees)",
-    y = "Count"
-  ) +
-  theme_track() +
-  theme(axis.text.y = element_blank())
-
-# Combine direction plots
-direction_combined <- (p7 + p8) +
-  plot_annotation(
-    title = "Directionality Analysis",
-    subtitle = "How nuclei change direction during movement",
-    theme = theme(
-      plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
-      plot.subtitle = element_text(size = 10, hjust = 0.5, color = "grey40")
-    )
-  )
-
-ggsave("analysis_output/02_directionality.pdf", direction_combined, width = 12, height = 5)
-cat("  Saved: 02_directionality.pdf\n")
-
-# =============================================================================
-# PART 4: SPATIAL VELOCITY PATTERNS
-# =============================================================================
-#
-# BIOLOGICAL INTERPRETATION:
-#   Spatial patterns in velocity reveal:
-#   - Morphogenetic flows (collective cell movements)
-#   - Regional differences (e.g., faster at embryo margins)
-#   - Tissue organization (convergent/divergent flows)
-#
-
-cat("\n=== PART 4: SPATIAL VELOCITY PATTERNS ===\n")
-
-# Bin space for local velocity statistics
-spatial_velocity <- spots_velocity %>%
-  filter(!is.na(inst_speed_um_min)) %>%
-  mutate(
-    x_bin = round(POSITION_X / 15) * 15,  # 15 µm bins
-    y_bin = round(POSITION_Y / 15) * 15,
-    z_bin = round(POSITION_Z / 15) * 15
-  )
-
-# Local velocity statistics (XY projection)
-local_stats_xy <- spatial_velocity %>%
-  group_by(x_bin, y_bin) %>%
-  summarise(
-    mean_speed = mean(inst_speed_um_min, na.rm = TRUE),
-    mean_vx = mean(vx, na.rm = TRUE),
-    mean_vy = mean(vy, na.rm = TRUE),
-    n = n(),
-    .groups = "drop"
-  ) %>%
-  filter(n >= 20)
-
-# Plot 9: Spatial speed heatmap
-#
-# INTERPRETATION:
-#   - Hot spots = regions of high nuclear motility
-#   - Cold regions = quiescent or stationary nuclei
-#   - Gradients = transitional zones
-#
-p9 <- ggplot(local_stats_xy, aes(x = x_bin, y = y_bin, fill = mean_speed)) +
-  geom_tile() +
-  scale_fill_viridis_c(name = "Speed\n(µm/min)", option = "plasma") +
-  coord_fixed() +
-  labs(
-    title = "Spatial Distribution of Nuclear Speed",
-    subtitle = "XY projection; color = mean local speed",
-    x = "X position (µm)",
-    y = "Y position (µm)"
-  ) +
-  theme_track()
-
-# Plot 10: Velocity vector field
-#
-# INTERPRETATION:
-#   - Arrows show local flow direction
-#   - Aligned arrows = collective migration
-#   - Random arrows = disorganized movement
-#
-p10 <- ggplot(local_stats_xy %>% filter(n >= 50),
-              aes(x = x_bin, y = y_bin)) +
-  geom_segment(aes(xend = x_bin + mean_vx * 5, yend = y_bin + mean_vy * 5,
-                   color = mean_speed),
-               arrow = arrow(length = unit(0.15, "cm")), linewidth = 0.4) +
-  scale_color_viridis_c(name = "Speed\n(µm/min)", option = "plasma") +
-  coord_fixed() +
-  labs(
-    title = "Local Velocity Vector Field",
-    subtitle = "Arrows show mean flow direction (scaled 5x)",
-    x = "X position (µm)",
-    y = "Y position (µm)"
-  ) +
-  theme_track()
-
-# Combine spatial plots
-spatial_combined <- (p9 + p10) +
-  plot_annotation(
-    title = "Spatial Velocity Patterns (15 um clusters)",
-    subtitle = "Where nuclei move faster and in what direction",
-    theme = theme(
-      plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
-      plot.subtitle = element_text(size = 10, hjust = 0.5, color = "grey40")
-    )
-  )
-
-ggsave("analysis_output/03_spatial_velocity.pdf", spatial_combined, width = 12, height = 6)
-cat("  Saved: 03_spatial_velocity.pdf\n")
-
-# =============================================================================
-# PART 5: MEAN SQUARED DISPLACEMENT (MSD) ANALYSIS
-# =============================================================================
-#
-# BIOLOGICAL INTERPRETATION:
-#   MSD reveals the TYPE of movement:
-#   - MSD ~ t^α where α (alpha) indicates movement mode:
-#     α ≈ 1: Normal diffusion (random walk)
-#     α < 1: Subdiffusion (confined, e.g., in crowded tissue)
-#     α > 1: Superdiffusion (directed migration)
-#
-#   This is key for understanding whether nuclei are:
-#   - Freely diffusing (random)
-#   - Confined by surrounding cells
-#   - Actively migrating with a bias
-#
-
-cat("\n=== PART 5: MSD ANALYSIS ===\n")
-
-# Calculate MSD for each track
-calculate_msd <- function(df, max_lag = 30) {
-  n <- nrow(df)
-  if (n < MIN_SPOTS) return(NULL)
-
-  max_lag <- min(max_lag, n - 1)
-
-  msd_values <- sapply(1:max_lag, function(lag) {
-    displacements <- (df$POSITION_X[(lag+1):n] - df$POSITION_X[1:(n-lag)])^2 +
-      (df$POSITION_Y[(lag+1):n] - df$POSITION_Y[1:(n-lag)])^2 +
-      (df$POSITION_Z[(lag+1):n] - df$POSITION_Z[1:(n-lag)])^2
-    mean(displacements, na.rm = TRUE)
-  })
-
-  tibble(
-    lag_frames = 1:max_lag,
-    lag_min = 1:max_lag * FRAME_INTERVAL_MIN,
-    msd = msd_values
-  )
-}
-
-# Sample tracks for MSD (memory efficient)
-set.seed(42)
-sample_tracks <- sample(unique(spots_clean$TRACK_ID), min(10000, n_distinct(spots_clean$TRACK_ID)))
-
-msd_data <- spots_clean %>%
-  filter(TRACK_ID %in% sample_tracks) %>%
-  arrange(TRACK_ID, FRAME) %>%
-  group_by(TRACK_ID) %>%
-  group_modify(~{
-    result <- calculate_msd(.x)
-    if (is.null(result)) return(tibble())
-    result
-  }) %>%
-  ungroup()
-
-# Ensemble MSD
-ensemble_msd <- msd_data %>%
-  group_by(lag_min) %>%
-  summarise(
-    mean_msd = mean(msd, na.rm = TRUE),
-    se_msd = sd(msd, na.rm = TRUE) / sqrt(n()),
-    n = n()
-  ) %>%
-  filter(n >= 50)
-
-# Fit power law: MSD = D * t^alpha
-msd_fit <- lm(log(mean_msd) ~ log(lag_min), data = ensemble_msd %>% filter(lag_min <= 10))
-alpha <- coef(msd_fit)[2]
-D_apparent <- exp(coef(msd_fit)[1]) / 6  # 3D diffusion coefficient
-
-cat(sprintf("MSD Analysis Results:\n"))
-cat(sprintf("  Power law exponent (α): %.3f\n", alpha))
-cat(sprintf("  Interpretation: %s\n",
-            ifelse(alpha < 0.8, "Subdiffusive (confined movement)",
-                   ifelse(alpha > 1.2, "Superdiffusive (directed migration)",
-                          "Normal diffusion (random walk)"))))
-cat(sprintf("  Apparent diffusion coefficient: %.3f µm²/min\n", D_apparent))
-
-# Plot 11: MSD curves
-#
-# INTERPRETATION:
-#   - Individual gray lines = single track MSDs (variability)
-#   - Red line = ensemble average (population behavior)
-#   - Slope on log-log plot = α (movement type)
-#
-p11 <- ggplot() +
-  geom_line(data = msd_data %>% filter(TRACK_ID %in% sample(unique(TRACK_ID), 50)),
-            aes(x = lag_min, y = msd, group = TRACK_ID), alpha = 0.2, color = "grey50") +
-  geom_ribbon(data = ensemble_msd,
-              aes(x = lag_min, ymin = mean_msd - se_msd, ymax = mean_msd + se_msd),
-              alpha = 0.3, fill = "#B2182B") +
-  geom_line(data = ensemble_msd, aes(x = lag_min, y = mean_msd),
-            color = "#B2182B", linewidth = 1.2) +
-  scale_x_log10() +
-  scale_y_log10() +
-  labs(
-    title = "Mean Squared Displacement Analysis",
-    subtitle = sprintf("alpha = %.2f (%s)", alpha,
-                      ifelse(alpha < 0.8, "subdiffusive",
-                             ifelse(alpha > 1.2, "superdiffusive", "diffusive"))),
-    x = "Time lag (min, log scale)",
-    y = "MSD (µm², log scale)"
-  ) +
-  theme_track()
-
-ggsave("analysis_output/04_msd_analysis.pdf", p11, width = 8, height = 6)
-cat("  Saved: 04_msd_analysis.pdf\n")
-
-# =============================================================================
-# PART 6: TRACK CLASSIFICATION BY MOVEMENT TYPE
-# =============================================================================
-#
-# BIOLOGICAL INTERPRETATION:
-#   Different nuclei show different movement patterns:
-#   - Directed: actively migrating cells (high confinement ratio, low turning)
-#   - Confined: cells in dense tissue (low confinement ratio)
-#   - Random: cells exploring their environment
-#
-#   We classify based on confinement ratio and linearity.
-#
-
-cat("\n=== PART 6: MOVEMENT TYPE CLASSIFICATION ===\n")
-
-# Classify tracks based on movement metrics
-tracks_classified <- tracks_clean %>%
-  mutate(
-    movement_type = case_when(
-      CONFINEMENT_RATIO > 0.6 & LINEARITY_OF_FORWARD_PROGRESSION > 0.5 ~ "Directed",
-      CONFINEMENT_RATIO < 0.3 ~ "Confined",
-      TRUE ~ "Random"
-    ),
-    movement_type = factor(movement_type, levels = c("Directed", "Random", "Confined"))
-  )
-
-# Summary
-movement_summary <- tracks_classified %>%
-  count(movement_type) %>%
-  mutate(pct = 100 * n / sum(n))
-
-cat("Movement Type Classification:\n")
-for (i in 1:nrow(movement_summary)) {
-  cat(sprintf("  %s: %d tracks (%.1f%%)\n",
-              movement_summary$movement_type[i],
-              movement_summary$n[i],
-              movement_summary$pct[i]))
-}
-
-# Plot 12: Scatter of confinement vs linearity
-#
-# INTERPRETATION:
-#   - Upper right = directed migration
-#   - Lower left = confined/exploratory
-#   - Middle = random/intermediate
-#
-p12 <- ggplot(tracks_classified,
-              aes(x = CONFINEMENT_RATIO, y = LINEARITY_OF_FORWARD_PROGRESSION,
-                  color = movement_type)) +
-  geom_point(data = tracks_classified %>% filter(movement_type == "Random"),
-             alpha = 0.1, size = 0.5) +
-  geom_point(data = tracks_classified %>% filter(movement_type != "Random"),
-             alpha = 0.5, size = 1) +
-  geom_vline(xintercept = c(0.3, 0.6), linetype = "dashed", color = "grey50", linewidth = 0.3) +
-  geom_hline(yintercept = 0.5, linetype = "dashed", color = "grey50", linewidth = 0.3) +
-  scale_color_manual(values = movement_colors, breaks = c("Directed", "Random", "Confined")) +
-  labs(
-    title = "Movement Type Classification",
-    subtitle = "Based on confinement ratio and linearity",
-    x = "Confinement ratio (displacement/distance)",
-    y = "Linearity of forward progression",
-    color = NULL
-  ) +
-  coord_fixed(ratio = 1, xlim = c(0, 1), ylim = c(0, 1)) +
-  theme_track()
-
-# Plot 13: Movement type proportions (bar plot)
-p13 <- ggplot(movement_summary, aes(x = movement_type, y = pct, fill = movement_type)) +
-  geom_col(width = 0.7) +
-  geom_text(aes(label = sprintf("%d\n(%.0f%%)", n, pct)),
-            vjust = -0.2, size = 3, fontface = "bold") +
-  scale_fill_manual(values = movement_colors, breaks = c("Directed", "Random", "Confined")) +
-  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
-  labs(
-    title = "Movement Type Distribution",
-    x = NULL,
-    y = "% of tracks",
-    fill = NULL
-  ) +
-  theme_track() +
-  theme(legend.position = "none", panel.grid.major.x = element_blank())
-
-# Combine classification plots
-classification_combined <- (p12 + p13) +
-  plot_annotation(
-    title = "Nuclear Movement Classification",
-    subtitle = "Directed = persistent migration; Confined = restricted movement; Random = exploratory",
-    theme = theme(
-      plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
-      plot.subtitle = element_text(size = 10, hjust = 0.5, color = "grey40")
-    )
-  )
-
-ggsave("analysis_output/05_movement_classification.pdf", classification_combined, width = 12, height = 5)
-cat("  Saved: 05_movement_classification.pdf\n")
-
-# =============================================================================
-# PART 7: CLUSTERING ANALYSIS (memory-efficient)
-# =============================================================================
-#
-# BIOLOGICAL INTERPRETATION:
-#   Clustering identifies subpopulations of nuclei with similar movement:
-#   - Different cell types may have distinct motility signatures
-#   - Regional differences in tissue dynamics
-#   - Developmental stage-specific behaviors
-#
-#   We use k-means on a sample to avoid memory issues.
-#
-
-cat("\n=== PART 7: CLUSTERING ANALYSIS ===\n")
-
-# Prepare features for clustering
-# NOTE: Using SPEED_MEAN_UM_MIN (per-track mean speed in µm/min)
-clustering_features <- tracks_classified %>%
-  select(TRACK_ID, SPEED_MEAN_UM_MIN, CONFINEMENT_RATIO,
-         LINEARITY_OF_FORWARD_PROGRESSION, MEAN_DIRECTIONAL_CHANGE_RATE,
-         DURATION_MIN) %>%
-  filter(complete.cases(.))
-
-# Sample for memory efficiency
-set.seed(42)
-sample_size <- min(8000, nrow(clustering_features))
-sample_idx <- sample(1:nrow(clustering_features), sample_size)
-features_sample <- clustering_features[sample_idx, ]
-
-# Scale features
-features_scaled <- scale(features_sample %>% select(-TRACK_ID))
-
-# Determine optimal k using within-cluster sum of squares (faster than silhouette)
-wss <- sapply(2:8, function(k) {
-  km <- kmeans(features_scaled, centers = k, nstart = 10, iter.max = 20)
-  km$tot.withinss
-})
-
-# Elbow method - look for bend
-optimal_k <- 4  # Default to 4 clusters
-
-cat(sprintf("Using %d clusters based on elbow method\n", optimal_k))
-
-# Final clustering
-set.seed(42)
-km_result <- kmeans(features_scaled, centers = optimal_k, nstart = 25)
-features_sample$cluster <- factor(km_result$cluster)
-
-# Cluster summary
-cluster_summary <- features_sample %>%
-  group_by(cluster) %>%
-  summarise(
-    n = n(),
-    mean_speed = mean(SPEED_MEAN_UM_MIN),
-    mean_confinement = mean(CONFINEMENT_RATIO),
-    mean_linearity = mean(LINEARITY_OF_FORWARD_PROGRESSION),
-    mean_duration = mean(DURATION_MIN)
-  ) %>%
-  mutate(pct = 100 * n / sum(n))
-
-cat("\nCluster Summary:\n")
-print(as.data.frame(cluster_summary))
-
-# Plot 14: Cluster characteristics
-cluster_long <- features_sample %>%
-  select(cluster, SPEED_MEAN_UM_MIN, CONFINEMENT_RATIO, LINEARITY_OF_FORWARD_PROGRESSION) %>%
-  pivot_longer(-cluster, names_to = "metric") %>%
-  mutate(metric = recode(metric,
-                         "SPEED_MEAN_UM_MIN" = "Speed (µm/min)",
-                         "CONFINEMENT_RATIO" = "Confinement ratio",
-                         "LINEARITY_OF_FORWARD_PROGRESSION" = "Linearity"))
-
-p14 <- ggplot(cluster_long, aes(x = cluster, y = value, fill = cluster)) +
-  geom_boxplot(alpha = 0.7, outlier.size = 0.5) +
-  facet_wrap(~metric, scales = "free_y") +
-  scale_fill_viridis_d() +
-  labs(
-    title = "Cluster Characteristics",
-    subtitle = "Movement properties by cluster",
-    x = "Cluster",
-    y = "Value"
-  ) +
-  theme_track() +
-  theme(legend.position = "none")
-
-ggsave("analysis_output/06_clustering.pdf", p14, width = 10, height = 5)
-cat("  Saved: 06_clustering.pdf\n")
-
-# =============================================================================
-# PART 8: CONFINEMENT AND DISPLACEMENT ANALYSIS
-# =============================================================================
-#
-# BIOLOGICAL INTERPRETATION:
-#   Confinement ratio = net displacement / total distance traveled
-#   - CR = 1: perfectly straight path (ballistic)
-#   - CR → 0: highly confined (returns to origin)
-#
-#   In embryos:
-#   - Migrating cells: CR > 0.5
-#   - Cells in dense tissue: CR < 0.3
-#   - Random exploration: CR ~ 0.3-0.5
-#
-
-cat("\n=== PART 8: CONFINEMENT ANALYSIS ===\n")
-
-# Plot 15: Confinement ratio distribution
-#
-# INTERPRETATION:
-#   - Left peak: confined nuclei (surrounded by neighbors)
-#   - Right peak: migrating nuclei (directed movement)
-#   - Spread: heterogeneity in cell behaviors
-#
-p15 <- ggplot(tracks_clean, aes(x = CONFINEMENT_RATIO)) +
-  geom_histogram(bins = 50, fill = "#2166AC", alpha = 0.7) +
-  geom_vline(xintercept = c(0.3, 0.7), linetype = "dashed", color = "#B2182B", linewidth = 0.4) +
-  labs(
-    title = "Confinement Ratio Distribution",
-    subtitle = "<0.3 = confined; >0.7 = directed; between = random",
-    x = "Confinement ratio",
-    y = "Count"
-  ) +
-  theme_track()
-
-# Plot 16: Confinement vs speed
-#
-# INTERPRETATION:
-#   - Fast + high confinement = directed migration
-#   - Slow + low confinement = stationary/confined
-#   - Correlation indicates coupling between speed and directionality
-#
-# NOTE: Using SPEED_MEAN_UM_MIN (per-track mean from TrackMate, converted to µm/min)
-p16 <- ggplot(tracks_clean, aes(x = CONFINEMENT_RATIO, y = SPEED_MEAN_UM_MIN)) +
-  geom_point(alpha = 0.2, size = 0.5, color = "#2166AC") +
-  geom_smooth(method = "loess", color = "#B2182B", linewidth = 1, se = FALSE) +
-  labs(
-    title = "Confinement vs Speed",
-    subtitle = "Are faster nuclei more directed?",
-    x = "Confinement ratio",
-    y = "Mean track speed (µm/min)"
-  ) +
-  theme_track()
-
-# Combine confinement plots
-confinement_combined <- (p15 + p16) +
-  plot_annotation(
-    title = "Confinement Analysis",
-    theme = theme(
-      plot.title = element_text(size = 14, face = "bold", hjust = 0.5)
-    )
-  )
-
-ggsave("analysis_output/07_confinement.pdf", confinement_combined, width = 12, height = 5)
-cat("  Saved: 07_confinement.pdf\n")
-
-# =============================================================================
-# PART 9: Z-DEPTH ANALYSIS
-# =============================================================================
-#
-# BIOLOGICAL INTERPRETATION:
-#   Movement may vary with depth in the embryo:
-#   - Surface cells may migrate differently than deep cells
-#   - Tissue boundaries affect movement
-#   - Different cell types stratify by depth
-#
-
-cat("\n=== PART 9: Z-DEPTH ANALYSIS ===\n")
-
-# Bin by Z-depth
-z_analysis <- spots_velocity %>%
-  filter(!is.na(inst_speed_um_min)) %>%
-  mutate(z_layer = cut(POSITION_Z, breaks = 5,
-                       labels = c("Deep", "Mid-deep", "Middle", "Mid-surface", "Surface")))
-
-z_summary <- z_analysis %>%
-  group_by(z_layer) %>%
-  summarise(
-    mean_speed = mean(inst_speed_um_min, na.rm = TRUE),
-    se_speed = sd(inst_speed_um_min, na.rm = TRUE) / sqrt(n()),
-    n = n()
-  )
-
-# Plot 17: Speed by Z-layer
-#
-# INTERPRETATION:
-#   - Differences reveal tissue organization
-#   - Surface vs deep movement patterns
-#   - May reflect different cell populations
-#
-p17 <- ggplot(z_analysis, aes(x = z_layer, y = inst_speed_um_min, fill = z_layer)) +
-  geom_boxplot(alpha = 0.7, outlier.alpha = 0.1, outlier.size = 0.3) +
-  scale_fill_viridis_d() +
-  coord_cartesian(ylim = c(0, 10)) +
-  labs(
-    title = "Nuclear Speed by Z-Depth (3D speed)",
-    subtitle = "3D speed at different depths",
-    x = "Z-layer (deep to surface)",
-    y = "Instantaneous speed (µm/min)"
-  ) +
-  theme_track() +
-  theme(legend.position = "none")
-
-ggsave("analysis_output/08_z_depth_basic.pdf", p17, width = 8, height = 5)
-cat("  Saved: 08_z_depth_basic.pdf\n")
-
-# =============================================================================
-# PART 9B: SPHERICAL DEPTH ANALYSIS (from orientation step sphere fit)
-# =============================================================================
-#
-# BIOLOGICAL INTERPRETATION:
-#   Cartesian Z is a poor proxy for embryo depth because the embryo is curved.
-#   If orientation_interactive.R fitted a sphere and exported SPHERICAL_DEPTH,
-#   we use that instead:
-#     SPHERICAL_DEPTH = R_sphere − radial_distance  (0 at surface, + inward)
-#     THETA_DEG       = latitude from animal pole   (0° AP, 90° equator, 180° VP)
-#     IN_MARGIN       = flag for cells in the ingression margin band
-#
-#   This section is skipped if the enriched columns are absent.
-#
-
-HAS_SPHERICAL <- all(c("SPHERICAL_DEPTH", "THETA_DEG") %in% names(spots_clean))
-
-if (HAS_SPHERICAL) {
-  cat("\n=== PART 9B: SPHERICAL DEPTH ANALYSIS ===\n")
-
-  # Propagate spherical columns into velocity data
-  if (!"SPHERICAL_DEPTH" %in% names(spots_velocity)) {
-    spots_velocity <- spots_velocity %>%
-      left_join(spots_clean %>% select(ID, SPHERICAL_DEPTH, SPHERICAL_DEPTH_NORM,
-                                        THETA_DEG, PHI_DEG,
-                                        any_of("IN_MARGIN"), RADIAL_DIST),
-                by = "ID")
-  }
-
-  # Spherical depth layers (5 equal-width bands from surface to deep)
-  sd_range <- range(spots_velocity$SPHERICAL_DEPTH, na.rm = TRUE)
-  sd_breaks <- seq(sd_range[1], sd_range[2], length.out = 6)
-  sd_labels <- sprintf("%.0f–%.0f µm", sd_breaks[1:5], sd_breaks[2:6])
-  sd_labels[1] <- paste0("Surface (", sd_labels[1], ")")
-  sd_labels[5] <- paste0("Deep (", sd_labels[5], ")")
-
-  spots_velocity <- spots_velocity %>%
-    mutate(sph_layer = cut(SPHERICAL_DEPTH, breaks = sd_breaks, labels = sd_labels,
-                           include.lowest = TRUE))
-
-  # Latitude bands (animal pole zones)
-  spots_velocity <- spots_velocity %>%
-    mutate(lat_band = cut(THETA_DEG, breaks = c(0, 30, 60, 90, 120, 150, 180),
-                          labels = c("AP (0–30°)", "Sub-AP (30–60°)",
-                                     "Equatorial (60–90°)", "Sub-VP (90–120°)",
-                                     "VP zone (120–150°)", "VP (150–180°)"),
-                          include.lowest = TRUE))
-
-  # --- Plot: Speed by spherical depth layer ---
-  p_sph_speed <- ggplot(spots_velocity %>% filter(!is.na(sph_layer) & !is.na(inst_speed_um_min)),
-                        aes(x = sph_layer, y = inst_speed_um_min, fill = sph_layer)) +
-    geom_boxplot(alpha = 0.7, outlier.alpha = 0.1, outlier.size = 0.3) +
-    scale_fill_viridis_d(guide = "none") +
-    coord_cartesian(ylim = c(0, 10)) +
-    labs(title = "Speed by Spherical Depth (distance from embryo surface)",
-         subtitle = "Depth measured from fitted sphere — not Cartesian Z",
-         x = "Spherical depth layer", y = "Instantaneous speed (µm/min)") +
-    theme_track() + theme(axis.text.x = element_text(angle = 30, hjust = 1))
-
-  # --- Plot: Speed by latitude from AP ---
-  p_lat_speed <- ggplot(spots_velocity %>% filter(!is.na(lat_band) & !is.na(inst_speed_um_min)),
-                        aes(x = lat_band, y = inst_speed_um_min, fill = lat_band)) +
-    geom_boxplot(alpha = 0.7, outlier.alpha = 0.1, outlier.size = 0.3) +
-    scale_fill_viridis_d(option = "C", guide = "none") +
-    coord_cartesian(ylim = c(0, 10)) +
-    labs(title = "Speed by Latitude from Animal Pole",
-         subtitle = "0° = animal pole; 90° = equator; 180° = vegetal pole",
-         x = "Latitude band", y = "Instantaneous speed (µm/min)") +
-    theme_track() + theme(axis.text.x = element_text(angle = 30, hjust = 1))
-
-  # --- Plot: Spherical depth vs Cartesian Z comparison ---
-  depth_compare_sample <- spots_velocity %>%
-    filter(!is.na(SPHERICAL_DEPTH) & !is.na(POSITION_Z)) %>%
-    sample_n(min(20000, n()))
-
-  p_depth_compare <- ggplot(depth_compare_sample,
-                            aes(x = POSITION_Z, y = SPHERICAL_DEPTH, color = THETA_DEG)) +
-    geom_point(alpha = 0.15, size = 0.3) +
-    scale_color_viridis_c(name = "Latitude (°)", option = "C") +
-    geom_abline(slope = -1, intercept = 0, linetype = "dashed", color = "red", alpha = 0.5) +
-    labs(title = "Spherical Depth vs Cartesian Z",
-         subtitle = "Curvature correction — diagonal = perfect flat approximation",
-         x = "Cartesian Z (µm)", y = "Spherical depth (µm)") +
-    theme_track()
-
-  sph_combined <- (p_sph_speed + p_lat_speed) / p_depth_compare +
-    plot_annotation(title = "Spherical Coordinate Depth Analysis",
-                    theme = theme(plot.title = element_text(size = 14, face = "bold", hjust = 0.5)))
-
-  ggsave("analysis_output/08b_spherical_depth.pdf", sph_combined, width = 16, height = 12)
-  cat("  Saved: 08b_spherical_depth.pdf\n")
-
-  # --- Margin-specific analysis ---
-  HAS_MARGIN <- "IN_MARGIN" %in% names(spots_velocity)
-  if (HAS_MARGIN && any(spots_velocity$IN_MARGIN, na.rm = TRUE)) {
-    n_margin <- sum(spots_velocity$IN_MARGIN, na.rm = TRUE)
-    n_total  <- nrow(spots_velocity)
-    cat(sprintf("  Margin cells: %s / %s (%.1f%%)\n",
-                format(n_margin, big.mark = ","), format(n_total, big.mark = ","),
-                n_margin / n_total * 100))
-
-    margin_speed <- spots_velocity %>%
-      filter(!is.na(inst_speed_um_min)) %>%
-      mutate(region = ifelse(IN_MARGIN, "Margin", "Non-margin"))
-
-    p_margin_speed <- ggplot(margin_speed, aes(x = inst_speed_um_min, fill = region)) +
-      geom_density(alpha = 0.5) +
-      scale_fill_manual(values = c("Margin" = "#E41A1C", "Non-margin" = "#2166AC")) +
-      labs(title = "Instantaneous speed: Margin vs Non-margin cells",
-           subtitle = "Margin cells selected by latitude band in orientation step",
-           x = "Speed (µm/min)", y = "Density", fill = NULL) +
-      theme_track()
-
-    p_margin_vz <- ggplot(margin_speed %>% filter(!is.na(vz) & abs(vz) < 10),
-                          aes(x = vz, fill = region)) +
-      geom_density(alpha = 0.5) +
-      geom_vline(xintercept = 0, linetype = "dashed") +
-      scale_fill_manual(values = c("Margin" = "#E41A1C", "Non-margin" = "#2166AC")) +
-      labs(title = "Vertical (Z) velocity: Margin vs Non-margin",
-           subtitle = "Positive = outward from embryo centre; Negative = inward (ingression)",
-           x = "Z-velocity (µm/min)", y = "Density", fill = NULL) +
-      theme_track()
-
-    margin_combined <- p_margin_speed + p_margin_vz +
-      plot_annotation(title = "Margin Cell Analysis",
-                      theme = theme(plot.title = element_text(size = 14, face = "bold", hjust = 0.5)))
-    ggsave("analysis_output/08c_margin_analysis.pdf", margin_combined, width = 14, height = 6)
-    cat("  Saved: 08c_margin_analysis.pdf\n")
-  }
-
-  # Summary stats
-  sph_summary <- spots_velocity %>%
-    filter(!is.na(sph_layer) & !is.na(inst_speed_um_min)) %>%
-    group_by(sph_layer) %>%
-    summarise(median_speed = median(inst_speed_um_min), n = n(), .groups = "drop")
-  cat("  Speed by spherical depth:\n")
-  for (i in seq_len(nrow(sph_summary))) {
-    cat(sprintf("    %s: %.2f µm/min (n=%s)\n",
-                sph_summary$sph_layer[i], sph_summary$median_speed[i],
-                format(sph_summary$n[i], big.mark = ",")))
-  }
-} else {
-  cat("\n  [Spherical coordinates not found — skipping Part 9B]\n")
-  cat("  (Run orientation_interactive.R with sphere fit to enable this analysis)\n")
-}
-
-# =============================================================================
-# PART 10: COMPREHENSIVE 4D SPATIAL-TEMPORAL ANALYSIS
-# =============================================================================
-#
-# BIOLOGICAL INTERPRETATION:
-#   Embryonic development is inherently 4D (X, Y, Z, Time). Nuclear movement
-#   patterns change across:
-#   - SPACE: Different regions (anterior/posterior, dorsal/ventral, deep/surface)
-#   - TIME: Different developmental stages (early divisions vs later morphogenesis)
-#   - COUPLED SPACE-TIME: Waves of movement, morphogenetic flows
-#
-#   This comprehensive analysis explores:
-#   1. Z-dependent movement in XY space
-#   2. Temporal evolution of spatial patterns
-#   3. Full 4D parameter exploration
-#   4. Interactive/3D visualizations
-#
-
-cat("\n=== PART 10: COMPREHENSIVE 4D ANALYSIS ===\n")
-
-# -----------------------------------------------------------------------------
-# 12B.1: Spatial binning for 4D analysis
-# -----------------------------------------------------------------------------
-
-# Create spatial bins (voxels) for local statistics
-SPATIAL_BIN_SIZE <- 15  # µm per bin
-TIME_BIN_SIZE <- 10     # minutes per time bin
-
-# Join velocity data with turning angle from spots_direction
-spots_4d <- spots_velocity %>%
-  filter(!is.na(inst_speed_um_min)) %>%
-  # Add turning angle from spots_direction (calculated in Part 6)
-  left_join(
-    spots_direction %>%
-      select(TRACK_ID, FRAME, turning_angle, direction_xy) %>%
-      filter(!is.na(turning_angle)),
-    by = c("TRACK_ID", "FRAME")
-  ) %>%
-  mutate(
-    # Spatial bins
-    x_bin = floor(POSITION_X / SPATIAL_BIN_SIZE) * SPATIAL_BIN_SIZE,
-    y_bin = floor(POSITION_Y / SPATIAL_BIN_SIZE) * SPATIAL_BIN_SIZE,
-    z_bin = floor(POSITION_Z / SPATIAL_BIN_SIZE) * SPATIAL_BIN_SIZE,
-
-    # Time bins (in minutes)
-    time_min = FRAME * FRAME_INTERVAL_MIN,
-    time_bin = floor(time_min / TIME_BIN_SIZE) * TIME_BIN_SIZE,
-
-    # Z-layers (normalized to 0-1 scale)
-    z_range = max(POSITION_Z, na.rm = TRUE) - min(POSITION_Z, na.rm = TRUE),
-    z_normalized = (POSITION_Z - min(POSITION_Z, na.rm = TRUE)) / z_range,
-    z_layer = cut(z_normalized, breaks = c(0, 0.25, 0.5, 0.75, 1.0),
-                  labels = c("Deep (0-25%)", "Mid-deep (25-50%)",
-                             "Mid-surface (50-75%)",
-                            "Surface (75-100%)"),
-                  include.lowest = TRUE)
-  )
-
-# Add spherical depth layers if available (from orientation step sphere fit)
-if (HAS_SPHERICAL && "SPHERICAL_DEPTH" %in% names(spots_4d)) {
-  sd_range_4d <- range(spots_4d$SPHERICAL_DEPTH, na.rm = TRUE)
-  sd_breaks_4d <- seq(sd_range_4d[1], sd_range_4d[2], length.out = 5)
-  spots_4d <- spots_4d %>%
-    mutate(
-      sph_layer = cut(SPHERICAL_DEPTH, breaks = sd_breaks_4d,
-                      labels = c("Surface", "Sub-surface", "Mid-deep", "Deep"),
-                      include.lowest = TRUE),
-      lat_band = cut(THETA_DEG, breaks = c(0, 45, 90, 135, 180),
-                     labels = c("AP (0-45°)", "Sub-AP (45-90°)",
-                                "Sub-VP (90-135°)", "VP (135-180°)"),
-                     include.lowest = TRUE)
-    )
-  cat("  Added spherical depth layers and latitude bands to 4D data\n")
-}
-
-# -----------------------------------------------------------------------------
-# 12B.2: Z-layer specific XY velocity patterns
-# -----------------------------------------------------------------------------
-#
-# INTERPRETATION:
-#   Different Z-layers may show different flow patterns:
-#   - Deep cells: may be more stationary (yolk syncytial layer)
-#   - Middle cells: active gastrulation movements
-#   - Surface cells: epiboly, directed migration
-#
-
-cat("  Computing Z-layer specific XY patterns...\n")
-
-# Local velocity vectors for each Z-layer
-velocity_by_z <- spots_4d %>%
-  filter(!is.na(vx) & !is.na(vy) & !is.na(z_layer)) %>%
-  group_by(z_layer, x_bin, y_bin) %>%
-  summarise(
-    mean_speed = mean(inst_speed_um_min, na.rm = TRUE),
-    mean_vx = mean(vx, na.rm = TRUE),
-    mean_vy = mean(vy, na.rm = TRUE),
-    mean_vz = mean(vz, na.rm = TRUE),
-    sd_speed = sd(inst_speed_um_min, na.rm = TRUE),
-    n = n(),
-    .groups = "drop"
-  ) %>%
-  filter(n >= 10)  # Need enough points for reliable statistics
-
-# Plot: XY velocity heatmaps for each Z-layer
-p_z_xy_heat <- ggplot(velocity_by_z, aes(x = x_bin, y = y_bin, fill = mean_speed)) +
-  geom_tile() +
-  facet_wrap(~z_layer, ncol = 5) +
-  scale_fill_viridis_c(name = "3D Speed\n(µm/min)", option = "plasma", limits = c(0, NA)) +
-  coord_fixed() +
-  labs(
-    title = "XY Speed Distribution by Z-Layer (3D speed)",
-    subtitle = "3D speed mapped to XY positions at each depth",
-    x = "X position (µm)",
-    y = "Y position (µm)"
-  ) +
-  theme_track() +
-  theme(
-    strip.text = element_text(face = "bold", size = 9),
-    legend.position = "right"
-  )
-
-# Plot: XY velocity vectors for each Z-layer
-p_z_xy_vector <- ggplot(velocity_by_z %>% filter(n >= 20),
-                        aes(x = x_bin, y = y_bin)) +
-  geom_segment(aes(xend = x_bin + mean_vx * 5, yend = y_bin + mean_vy * 5,
-                   color = mean_speed),
-               arrow = arrow(length = unit(0.1, "cm")), linewidth = 0.3) +
-  facet_wrap(~z_layer, ncol = 5) +
-  scale_color_viridis_c(name = "3D Speed\n(µm/min)", option = "plasma") +
-  coord_fixed() +
-  labs(
-    title = "XY Velocity Vectors by Z-Layer",
-    subtitle = "XY flow directions (Z-component not shown); arrows scaled 5x",
-    x = "X position (µm)",
-    y = "Y position (µm)"
-  ) +
-  theme_track() +
-  theme(
-    strip.text = element_text(face = "bold", size = 9),
-    legend.position = "right"
-  )
-
-# Combine Z-layer XY plots
-z_xy_combined <- p_z_xy_heat / p_z_xy_vector +
-  plot_annotation(
-    title = "Depth-Dependent Movement Patterns in XY",
-    theme = theme(
-      plot.title = element_text(size = 14, face = "bold", hjust = 0.5)
-    )
-  )
-
-ggsave("analysis_output/09_z_layer_xy_patterns.pdf", z_xy_combined, width = 14, height = 12)
-cat("  Saved: 09_z_layer_xy_patterns.pdf\n")
-
-# -----------------------------------------------------------------------------
-# 12B.3: Z-movement analysis (vertical migration)
-# -----------------------------------------------------------------------------
-#
-# INTERPRETATION:
-#   Vertical (Z) movement is often overlooked but critical:
-#   - Interkinetic nuclear migration: nuclei move up/down in neuroepithelium
-#   - Involution during gastrulation: cells move from surface to deep
-#   - Cell division: nuclei move apically before dividing
-#
-
-# Analyze vertical velocity component
-z_movement_stats <- spots_4d %>%
-  filter(!is.na(vz)) %>%
-  group_by(z_layer) %>%
-  summarise(
-    mean_vz = mean(vz, na.rm = TRUE),
-    se_vz = sd(vz, na.rm = TRUE) / sqrt(n()),
-    prop_moving_up = mean(vz > 0, na.rm = TRUE),
-    prop_moving_down = mean(vz < 0, na.rm = TRUE),
-    n = n()
-  )
-
-# Plot: Z-velocity by layer
-p_vz_layer <- ggplot(z_movement_stats, aes(x = z_layer, y = mean_vz, fill = mean_vz > 0)) +
-  geom_col(width = 0.7) +
-  geom_errorbar(aes(ymin = mean_vz - se_vz, ymax = mean_vz + se_vz), width = 0.2) +
-  geom_hline(yintercept = 0, linetype = "dashed") +
-  scale_fill_manual(values = c("TRUE" = "#2166AC", "FALSE" = "#B2182B"),
-                    labels = c("TRUE" = "Moving up", "FALSE" = "Moving down")) +
-  labs(
-    title = "Vertical (Z-only) Velocity by Depth",
-    subtitle = "+Z = towards surface; -Z = towards deep (Z-component only)",
-    x = "Z-layer",
-    y = "Mean Z-velocity (µm/min)",
-    fill = NULL
-  ) +
-  theme_track() +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1))
-
-# Z-velocity distribution at each layer
-p_vz_dist <- ggplot(spots_4d %>% filter(!is.na(vz) & abs(vz) < 10),
-                    aes(x = vz, fill = z_layer)) +
-  geom_density(alpha = 0.5) +
-  geom_vline(xintercept = 0, linetype = "dashed") +
-  facet_wrap(~z_layer, ncol = 1, scales = "free_y") +
-  scale_fill_viridis_d() +
-  labs(
-    title = "Z-Velocity Distribution by Layer",
-    subtitle = "Are nuclei at certain depths preferentially moving up or down?",
-    x = "Z-velocity (µm/min)",
-    y = "Density"
-  ) +
-  theme_track() +
-  theme(legend.position = "none",
-        strip.text = element_text(size = 8))
-
-z_movement_combined <- (p_vz_layer | p_vz_dist) +
-  plot_annotation(
-    title = "Vertical Nuclear Migration Analysis",
-    theme = theme(plot.title = element_text(size = 14, face = "bold", hjust = 0.5))
-  )
-
-ggsave("analysis_output/10_z_velocity_analysis.pdf", z_movement_combined, width = 12, height = 8)
-cat("  Saved: 10_z_velocity_analysis.pdf\n")
-
-# -----------------------------------------------------------------------------
-# 12B.4: Temporal evolution of spatial patterns
-# -----------------------------------------------------------------------------
-#
-# INTERPRETATION:
-#   Movement patterns evolve during development:
-#   - Early: more uniform, exploratory movement
-#   - Later: coordinated morphogenetic flows
-#   - Waves of activity may propagate across the embryo
-#
-
-cat("  Computing temporal evolution...\n")
-
-# Speed over time for each Z-layer
-speed_time_z <- spots_4d %>%
-  filter(!is.na(inst_speed_um_min)) %>%
-  group_by(time_bin, z_layer) %>%
-  summarise(
-    mean_speed = mean(inst_speed_um_min, na.rm = TRUE),
-    se_speed = sd(inst_speed_um_min, na.rm = TRUE) / sqrt(n()),
-    n = n(),
-    .groups = "drop"
-  ) %>%
-  filter(n >= 20)
-
-# Plot: Speed vs time for each Z-layer
-p_speed_time_z <- ggplot(speed_time_z, aes(x = time_bin, y = mean_speed,
-                                            color = z_layer, fill = z_layer)) +
-  geom_ribbon(aes(ymin = mean_speed - se_speed, ymax = mean_speed + se_speed),
-              alpha = 0.2, color = NA) +
-  geom_line(linewidth = 1) +
-  scale_color_viridis_d() +
-  scale_fill_viridis_d() +
-  labs(
-    title = "Nuclear Speed Over Time by Z-Layer",
-    subtitle = "How movement activity evolves at different depths",
-    x = "Time (min)",
-    y = "Mean speed (µm/min)",
-    color = "Z-layer",
-    fill = "Z-layer"
-  ) +
-  theme_track() +
-  theme(legend.position = "right")
-
-# Speed evolution in XY space over time (sampled timepoints)
-time_points <- unique(spots_4d$time_bin)
-sample_times <- time_points[seq(1, length(time_points), length.out = min(6, length(time_points)))]
-
-speed_xy_time <- spots_4d %>%
-  filter(time_bin %in% sample_times) %>%
-  group_by(time_bin, x_bin, y_bin) %>%
-  summarise(
-    mean_speed = mean(inst_speed_um_min, na.rm = TRUE),
-    n = n(),
-    .groups = "drop"
-  ) %>%
-  filter(n >= 5)
-
-p_speed_xy_time <- ggplot(speed_xy_time, aes(x = x_bin, y = y_bin, fill = mean_speed)) +
-  geom_tile() +
-  facet_wrap(~paste0("t = ", time_bin, " min"), ncol = 6) +
-  scale_fill_viridis_c(name = "Speed\n(µm/min)", option = "plasma", limits = c(0, NA)) +
-  coord_fixed() +
-  labs(
-    title = "Spatial Speed Patterns Over Time",
-    subtitle = "How movement hotspots shift during development",
-    x = "X position (µm)",
-    y = "Y position (µm)"
-  ) +
-  theme_track() +
-  theme(strip.text = element_text(face = "bold"))
-
-# Combine temporal plots
-temporal_combined <- p_speed_time_z / p_speed_xy_time +
-  plot_layout(heights = c(1, 2)) +
-  plot_annotation(
-    title = "Temporal Evolution of Movement Patterns",
-    theme = theme(plot.title = element_text(size = 14, face = "bold", hjust = 0.5))
-  )
-
-ggsave("analysis_output/11_temporal_evolution.pdf", temporal_combined, width = 12, height = 14)
-cat("  Saved: 11_temporal_evolution.pdf\n")
-
-# -----------------------------------------------------------------------------
-# 12B.5: XZ and YZ projections (sagittal and coronal views)
-# -----------------------------------------------------------------------------
-#
-# INTERPRETATION:
-#   XY projection alone misses depth information.
-#   XZ (sagittal) and YZ (coronal) views reveal:
-#   - Vertical tissue organization
-#   - Morphogenetic flows in the Z-axis
-#   - Layer-specific movement patterns
-#
-
-# XZ projection
-speed_xz <- spots_4d %>%
-  group_by(x_bin, z_bin) %>%
-  summarise(
-    mean_speed = mean(inst_speed_um_min, na.rm = TRUE),
-    mean_vx = mean(vx, na.rm = TRUE),
-    mean_vz = mean(vz, na.rm = TRUE),
-    n = n(),
-    .groups = "drop"
-  ) %>%
-  filter(n >= 10)
-
-# YZ projection
-speed_yz <- spots_4d %>%
-  group_by(y_bin, z_bin) %>%
-  summarise(
-    mean_speed = mean(inst_speed_um_min, na.rm = TRUE),
-    mean_vy = mean(vy, na.rm = TRUE),
-    mean_vz = mean(vz, na.rm = TRUE),
-    n = n(),
-    .groups = "drop"
-  ) %>%
-  filter(n >= 10)
-
-# XZ heatmap and vectors
-p_xz_heat <- ggplot(speed_xz, aes(x = x_bin, y = z_bin, fill = mean_speed)) +
-  geom_tile() +
-  scale_fill_viridis_c(name = "Speed\n(µm/min)", option = "plasma") +
-  labs(
-    title = "XZ Projection (Sagittal View)",
-    subtitle = "Speed distribution in anterior-posterior × depth",
-    x = "X position (µm)",
-    y = "Z position (µm)"
-  ) +
-  coord_fixed() +
-  theme_track()
-
-p_xz_vector <- ggplot(speed_xz %>% filter(n >= 20),
-                      aes(x = x_bin, y = z_bin)) +
-  geom_segment(aes(xend = x_bin + mean_vx * 5, yend = z_bin + mean_vz * 5,
-                   color = mean_speed),
-               arrow = arrow(length = unit(0.1, "cm")), linewidth = 0.4) +
-  scale_color_viridis_c(name = "Speed\n(µm/min)", option = "plasma") +
-  labs(
-    title = "XZ Velocity Vectors",
-    subtitle = "Flow patterns in sagittal plane",
-    x = "X position (µm)",
-    y = "Z position (µm)"
-  ) +
-  coord_fixed() +
-  theme_track()
-
-# YZ heatmap and vectors
-p_yz_heat <- ggplot(speed_yz, aes(x = y_bin, y = z_bin, fill = mean_speed)) +
-  geom_tile() +
-  scale_fill_viridis_c(name = "Speed\n(µm/min)", option = "plasma") +
-  labs(
-    title = "YZ Projection (Coronal View)",
-    subtitle = "Speed distribution in left-right × depth",
-    x = "Y position (µm)",
-    y = "Z position (µm)"
-  ) +
-  coord_fixed() +
-  theme_track()
-
-p_yz_vector <- ggplot(speed_yz %>% filter(n >= 20),
-                      aes(x = y_bin, y = z_bin)) +
-  geom_segment(aes(xend = y_bin + mean_vy * 5, yend = z_bin + mean_vz * 5,
-                   color = mean_speed),
-               arrow = arrow(length = unit(0.1, "cm")), linewidth = 0.4) +
-  scale_color_viridis_c(name = "Speed\n(µm/min)", option = "plasma") +
-  labs(
-    title = "YZ Velocity Vectors",
-    subtitle = "Flow patterns in coronal plane",
-    x = "Y position (µm)",
-    y = "Z position (µm)"
-  ) +
-  coord_fixed() +
-  theme_track()
-
-# Combine projections
-projections_combined <- (p_xz_heat + p_xz_vector) / (p_yz_heat + p_yz_vector) +
-  plot_annotation(
-    title = "Orthogonal Projections: XZ and YZ Views",
-    subtitle = "Side and front views of 3D movement patterns",
-    theme = theme(
-      plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
-      plot.subtitle = element_text(hjust = 0.5, color = "grey50")
-    )
-  )
-
-ggsave("analysis_output/12_xz_yz_projections.pdf", projections_combined, width = 14, height = 12)
-cat("  Saved: 12_xz_yz_projections.pdf\n")
-
-# -----------------------------------------------------------------------------
-# 12B.6: 4D Parameter Exploration - Correlations
-# -----------------------------------------------------------------------------
-#
-# INTERPRETATION:
-#   Understanding which parameters co-vary helps identify:
-#   - Movement signatures for different cell populations
-#   - Coupling between speed, directionality, and position
-#   - Developmental gradients
-#
-
-cat("  Computing 4D parameter correlations...\n")
-
-# Per-track summary with spatial info
-track_spatial_summary <- spots_4d %>%
-  group_by(TRACK_ID) %>%
-  summarise(
-    # Position (mean)
-    mean_x = mean(POSITION_X, na.rm = TRUE),
-    mean_y = mean(POSITION_Y, na.rm = TRUE),
-    mean_z = mean(POSITION_Z, na.rm = TRUE),
-    z_normalized = mean(z_normalized, na.rm = TRUE),
-
-    # Time
-    start_time = min(time_min, na.rm = TRUE),
-
-    # Movement
-    mean_speed = mean(inst_speed_um_min, na.rm = TRUE),
-    mean_vz = mean(vz, na.rm = TRUE),
-    speed_variability = sd(inst_speed_um_min, na.rm = TRUE) / mean(inst_speed_um_min, na.rm = TRUE),
-
-    # Direction
-    mean_turning = mean(turning_angle, na.rm = TRUE),
-
-    n_spots = n(),
-    .groups = "drop"
-  ) %>%
-  filter(n_spots >= 5) %>%
-  left_join(
-    tracks_classified %>% select(TRACK_ID, CONFINEMENT_RATIO, LINEARITY_OF_FORWARD_PROGRESSION,
-                            TRACK_DISPLACEMENT, movement_type),
-    by = "TRACK_ID"
-  )
-
-# Correlation matrix
-cor_vars <- track_spatial_summary %>%
-  select(mean_x, mean_y, mean_z, start_time, mean_speed, mean_vz,
-         speed_variability, CONFINEMENT_RATIO, LINEARITY_OF_FORWARD_PROGRESSION)
-
-cor_matrix <- cor(cor_vars, use = "pairwise.complete.obs")
-
-# Plot correlation heatmap
-cor_long <- as.data.frame(cor_matrix) %>%
-  rownames_to_column("var1") %>%
-  pivot_longer(-var1, names_to = "var2", values_to = "correlation") %>%
-  mutate(
-    var1 = factor(var1, levels = colnames(cor_matrix)),
-    var2 = factor(var2, levels = rev(colnames(cor_matrix)))
-  )
-
-p_cor <- ggplot(cor_long, aes(x = var1, y = var2, fill = correlation)) +
-  geom_tile() +
-  geom_text(aes(label = sprintf("%.2f", correlation)), size = 2.5) +
-  scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
-                       midpoint = 0, limits = c(-1, 1), name = "r") +
-  labs(
-    title = "Parameter Correlation Matrix",
-    subtitle = "Relationships between spatial, temporal, and movement features",
-    x = NULL, y = NULL
-  ) +
-  theme_track() +
-  theme(
-    axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
-    axis.text.y = element_text(size = 8),
-    legend.position = "right"
-  )
-
-ggsave("analysis_output/13_parameter_correlations.pdf", p_cor, width = 10, height = 8)
-cat("  Saved: 13_parameter_correlations.pdf\n")
-
-# -----------------------------------------------------------------------------
-# 12B.7: Movement type spatial distribution
-# -----------------------------------------------------------------------------
-#
-# INTERPRETATION:
-#   Where in the embryo do we find directed vs confined vs random movement?
-#   - Directed: actively migrating regions
-#   - Confined: densely packed regions
-#   - Random: exploratory behavior
-#
-
-# Spatial distribution of movement types
-movement_spatial <- track_spatial_summary %>%
-  filter(!is.na(movement_type))
-
-# XY distribution by movement type
-p_movetype_xy <- ggplot(movement_spatial, aes(x = mean_x, y = mean_y, color = movement_type)) +
-  geom_point(alpha = 0.3, size = 0.5) +
-  facet_wrap(~movement_type) +
-  scale_color_manual(values = movement_colors) +
-  coord_fixed() +
-  labs(
-    title = "Spatial Distribution of Movement Types (XY)",
-    subtitle = "Where in the embryo do we find each movement pattern?",
-    x = "Mean X position (µm)",
-    y = "Mean Y position (µm)"
-  ) +
-  theme_track() +
-  theme(legend.position = "none")
-
-# XZ distribution by movement type (showing Z-location for each type)
-p_movetype_xz <- ggplot(movement_spatial, aes(x = mean_x, y = mean_z, color = movement_type)) +
-  geom_point(alpha = 0.3, size = 0.5) +
-  facet_wrap(~movement_type) +
-  scale_color_manual(values = movement_colors) +
-  labs(
-    title = "Spatial Distribution of Movement Types (XZ - Side View)",
-    subtitle = "Depth distribution of each movement pattern",
-    x = "Mean X position (µm)",
-    y = "Mean Z position (µm)"
-  ) +
-  theme_track() +
-  theme(legend.position = "none")
-
-# Z distribution by movement type (violin + boxplot)
-p_movetype_z <- ggplot(movement_spatial, aes(x = movement_type, y = z_normalized,
-                                              fill = movement_type)) +
-  geom_violin(alpha = 0.7) +
-  geom_boxplot(width = 0.2, alpha = 0.8, outlier.size = 0.3) +
-  scale_fill_manual(values = movement_colors) +
-  labs(
-    title = "Z-Distribution by Movement Type",
-    subtitle = "Are different movement types stratified by depth?",
-    x = NULL,
-    y = "Normalized Z position (0=deep, 1=surface)"
-  ) +
-  theme_track() +
-  theme(legend.position = "none")
-
-# Z density distribution (overlaid for comparison)
-p_movetype_z_density <- ggplot(movement_spatial, aes(x = z_normalized, fill = movement_type)) +
-  geom_density(alpha = 0.5) +
-  scale_fill_manual(values = movement_colors) +
-  labs(
-    title = "Z-Depth Density by Movement Type",
-    subtitle = "Overlaid distributions show depth preferences",
-    x = "Normalized Z position (0=deep, 1=surface)",
-    y = "Density"
-  ) +
-  theme_track()
-
-# Time distribution by movement type
-p_movetype_time <- ggplot(movement_spatial, aes(x = start_time, fill = movement_type)) +
-  geom_density(alpha = 0.5) +
-  facet_wrap(~movement_type, ncol = 1) +
-  scale_fill_manual(values = movement_colors) +
-  labs(
-    title = "Temporal Distribution of Movement Types",
-    subtitle = "When do different movement patterns occur?",
-    x = "Track start time (min)",
-    y = "Density"
-  ) +
-  theme_track() +
-  theme(legend.position = "none")
-
-# Summary statistics for Z by movement type
-z_by_movetype_stats <- movement_spatial %>%
-  group_by(movement_type) %>%
-  summarise(
-    n = n(),
-    mean_z = mean(z_normalized, na.rm = TRUE),
-    median_z = median(z_normalized, na.rm = TRUE),
-    sd_z = sd(z_normalized, na.rm = TRUE),
-    .groups = "drop"
-  )
-
-cat("\n  Z-distribution by movement type:\n")
-for (i in 1:nrow(z_by_movetype_stats)) {
-  cat(sprintf("    %s: mean Z=%.2f, median=%.2f (n=%d)\n",
-              z_by_movetype_stats$movement_type[i],
-              z_by_movetype_stats$mean_z[i],
-              z_by_movetype_stats$median_z[i],
-              z_by_movetype_stats$n[i]))
-}
-
-movetype_spatial_combined <- (p_movetype_xy | p_movetype_xz) / (p_movetype_z | p_movetype_z_density) / p_movetype_time +
-  plot_layout(heights = c(1.2, 1, 1.2)) +
-  plot_annotation(
-    title = "4D Distribution of Movement Types",
-    theme = theme(plot.title = element_text(size = 14, face = "bold", hjust = 0.5))
-  )
-
-ggsave("analysis_output/14_movement_type_4d.pdf", movetype_spatial_combined, width = 14, height = 16)
-cat("  Saved: 14_movement_type_4d.pdf\n")
-
-# -----------------------------------------------------------------------------
-# 12B.8: 3D Track Visualization Data Export
-# -----------------------------------------------------------------------------
-#
-# For interactive 3D visualization, we export data in formats compatible with:
-#   - plotly (R/Python)
-#   - napari (Python)
-#   - ParaView (standalone)
-#   - Fiji/ImageJ 3D viewer
-#
-
-cat("  Exporting 3D visualization data...\n")
-
-# Sample tracks for 3D visualization (too many = cluttered)
-set.seed(42)
-sample_track_ids <- sample(unique(spots_clean$TRACK_ID), min(500, n_distinct(spots_clean$TRACK_ID)))
-
-tracks_3d_export <- spots_clean %>%
-  filter(TRACK_ID %in% sample_track_ids) %>%
-  arrange(TRACK_ID, FRAME) %>%
-  left_join(
-    tracks_classified %>% dplyr::select(TRACK_ID, SPEED_MEAN_UM_MIN, CONFINEMENT_RATIO, movement_type),
-    by = "TRACK_ID"
-  ) %>%
-  select(TRACK_ID, FRAME, POSITION_X, POSITION_Y, POSITION_Z,
-         SPEED_MEAN_UM_MIN, CONFINEMENT_RATIO, movement_type)
-
-write_csv(tracks_3d_export, "analysis_output/tracks_3d_visualization.csv")
-cat("    Exported: tracks_3d_visualization.csv (", nrow(tracks_3d_export), " points, ",
-    n_distinct(tracks_3d_export$TRACK_ID), " tracks)\n")
-
-# Also create a summary for plotly-style 3D scatter
-track_centroids <- track_spatial_summary %>%
-  filter(!is.na(movement_type)) %>%
-  select(TRACK_ID, mean_x, mean_y, mean_z, mean_speed, CONFINEMENT_RATIO, movement_type)
-
-write_csv(track_centroids, "analysis_output/track_centroids_3d.csv")
-
-# -----------------------------------------------------------------------------
-# 12B.9: Static 3D-like visualization (pseudo-3D)
-# -----------------------------------------------------------------------------
-#
-# Create a multi-panel view that gives 3D impression:
-#   - XY colored by Z
-#   - XZ side view
-#   - YZ front view
-#   - Time-color animation frames
-#
-
-# Use ALL tracks for complete visualization (not sampled)
-cat("  Creating pseudo-3D visualization with all tracks...\n")
-
-viz_all <- spots_clean %>%
-  arrange(TRACK_ID, FRAME) %>%
-  mutate(
-    z_normalized = (POSITION_Z - min(POSITION_Z)) / (max(POSITION_Z) - min(POSITION_Z)),
-    time_normalized = FRAME / max(FRAME)
-  )
-
-# XY view colored by Z
-p_3d_xy <- ggplot(viz_all, aes(x = POSITION_X, y = POSITION_Y,
-                                group = TRACK_ID, color = z_normalized)) +
-  geom_path(alpha = 0.3, linewidth = 0.15) +
-  scale_color_viridis_c(name = "Z depth\n(normalized)", option = "plasma") +
-  coord_fixed() +
-  labs(title = "XY View (top-down)", subtitle = "Color = depth", x = "X (µm)", y = "Y (µm)") +
-  theme_track()
-
-# XZ view (sagittal)
-p_3d_xz <- ggplot(viz_all, aes(x = POSITION_X, y = POSITION_Z,
-                                group = TRACK_ID, color = time_normalized)) +
-  geom_path(alpha = 0.3, linewidth = 0.15) +
-  scale_color_viridis_c(name = "Time", option = "viridis", guide = "none") +
-  labs(title = "XZ View (side)", subtitle = "Color = time", x = "X (µm)", y = "Z (µm)") +
-  theme_track()
-
-# YZ view (coronal)
-p_3d_yz <- ggplot(viz_all, aes(x = POSITION_Y, y = POSITION_Z,
-                                group = TRACK_ID, color = time_normalized)) +
-  geom_path(alpha = 0.3, linewidth = 0.15) +
-  scale_color_viridis_c(name = "Time", option = "viridis", guide = "none") +
-  labs(title = "YZ View (front)", subtitle = "Color = time", x = "Y (µm)", y = "Z (µm)") +
-  theme_track()
-
-# XY view colored by time
-p_3d_xy_time <- ggplot(viz_all, aes(x = POSITION_X, y = POSITION_Y,
-                                     group = TRACK_ID, color = time_normalized)) +
-  geom_path(alpha = 0.3, linewidth = 0.15) +
-  scale_color_viridis_c(name = "Time\n(normalized)", option = "viridis") +
-  coord_fixed() +
-  labs(title = "XY View (top-down)", subtitle = "Color = time progression", x = "X (µm)", y = "Y (µm)") +
-  theme_track()
-
-# Combine into comprehensive pseudo-3D view
-pseudo_3d <- (p_3d_xy | p_3d_xy_time) / (p_3d_xz | p_3d_yz) +
-  plot_annotation(
-    title = "Complete 3D Track Visualization - All Tracks",
-    subtitle = sprintf("%d tracks, %d spots | Multiple viewing angles",
-                      n_distinct(viz_all$TRACK_ID), nrow(viz_all)),
-    theme = theme(
-      plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
-      plot.subtitle = element_text(hjust = 0.5, color = "grey50")
-    )
-  )
-
-ggsave("analysis_output/15_pseudo_3d_tracks.pdf", pseudo_3d, width = 16, height = 14)
-cat("  Saved: 15_pseudo_3d_tracks.pdf\n")
-
-# =============================================================================
-# PART 11: INTERACTIVE 4D VISUALIZATION WITH PLOTLY
-# =============================================================================
-#
-# BIOLOGICAL INTERPRETATION:
-#   Interactive 3D visualization allows:
-#   - Rotating the embryo to see tracks from any angle
-#   - Identifying spatial clusters of similar movement
-#   - Following individual tracks through time
-#   - Zooming into regions of interest
-#
-#   We create multiple HTML files for different views.
-#
-
-cat("\n=== PART 11: INTERACTIVE 4D VISUALIZATION ===\n")
-
-# -----------------------------------------------------------------------------
-# 11.1: Interactive 3D track plot (static snapshot with rotation)
-# -----------------------------------------------------------------------------
-
-cat("  Creating interactive 3D visualizations...\n")
-
-# Sample tracks for interactive view (too many = slow rendering)
-set.seed(42)
-n_sample_interactive <- min(1000, n_distinct(spots_clean$TRACK_ID))
-sample_ids_interactive <- sample(unique(spots_clean$TRACK_ID), n_sample_interactive)
-
-viz_interactive <- spots_clean %>%
-  filter(TRACK_ID %in% sample_ids_interactive) %>%
-  arrange(TRACK_ID, FRAME) %>%
-  left_join(
-    tracks_classified %>% select(TRACK_ID, movement_type, SPEED_MEAN_UM_MIN),
-    by = "TRACK_ID"
-  ) %>%
-  mutate(
-    time_min = FRAME * FRAME_INTERVAL_MIN,
-    movement_type = as.character(movement_type)
-  )
-
-# 3D scatter plot of track positions colored by movement type
-fig_3d_movetype <- plot_ly(
-  viz_interactive,
-  x = ~POSITION_X, y = ~POSITION_Y, z = ~POSITION_Z,
-  color = ~movement_type,
-  colors = c("Directed" = "#2166AC", "Random" = "#762A83", "Confined" = "#B2182B"),
-  type = "scatter3d",
-  mode = "markers",
-  marker = list(size = 1.5, opacity = 0.4),
-  hoverinfo = "text",
-  text = ~paste("Track:", TRACK_ID, "<br>Type:", movement_type,
-                "<br>Speed:", round(SPEED_MEAN_UM_MIN, 2), "µm/min")
-) %>%
-  plotly::layout(
-    title = list(
-      text = "3D Nuclear Positions by Movement Type",
-      font = list(size = 16)
-    ),
-    scene = list(
-      xaxis = list(title = "X (µm)"),
-      yaxis = list(title = "Y (µm)"),
-      zaxis = list(title = "Z (µm)"),
-      aspectmode = "data"
-    ),
-    legend = list(title = list(text = "Movement Type"))
-  )
-
-htmlwidgets::saveWidget(fig_3d_movetype, "analysis_output/16_interactive_3d_movetype.html",
-                        selfcontained = TRUE)
-cat("    Saved: 16_interactive_3d_movetype.html\n")
-
-# 3D scatter colored by speed
-fig_3d_speed <- plot_ly(
-  viz_interactive,
-  x = ~POSITION_X, y = ~POSITION_Y, z = ~POSITION_Z,
-  color = ~SPEED_MEAN_UM_MIN,
-  colors = viridis::plasma(100),
-  type = "scatter3d",
-  mode = "markers",
-  marker = list(size = 1.5, opacity = 0.5),
-  hoverinfo = "text",
-  text = ~paste("Track:", TRACK_ID, "<br>Speed:", round(SPEED_MEAN_UM_MIN, 2), "µm/min")
-) %>%
-  plotly::layout(
-    title = list(
-      text = "3D Nuclear Positions by Speed",
-      font = list(size = 16)
-    ),
-    scene = list(
-      xaxis = list(title = "X (µm)"),
-      yaxis = list(title = "Y (µm)"),
-      zaxis = list(title = "Z (µm)"),
-      aspectmode = "data"
-    )
-  )
-
-htmlwidgets::saveWidget(fig_3d_speed, "analysis_output/17_interactive_3d_speed.html",
-                        selfcontained = TRUE)
-cat("    Saved: 17_interactive_3d_speed.html\n")
-
-# -----------------------------------------------------------------------------
-# 11.2: 3D track lines (showing actual trajectories)
-# -----------------------------------------------------------------------------
-
-# Create line traces for each track
-cat("  Creating 3D track line visualization...\n")
-
-# Use fewer tracks for line visualization (more complex rendering)
-n_line_tracks <- min(1000, n_distinct(spots_clean$TRACK_ID))
-line_track_ids <- sample(unique(spots_clean$TRACK_ID), n_line_tracks)
-
-viz_lines <- spots_clean %>%
-  filter(TRACK_ID %in% line_track_ids) %>%
-  arrange(TRACK_ID, FRAME) %>%
-  left_join(
-    tracks_classified %>% select(TRACK_ID, movement_type, SPEED_MEAN_UM_MIN),
-    by = "TRACK_ID"
-  )
-
-
-# Create 3D line plot
-fig_3d_lines <- plot_ly()
-
-for (tid in unique(viz_lines$TRACK_ID)) {
-  track_data <- viz_lines %>% filter(TRACK_ID == tid)
-  mvtype <- unique(track_data$movement_type)[1]
-  color <- switch(as.character(mvtype),
-                  "Directed" = "#2166AC",
-                  "Confined" = "#B2182B",
-                  "#762A83")
-
-  fig_3d_lines <- fig_3d_lines %>%
-    add_trace(
-      data = track_data,
-      x = ~POSITION_X, y = ~POSITION_Y, z = ~POSITION_Z,
-      type = "scatter3d",
-      mode = "lines",
-      line = list(width = 2, color = color),
-      opacity = 0.6,
-      name = mvtype,
-      legendgroup = mvtype,
-      showlegend = (tid == line_track_ids[1] ||
-                    !mvtype %in% sapply(line_track_ids[1:(which(line_track_ids == tid)-1)],
-                                        function(x) unique(viz_lines$movement_type[viz_lines$TRACK_ID == x])[1])),
-      hoverinfo = "text",
-      text = paste("Track:", tid, "| Type:", mvtype)
+species_colors <- c("Zebrafish" = "#2166AC", "Medaka" = "#B2182B")
+
+theme_pipe <- function(base_size = 10) {
+  theme_minimal(base_size = base_size) +
+    theme(
+      plot.title       = element_text(hjust = 0.5, face = "bold", size = base_size + 2),
+      plot.subtitle    = element_text(hjust = 0.5, size = base_size - 1, color = "grey50"),
+      legend.position  = "bottom",
+      panel.grid.minor = element_blank(),
+      strip.text       = element_text(face = "bold")
     )
 }
 
-fig_3d_lines <- fig_3d_lines %>%
-  plotly::layout(
-    title = list(
-      text = sprintf("3D Track Trajectories (n=%d sample)", n_line_tracks),
-      font = list(size = 16)
-    ),
-    scene = list(
-      xaxis = list(title = "X (µm)"),
-      yaxis = list(title = "Y (µm)"),
-      zaxis = list(title = "Z (µm)"),
-      aspectmode = "data"
-    )
-  )
-
-htmlwidgets::saveWidget(fig_3d_lines, "analysis_output/18_interactive_3d_tracks.html",
-                        selfcontained = TRUE)
-cat("    Saved: 18_interactive_3d_tracks.html\n")
-
-# -----------------------------------------------------------------------------
-# 11.3: 4D Animation (3D + Time slider)
-# -----------------------------------------------------------------------------
-
-cat("  Creating 4D time-lapse animation...\n")
-
-# Bin time for animation frames
-time_bins <- seq(0, max(viz_interactive$time_min), by = 5)  # 5-minute frames
-
-viz_animated <- viz_interactive %>%
-  mutate(time_bin = cut(time_min, breaks = c(time_bins, Inf),
-                        labels = paste0(time_bins, "-", c(time_bins[-1], max(time_min) + 1), " min"),
-                        include.lowest = TRUE))
-
-fig_4d <- plot_ly(
-  viz_animated,
-  x = ~POSITION_X, y = ~POSITION_Y, z = ~POSITION_Z,
-  color = ~movement_type,
-  colors = c("Directed" = "#2166AC", "Random" = "#762A83", "Confined" = "#B2182B"),
-  frame = ~time_bin,
-  type = "scatter3d",
-  mode = "markers",
-  marker = list(size = 2, opacity = 0.5)
-) %>%
-  plotly::layout(
-    title = list(
-      text = "4D Nuclear Movement (use slider for time)",
-      font = list(size = 16)
-    ),
-    scene = list(
-      xaxis = list(title = "X (µm)"),
-      yaxis = list(title = "Y (µm)"),
-      zaxis = list(title = "Z (µm)"),
-      aspectmode = "data"
-    )
-  ) %>%
-  animation_opts(
-    frame = 800,    # ms per frame
-    transition = 0, # no smooth transition (required for scatter3d)
-    redraw = TRUE   # must redraw full scene for 3D plots
-  ) %>%
-  animation_slider(
-    currentvalue = list(prefix = "Time: "),
-    steps = lapply(levels(viz_animated$time_bin), function(b) {
-      list(method = "animate",
-           args = list(list(b), list(mode = "immediate",
-                                      frame = list(duration = 800, redraw = TRUE),
-                                      transition = list(duration = 0))),
-           label = b)
-    })
-  )
-
-htmlwidgets::saveWidget(fig_4d, "analysis_output/19_interactive_4d_timelapse.html",
-                        selfcontained = TRUE)
-cat("    Saved: 19_interactive_4d_timelapse.html\n")
-
-# =============================================================================
-# PART 12: ADDITIONAL ANALYSES
-# =============================================================================
-#
-# Additional analyses that provide deeper biological insights:
-#
-
-cat("\n=== PART 12: ADDITIONAL ANALYSES ===\n")
-
-# -----------------------------------------------------------------------------
-# 12.1: Track persistence (how long do tracks maintain direction?)
-# -----------------------------------------------------------------------------
-
-cat("  Computing track persistence...\n")
-
-# Calculate directional autocorrelation
-calculate_persistence <- function(df) {
-  if (nrow(df) < 5) return(NA)
-
-  # Get displacement vectors
-  displacements <- df %>%
-    arrange(FRAME) %>%
-    mutate(
-      dx = POSITION_X - lag(POSITION_X),
-      dy = POSITION_Y - lag(POSITION_Y),
-      dz = POSITION_Z - lag(POSITION_Z)
-    ) %>%
-    filter(!is.na(dx))
-
-  if (nrow(displacements) < 3) return(NA)
-
-  # Compute autocorrelation of direction
-  # (cosine of angle between consecutive displacements)
-  autocorr <- displacements %>%
-    mutate(
-      mag = sqrt(dx^2 + dy^2 + dz^2),
-      dx_norm = dx / (mag + 1e-10),
-      dy_norm = dy / (mag + 1e-10),
-      dz_norm = dz / (mag + 1e-10),
-      dot_next = dx_norm * lead(dx_norm) + dy_norm * lead(dy_norm) + dz_norm * lead(dz_norm)
-    )
-
-  mean(autocorr$dot_next, na.rm = TRUE)
+save_pdf <- function(plot, filename, width = 12, height = 8) {
+  path <- file.path(OUTPUT_DIR, filename)
+  ggsave(path, plot, width = width, height = height, device = cairo_pdf)
+  cat(sprintf("  -> Saved %s\n", path))
 }
 
-# Calculate persistence for each track
-track_persistence <- spots_clean %>%
-  group_by(TRACK_ID) %>%
-  group_modify(~tibble(persistence = calculate_persistence(.x))) %>%
-  ungroup() %>%
-  filter(!is.na(persistence)) %>%
-  left_join(tracks_classified %>% select(TRACK_ID, movement_type), by = "TRACK_ID")
+frame_to_min <- function(f) f * FRAME_INTERVAL_MIN
+frame_to_hpf <- function(f) f * FRAME_INTERVAL_SEC / 3600
 
-# Plot persistence by movement type
-p_persistence <- ggplot(track_persistence %>% filter(!is.na(movement_type)),
-                        aes(x = movement_type, y = persistence, fill = movement_type)) +
-  geom_violin(alpha = 0.7) +
-  geom_boxplot(width = 0.2, alpha = 0.8) +
-  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
-  scale_fill_manual(values = movement_colors) +
-  labs(
-    title = "Directional Persistence by Movement Type",
-    subtitle = "1 = perfectly persistent; 0 = random; -1 = reversing",
-    x = NULL,
-    y = "Persistence (autocorrelation)"
-  ) +
-  theme_track() +
-  theme(legend.position = "none")
-
-ggsave("analysis_output/20_persistence.pdf", p_persistence, width = 8, height = 6)
-cat("    Saved: 20_persistence.pdf\n")
-
-# -----------------------------------------------------------------------------
-# 12.2: Speed-confinement phase space
-# -----------------------------------------------------------------------------
-#
-# INTERPRETATION:
-#   A 2D phase space of speed vs confinement reveals distinct populations:
-#   - Fast + directed: active migration
-#   - Slow + confined: stationary/crowded cells
-#   - Fast + confined: oscillating cells (e.g., interkinetic migration)
-#   - Slow + directed: slow persistent crawling
-#
-
-p_phase_space <- ggplot(tracks_classified,
-                        aes(x = SPEED_MEAN_UM_MIN, y = CONFINEMENT_RATIO, color = movement_type)) +
-  geom_point(alpha = 0.3, size = 0.8) +
-  geom_density_2d(linewidth = 0.3, alpha = 0.7) +
-  scale_color_manual(values = movement_colors) +
-  labs(
-    title = "Speed-Confinement Phase Space",
-    subtitle = "Contours show density; movement type classification overlaid",
-    x = "Mean speed (µm/min, 3D)",
-    y = "Confinement ratio",
-    color = NULL
-  ) +
-  theme_track()
-
-ggsave("analysis_output/21_phase_space.pdf", p_phase_space, width = 10, height = 8)
-cat("    Saved: 21_phase_space.pdf\n")
-
-# -----------------------------------------------------------------------------
-# 12.3: Local density vs speed analysis
-# -----------------------------------------------------------------------------
-#
-# INTERPRETATION:
-#   Does nuclear density affect movement speed?
-#   - High density → more crowded → slower movement?
-#   - Or high activity regions → both high density and speed?
-#
-
-cat("  Computing local density effects...\n")
-
-# Calculate local density for each spot
-spots_with_density <- spots_clean %>%
-  mutate(
-    x_bin = floor(POSITION_X / 100) * 100,
-    y_bin = floor(POSITION_Y / 100) * 100,
-    z_bin = floor(POSITION_Z / 50) * 50,
-    time_bin = floor(FRAME / 10) * 10
-  )
-
-local_density <- spots_with_density %>%
-  group_by(x_bin, y_bin, z_bin, time_bin) %>%
-  summarise(local_density = n(), .groups = "drop")
-
-spots_density <- spots_with_density %>%
-  left_join(local_density, by = c("x_bin", "y_bin", "z_bin", "time_bin")) %>%
-  left_join(
-    spots_velocity %>% select(TRACK_ID, FRAME, inst_speed_um_min),
-    by = c("TRACK_ID", "FRAME")
-  ) %>%
-  filter(!is.na(inst_speed_um_min) & !is.na(local_density))
-
-# Plot density vs speed
-density_speed_summary <- spots_density %>%
-  mutate(density_bin = cut(local_density, breaks = quantile(local_density, probs = seq(0, 1, 0.1)),
-                           include.lowest = TRUE)) %>%
-  group_by(density_bin) %>%
-  summarise(
-    mean_speed = mean(inst_speed_um_min, na.rm = TRUE),
-    se_speed = sd(inst_speed_um_min, na.rm = TRUE) / sqrt(n()),
-    mean_density = mean(local_density),
-    n = n()
-  ) %>%
-  filter(!is.na(density_bin))
-
-p_density_speed <- ggplot(density_speed_summary, aes(x = mean_density, y = mean_speed)) +
-  geom_point(aes(size = n), color = "#2166AC", alpha = 0.7) +
-  geom_smooth(method = "loess", color = "#B2182B", se = TRUE, alpha = 0.2) +
-  labs(
-    title = "Local Density vs Nuclear Speed",
-    subtitle = "Does crowding affect movement? (loess fit with 95% CI)",
-    x = "Local nuclear density (nuclei per voxel)",
-    y = "Mean instantaneous speed (µm/min, 3D)",
-    size = "n obs"
-  ) +
-  theme_track()
-
-ggsave("analysis_output/22_density_vs_speed.pdf", p_density_speed, width = 10, height = 7)
-cat("    Saved: 22_density_vs_speed.pdf\n")
-
-# -----------------------------------------------------------------------------
-# 12.4: Neighbor correlation analysis
-# -----------------------------------------------------------------------------
-#
-# INTERPRETATION:
-#   Do nearby nuclei move together (correlated movement)?
-#   - High correlation = collective behavior / tissue flow
-#   - Low correlation = independent cell movement
-#
-
-cat("  Computing neighbor velocity correlation...\n")
-
-# Sample frames for neighbor analysis (computationally expensive)
-sample_frames <- sample(unique(spots_velocity$FRAME), min(20, n_distinct(spots_velocity$FRAME)))
-
-neighbor_corr <- map_dfr(sample_frames, function(f) {
-  frame_data <- spots_velocity %>%
-    filter(FRAME == f & !is.na(vx) & !is.na(vy) & !is.na(vz))
-
-  if (nrow(frame_data) < 50) return(NULL)
-
-  # Sample spots to avoid O(n²) computation
-  sample_spots <- sample_n(frame_data, min(200, nrow(frame_data)))
-
-  # For each spot, find neighbors and compute velocity correlation
-  correlations <- map_dfr(1:nrow(sample_spots), function(i) {
-    spot <- sample_spots[i, ]
-
-    # Find neighbors within 50 µm
-    neighbors <- frame_data %>%
-      mutate(
-        dist = sqrt((POSITION_X - spot$POSITION_X)^2 +
-                    (POSITION_Y - spot$POSITION_Y)^2 +
-                    (POSITION_Z - spot$POSITION_Z)^2)
-      ) %>%
-      filter(dist > 0 & dist < 50)
-
-    if (nrow(neighbors) == 0) return(NULL)
-
-    # Compute velocity correlation with neighbors
-    v_self <- c(spot$vx, spot$vy, spot$vz)
-    v_self_norm <- v_self / (sqrt(sum(v_self^2)) + 1e-10)
-
-    neighbor_corrs <- neighbors %>%
-      rowwise() %>%
-      mutate(
-        v_neigh = list(c(vx, vy, vz)),
-        v_neigh_norm = list(unlist(v_neigh) / (sqrt(sum(unlist(v_neigh)^2)) + 1e-10)),
-        corr = sum(v_self_norm * unlist(v_neigh_norm))
-      ) %>%
-      ungroup()
-
-    tibble(
-      distance_bin = cut(neighbor_corrs$dist, breaks = c(0, 10, 20, 30, 40, 50)),
-      correlation = neighbor_corrs$corr
-    )
-  })
-
-  correlations
-})
-
-# Plot neighbor velocity correlation by distance
-if (nrow(neighbor_corr) > 0) {
-  neighbor_summary <- neighbor_corr %>%
-    filter(!is.na(distance_bin)) %>%
-    group_by(distance_bin) %>%
-    summarise(
-      mean_corr = mean(correlation, na.rm = TRUE),
-      se_corr = sd(correlation, na.rm = TRUE) / sqrt(n()),
-      n = n()
-    )
-
-  p_neighbor <- ggplot(neighbor_summary, aes(x = distance_bin, y = mean_corr)) +
-    geom_col(fill = "#2166AC", alpha = 0.7) +
-    geom_errorbar(aes(ymin = mean_corr - se_corr, ymax = mean_corr + se_corr), width = 0.2) +
-    geom_hline(yintercept = 0, linetype = "dashed") +
-    labs(
-      title = "Neighbor Velocity Correlation",
-      subtitle = "Do nearby nuclei move in similar directions? (1 = same, 0 = random, -1 = opposite)",
-      x = "Distance to neighbor (µm)",
-      y = "Mean velocity correlation"
-    ) +
-    theme_track()
-
-  ggsave("analysis_output/23_neighbor_correlation.pdf", p_neighbor, width = 10, height = 6)
-  cat("    Saved: 23_neighbor_correlation.pdf\n")
-}
-
-# -----------------------------------------------------------------------------
-# 12B.10: 4D Summary Statistics
-# -----------------------------------------------------------------------------
-
-cat("\n4D Analysis Summary:\n")
-
-# Spatial extent
-spatial_extent <- spots_clean %>%
-  summarise(
-    x_range = max(POSITION_X) - min(POSITION_X),
-    y_range = max(POSITION_Y) - min(POSITION_Y),
-    z_range = max(POSITION_Z) - min(POSITION_Z)
-  )
-
-cat(sprintf("  Spatial extent: X=%.0f µm, Y=%.0f µm, Z=%.0f µm\n",
-            spatial_extent$x_range, spatial_extent$y_range, spatial_extent$z_range))
-
-# Speed by Z-layer
-z_speed_summary <- spots_4d %>%
-  filter(!is.na(z_layer)) %>%
-  group_by(z_layer) %>%
-  summarise(mean_speed = mean(inst_speed_um_min, na.rm = TRUE)) %>%
-  arrange(z_layer)
-
-cat("  Speed by Z-layer:\n")
-for (i in 1:nrow(z_speed_summary)) {
-  cat(sprintf("    %s: %.2f µm/min\n",
-              z_speed_summary$z_layer[i], z_speed_summary$mean_speed[i]))
-}
-
-# Movement type spatial bias
-movetype_z_summary <- movement_spatial %>%
-  group_by(movement_type) %>%
-  summarise(
-    mean_z_norm = mean(z_normalized, na.rm = TRUE),
-    n = n()
-  )
-
-cat("  Movement type depth bias (0=deep, 1=surface):\n")
-for (i in 1:nrow(movetype_z_summary)) {
-  cat(sprintf("    %s: z=%.2f (n=%d)\n",
-              movetype_z_summary$movement_type[i],
-              movetype_z_summary$mean_z_norm[i],
-              movetype_z_summary$n[i]))
+add_depth_bin <- function(df) {
+  df %>%
+    mutate(depth_bin = cut(SPHERICAL_DEPTH,
+                           breaks = DEPTH_BREAKS,
+                           labels = DEPTH_LABELS,
+                           ordered_result = TRUE))
 }
 
 # =============================================================================
-# PART 13: CELL INGRESSION ANALYSIS
+# HELPER: compute instantaneous 3D velocity from consecutive spots
 # =============================================================================
-#
-# BIOLOGICAL INTERPRETATION:
-#   Cell ingression = cells that diverge from the local epiboly flow and move
-#   upward toward the margin. We detect this by:
-#     1. Computing the LOCAL BULK FLOW — mean velocity of nearby cells in a
-#        spatial neighborhood (~30 µm radius, same time frame)
-#     2. Computing each cell's RESIDUAL velocity = actual - local flow
-#     3. Flagging ingression when residual vy > 0 (upward deviation from flow)
-#        A positive residual vx (toward dorsal/interior) adds confidence.
-#
-#   If spherical coordinates are available (from orientation step), we also
-#   detect ingression as INWARD RADIAL MOVEMENT (decreasing radial distance
-#   from sphere centre, i.e. moving deeper into the embryo) specifically
-#   in the margin latitude band. This is the most biologically accurate
-#   definition of ingression during gastrulation.
-#
-#   Ingression is expected after a configurable onset time (default: 100 min).
-#   Spherical-depth-layer breakdown reveals depth-dependent ingression patterns.
-#
 
-cat("\n=== PART 13: CELL INGRESSION ANALYSIS ===\n")
-
-# ── User parameters ──────────────────────────────────────────────────────────
-INGRESSION_ONSET_MIN <- 100     # time (min) from which ingression is expected
-NEIGHBOR_RADIUS_UM   <- 30      # spatial radius for local flow computation
-
-cat(sprintf("  Ingression onset: %.0f min | Neighbor radius: %.0f µm\n",
-            INGRESSION_ONSET_MIN, NEIGHBOR_RADIUS_UM))
-
-# --- 13.1: Compute local bulk flow and residual velocities ---
-
-cat("  Computing local bulk flow (this may take a moment)...\n")
-
-# Work with steps that have valid velocities
-steps <- spots_velocity %>%
-  filter(!is.na(vx), !is.na(vy)) %>%
-  mutate(time_min = FRAME * FRAME_INTERVAL_MIN)
-
-# For each frame, compute local flow using spatial binning (fast approximation)
-# Instead of O(n²) per-point neighbor search, we bin into spatial tiles
-BIN_SIZE <- NEIGHBOR_RADIUS_UM  # bin matches radius
-steps <- steps %>%
-  mutate(x_bin = floor(POSITION_X / BIN_SIZE),
-         y_bin = floor(POSITION_Y / BIN_SIZE),
-         z_bin = floor(POSITION_Z / BIN_SIZE))
-
-# Local flow = mean velocity in surrounding bins (3×3×3 neighborhood)
-local_flow <- steps %>%
-  group_by(FRAME, x_bin, y_bin, z_bin) %>%
-  summarise(flow_vx = mean(vx, na.rm = TRUE),
-            flow_vy = mean(vy, na.rm = TRUE),
-            flow_n  = n(), .groups = "drop")
-
-# Expand to 3×3×3 neighborhood: each bin gets the average of its ±1 neighbors
-# This smooths the flow and approximates a circular radius
-neighbor_offsets <- expand.grid(dx = -1:1, dy = -1:1, dz = -1:1)
-
-local_flow_smooth <- local_flow %>%
-  crossing(neighbor_offsets) %>%
-  mutate(nb_x = x_bin + dx, nb_y = y_bin + dy, nb_z = z_bin + dz) %>%
-  group_by(FRAME, nb_x, nb_y, nb_z) %>%
-  summarise(flow_vx = weighted.mean(flow_vx, flow_n, na.rm = TRUE),
-            flow_vy = weighted.mean(flow_vy, flow_n, na.rm = TRUE),
-            flow_n  = sum(flow_n), .groups = "drop") %>%
-  rename(x_bin = nb_x, y_bin = nb_y, z_bin = nb_z)
-
-# Join back: each step gets its local flow
-steps <- steps %>%
-  left_join(local_flow_smooth, by = c("FRAME", "x_bin", "y_bin", "z_bin"),
-            suffix = c("", "_flow")) %>%
-  mutate(
-    # Residual = actual velocity minus local bulk flow
-    res_vx = vx - flow_vx,
-    res_vy = vy - flow_vy,
-    res_speed = sqrt(res_vx^2 + res_vy^2),
-    # Ingression: residual vy > 0 (primary) with optional +X confidence
-    is_ingressing = res_vy > 0,
-    # Confidence score: how much the residual points toward +Y and +X
-    ingression_confidence = case_when(
-      res_vy > 0 & res_vx > 0 ~ "High (+Y, +X)",
-      res_vy > 0 & res_vx <= 0 ~ "Moderate (+Y only)",
-      TRUE ~ "Not ingressing"
-    )
-  )
-
-cat(sprintf("  Computed residual velocities for %s steps\n",
-            format(nrow(steps), big.mark = ",")))
-
-# Assign Z layers
-z_breaks <- quantile(steps$POSITION_Z, probs = seq(0, 1, length.out = 6), na.rm = TRUE)
-z_labels <- paste0("Z", 1:5, " [",
-                    round(z_breaks[1:5]), "–",
-                    round(z_breaks[2:6]), " µm]")
-
-steps <- steps %>%
-  mutate(z_layer = cut(POSITION_Z, breaks = z_breaks, labels = z_labels,
-                       include.lowest = TRUE)) %>%
-  filter(!is.na(z_layer))
-
-# --- Spherical ingression detection (if sphere-fit data available) ---
-# Ingression in spherical coordinates = inward radial movement (decreasing radius)
-# This is more biologically accurate than Cartesian residual methods on a curved embryo
-if (HAS_SPHERICAL && "SPHERICAL_DEPTH" %in% names(steps)) {
-  cat("  Using spherical coordinates for enhanced ingression detection...\n")
-
-  # Compute radial velocity (dr/dt): positive = moving outward, negative = moving inward
-  steps <- steps %>%
+compute_inst_velocity <- function(spots_df) {
+  spots_df %>%
     arrange(TRACK_ID, FRAME) %>%
     group_by(TRACK_ID) %>%
     mutate(
-      d_radial = RADIAL_DIST - lag(RADIAL_DIST),
-      radial_velocity = d_radial / dt_min  # µm/min; negative = inward = ingression
+      dx = POSITION_X - lag(POSITION_X),
+      dy = POSITION_Y - lag(POSITION_Y),
+      dz = POSITION_Z - lag(POSITION_Z),
+      dt_frames = FRAME - lag(FRAME),
+      displacement_3d = sqrt(dx^2 + dy^2 + dz^2),
+      inst_speed_um_min = displacement_3d / (dt_frames * FRAME_INTERVAL_MIN),
+      # Component velocities (um/frame)
+      vx = dx / dt_frames,
+      vy = dy / dt_frames,
+      vz = dz / dt_frames,
+      # Tangential speed: |v_total|^2 = v_radial^2 + v_tangential^2
+      total_speed_frame = displacement_3d / dt_frames,
+      tangential_speed = sqrt(pmax(total_speed_frame^2 -
+                                     ifelse(is.na(RADIAL_VELOCITY), 0,
+                                            RADIAL_VELOCITY)^2, 0)),
+      # Turning angle (degrees) between consecutive displacement vectors
+      dot_prev = dx * lag(dx) + dy * lag(dy) + dz * lag(dz),
+      mag_curr = displacement_3d,
+      mag_prev = lag(displacement_3d),
+      cos_angle = dot_prev / (mag_curr * mag_prev),
+      turning_angle = acos(pmin(pmax(cos_angle, -1), 1)) * 180 / pi,
+      # XY direction angle (degrees from +X axis)
+      direction_xy = atan2(dy, dx) * 180 / pi
     ) %>%
     ungroup()
-
-  # Spherical ingression: inward radial movement (negative radial velocity)
-  steps <- steps %>%
-    mutate(
-      is_ingressing_sph = !is.na(radial_velocity) & radial_velocity < 0,
-      # Enhanced: ingressing AND in the margin latitude band
-      is_ingressing_margin = is_ingressing_sph &
-        !is.na(IN_MARGIN) & IN_MARGIN
-    )
-
-  # Use spherical depth layers instead of Cartesian Z
-  steps <- steps %>%
-    mutate(sph_depth_layer = cut(SPHERICAL_DEPTH,
-                                  breaks = quantile(SPHERICAL_DEPTH, probs = seq(0, 1, length.out = 6), na.rm = TRUE),
-                                  labels = paste0("SD", 1:5),
-                                  include.lowest = TRUE))
-
-  sph_pct <- mean(steps$is_ingressing_sph, na.rm = TRUE) * 100
-  margin_pct <- if (any(steps$IN_MARGIN, na.rm = TRUE))
-    mean(steps$is_ingressing_sph[steps$IN_MARGIN], na.rm = TRUE) * 100 else NA
-  cat(sprintf("  Spherical ingression: %.1f%% all steps | %.1f%% in margin band\n",
-              sph_pct, if (is.na(margin_pct)) 0 else margin_pct))
 }
 
-# Overall ingression summary (flow-residual method)
-overall_pct <- mean(steps$is_ingressing) * 100
-high_conf_pct <- mean(steps$ingression_confidence == "High (+Y, +X)") * 100
-cat(sprintf("  Overall: %.1f%% steps ingressing (%.1f%% high confidence)\n",
-            overall_pct, high_conf_pct))
+# =============================================================================
+# HELPER: compute MSD for tracks
+# =============================================================================
 
-# --- 13.2: Ingression rate over time, by Z layer ---
+compute_msd_ensemble <- function(spots_df, max_lag = 30, n_sample = 8000) {
+  set.seed(42)
+  track_ids <- unique(spots_df$TRACK_ID)
+  if (length(track_ids) > n_sample) {
+    track_ids <- sample(track_ids, n_sample)
+  }
 
-ingression_by_z_time <- steps %>%
-  mutate(time_bin_min = floor(time_min / 10) * 10) %>%
-  group_by(time_bin_min, z_layer) %>%
-  summarise(pct_ingressing = mean(is_ingressing) * 100,
-            pct_high_conf  = mean(ingression_confidence == "High (+Y, +X)") * 100,
-            n = n(), .groups = "drop")
+  dt <- as.data.table(spots_df)[TRACK_ID %in% track_ids,
+                                 .(TRACK_ID, FRAME, POSITION_X, POSITION_Y, POSITION_Z)]
+  setkey(dt, TRACK_ID, FRAME)
 
-p_ingress_time_z <- ggplot(ingression_by_z_time,
-                            aes(x = time_bin_min, y = pct_ingressing, color = z_layer)) +
-  geom_line(linewidth = 0.5, alpha = 0.4) +
-  geom_smooth(method = "loess", span = 0.4, se = FALSE, linewidth = 1) +
-  geom_vline(xintercept = INGRESSION_ONSET_MIN, linetype = "dashed", color = "grey40") +
-  annotate("text", x = INGRESSION_ONSET_MIN + 2,
-           y = max(ingression_by_z_time$pct_ingressing, na.rm = TRUE) * 0.95,
-           label = sprintf("onset (%d min)", INGRESSION_ONSET_MIN),
-           hjust = 0, size = 3, color = "grey40") +
-  scale_color_viridis_d(option = "C", end = 0.9) +
-  labs(title = "Ingression Rate Over Developmental Time by Z Layer",
-       subtitle = "% of steps with residual vy > 0 (deviating upward from local flow)",
-       x = "Time (min from start)", y = "% steps ingressing",
-       color = "Z layer") +
-  theme_track() + theme(legend.position = "right")
+  msd_list <- list()
+  for (lag in 1:max_lag) {
+    d2 <- dt[, {
+      n <- .N
+      if (n > lag) {
+        idx1 <- 1:(n - lag)
+        idx2 <- (1 + lag):n
+        # Only use pairs where frame difference matches lag
+        valid <- (FRAME[idx2] - FRAME[idx1]) == lag
+        if (sum(valid) > 0) {
+          dsq <- (POSITION_X[idx2[valid]] - POSITION_X[idx1[valid]])^2 +
+                 (POSITION_Y[idx2[valid]] - POSITION_Y[idx1[valid]])^2 +
+                 (POSITION_Z[idx2[valid]] - POSITION_Z[idx1[valid]])^2
+          .(msd = mean(dsq), n = length(dsq))
+        } else {
+          .(msd = numeric(0), n = integer(0))
+        }
+      } else {
+        .(msd = numeric(0), n = integer(0))
+      }
+    }, by = TRACK_ID]
 
-# --- 13.3: High-confidence ingression (residual +Y AND +X) over time ---
-
-p_ingress_conf <- ggplot(ingression_by_z_time,
-                          aes(x = time_bin_min, y = pct_high_conf, color = z_layer)) +
-  geom_line(linewidth = 0.5, alpha = 0.4) +
-  geom_smooth(method = "loess", span = 0.4, se = FALSE, linewidth = 1) +
-  geom_vline(xintercept = INGRESSION_ONSET_MIN, linetype = "dashed", color = "grey40") +
-  scale_color_viridis_d(option = "C", end = 0.9) +
-  labs(title = "High-Confidence Ingression (+Y and +X residual)",
-       subtitle = "Cells deviating upward AND inward from local epiboly flow",
-       x = "Time (min from start)", y = "% steps (high confidence)",
-       color = "Z layer") +
-  theme_track() + theme(legend.position = "right")
-
-# --- 13.4: Per-track ingression (tracks active after onset) ---
-
-track_ingression <- steps %>%
-  filter(time_min >= INGRESSION_ONSET_MIN) %>%
-  group_by(TRACK_ID) %>%
-  filter(n() >= 3) %>%
-  summarise(
-    x_start = first(POSITION_X), y_start = first(POSITION_Y), z_start = first(POSITION_Z),
-    x_end   = last(POSITION_X),  y_end   = last(POSITION_Y),
-    mean_res_vx = mean(res_vx, na.rm = TRUE),
-    mean_res_vy = mean(res_vy, na.rm = TRUE),
-    pct_steps_ingress = mean(is_ingressing) * 100,
-    pct_high_conf = mean(ingression_confidence == "High (+Y, +X)") * 100,
-    mean_speed = mean(inst_speed_um_min, na.rm = TRUE),
-    n_steps = n(),
-    .groups = "drop"
-  ) %>%
-  mutate(
-    is_ingressing_track = pct_steps_ingress > 60,  # >60% of steps deviate upward
-    z_layer = cut(z_start, breaks = z_breaks, labels = z_labels, include.lowest = TRUE)
-  ) %>%
-  left_join(tracks_classified %>% select(TRACK_ID, movement_type),
-            by = "TRACK_ID")
-
-# Track-level summary
-ingression_summary <- track_ingression %>%
-  filter(!is.na(z_layer)) %>%
-  group_by(z_layer) %>%
-  summarise(n_total = n(),
-            n_ingressing = sum(is_ingressing_track),
-            pct = n_ingressing / n_total * 100, .groups = "drop")
-
-cat(sprintf("  Tracks active after %d min: %d\n",
-            INGRESSION_ONSET_MIN, nrow(track_ingression)))
-cat("  Track-level ingression by Z layer (>60%% of steps deviate upward):\n")
-for (i in 1:nrow(ingression_summary)) {
-  cat(sprintf("    %s: %d / %d ingressing (%.1f%%)\n",
-              ingression_summary$z_layer[i],
-              ingression_summary$n_ingressing[i],
-              ingression_summary$n_total[i],
-              ingression_summary$pct[i]))
+    if (nrow(d2) > 0 && sum(d2$n) > 0) {
+      msd_list[[lag]] <- data.frame(
+        lag_frames = lag,
+        lag_min    = lag * FRAME_INTERVAL_MIN,
+        mean_msd   = weighted.mean(d2$msd, d2$n),
+        n_pairs    = sum(d2$n),
+        n_tracks   = nrow(d2)
+      )
+    }
+  }
+  bind_rows(msd_list)
 }
 
-# --- 13.5: Residual velocity field (post-onset), faceted by Z ---
-
-residual_field <- steps %>%
-  filter(time_min >= INGRESSION_ONSET_MIN) %>%
-  mutate(x_bin = round(POSITION_X / 25) * 25,
-         y_bin = round(POSITION_Y / 25) * 25) %>%
-  group_by(x_bin, y_bin, z_layer) %>%
-  summarise(mean_res_vx = mean(res_vx, na.rm = TRUE),
-            mean_res_vy = mean(res_vy, na.rm = TRUE),
-            pct_ingress = mean(is_ingressing) * 100,
-            n = n(), .groups = "drop") %>%
-  filter(n >= 3)
-
-p_ingress_field <- ggplot(residual_field, aes(x = x_bin, y = y_bin)) +
-  geom_tile(aes(fill = pct_ingress), alpha = 0.7) +
-  geom_segment(aes(xend = x_bin + mean_res_vx * 8, yend = y_bin + mean_res_vy * 8),
-               arrow = arrow(length = unit(1, "mm")), linewidth = 0.25, alpha = 0.6) +
-  scale_fill_gradient2(low = "#2166AC", mid = "grey95", high = "#B2182B",
-                        midpoint = 50, name = "% ingressing") +
-  facet_wrap(~z_layer, nrow = 1) +
-  coord_fixed() +
-  labs(title = sprintf("Residual Velocity Field (≥ %d min)", INGRESSION_ONSET_MIN),
-       subtitle = "Arrows = residual velocity (actual − local flow) | Color = ingression %",
-       x = "X (µm)", y = "Y (µm)") +
-  theme_track(base_size = 8) + theme(strip.text = element_text(size = 7))
-
-# --- 13.6: Spatial map of ingressing tracks, by Z ---
-
-p_ingress_map <- ggplot(track_ingression %>% filter(!is.na(z_layer)),
-                         aes(x = x_start, y = y_start)) +
-  geom_point(data = track_ingression %>% filter(!is_ingressing_track, !is.na(z_layer)),
-             color = "grey80", alpha = 0.3, size = 0.5) +
-  geom_point(data = track_ingression %>% filter(is_ingressing_track, !is.na(z_layer)),
-             color = "#B2182B", alpha = 0.5, size = 0.8) +
-  geom_segment(data = track_ingression %>% filter(is_ingressing_track, !is.na(z_layer)),
-               aes(xend = x_end, yend = y_end),
-               arrow = arrow(length = unit(0.8, "mm")),
-               color = "#B2182B", alpha = 0.25, linewidth = 0.2) +
-  facet_wrap(~z_layer, nrow = 1) +
-  coord_fixed() +
-  labs(title = "Ingressing Tracks (red) by Z Layer",
-       subtitle = "Track classified as ingressing if >60% of steps have upward residual velocity",
-       x = "X (µm)", y = "Y (µm)") +
-  theme_track(base_size = 8) + theme(strip.text = element_text(size = 7))
-
-# --- 13.7: Ingression speed & bar by Z layer ---
-
-p_ingress_speed_z <- ggplot(track_ingression %>% filter(is_ingressing_track, !is.na(z_layer)),
-                             aes(x = z_layer, y = mean_speed, fill = z_layer)) +
-  geom_violin(alpha = 0.5, draw_quantiles = c(0.25, 0.5, 0.75)) +
-  geom_jitter(width = 0.15, alpha = 0.2, size = 0.5) +
-  scale_fill_viridis_d(option = "C", end = 0.9, guide = "none") +
-  labs(title = "Ingressing Cell Speed by Z Layer",
-       x = NULL, y = "Mean speed (µm/min)") +
-  theme_track() + theme(axis.text.x = element_text(size = 7))
-
-p_ingress_bar <- ggplot(ingression_summary, aes(x = z_layer, y = pct, fill = pct)) +
-  geom_col() +
-  geom_text(aes(label = sprintf("%.0f%%\n(%d/%d)", pct, n_ingressing, n_total)),
-            vjust = -0.2, size = 2.8) +
-  scale_fill_gradient(low = "grey80", high = "#B2182B", guide = "none") +
-  labs(title = sprintf("Ingression Rate by Depth (after %d min)", INGRESSION_ONSET_MIN),
-       x = "Z layer", y = "% ingressing tracks") +
-  ylim(0, max(ingression_summary$pct, na.rm = TRUE) * 1.2) +
-  theme_track() + theme(axis.text.x = element_text(size = 7))
-
-# Combine ingression plots
-ingression_combined <- (p_ingress_time_z + p_ingress_conf) /
-                       p_ingress_field /
-                       p_ingress_map /
-                       (p_ingress_speed_z + p_ingress_bar) +
-  plot_annotation(
-    title = "Cell Ingression Analysis (Flow-Residual Method)",
-    subtitle = sprintf("Ingression = upward deviation from local bulk flow | Onset: %d min | Neighbor radius: %d µm",
-                        INGRESSION_ONSET_MIN, NEIGHBOR_RADIUS_UM),
-    theme = theme(
-      plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
-      plot.subtitle = element_text(size = 10, hjust = 0.5, color = "grey50")
-    )
-  )
-
-ggsave("analysis_output/24_ingression.pdf", ingression_combined, width = 18, height = 24)
-cat("  Saved: 24_ingression.pdf\n")
-
-# Export ingression data
-write_csv(track_ingression, "analysis_output/track_ingression.csv")
-cat("  Exported: track_ingression.csv\n")
-
-# =============================================================================
-# PART 14: FINAL SUMMARY
-# =============================================================================
+# #############################################################################
+#
+#                         MAIN EXECUTION
+#
+# #############################################################################
 
 cat("\n")
 cat(strrep("=", 70), "\n")
-cat("ANALYSIS SUMMARY\n")
-cat(strrep("=", 70), "\n\n")
-
-cat("DATASET:\n")
-cat(sprintf("  Tracks analyzed: %d\n", nrow(tracks_clean)))
-cat(sprintf("  Total imaging time: %.1f min (%.1f hours)\n",
-            max(spots_clean$FRAME) * FRAME_INTERVAL_MIN,
-            max(spots_clean$FRAME) * FRAME_INTERVAL_MIN / 60))
-cat(sprintf("  Temporal resolution: %d sec/frame\n", FRAME_INTERVAL_SEC))
-
-cat("\nNUCLEAR MOVEMENT:\n")
-cat(sprintf("  Median speed: %.2f µm/min\n", median(tracks_clean$SPEED_MEAN_UM_MIN)))
-cat(sprintf("  Median track duration: %.1f min\n", median(tracks_clean$DURATION_MIN)))
-cat(sprintf("  Median displacement: %.1f µm\n", median(tracks_clean$TRACK_DISPLACEMENT)))
-
-cat("\nMOVEMENT TYPES:\n")
-for (i in 1:nrow(movement_summary)) {
-  cat(sprintf("  %s: %.1f%%\n", movement_summary$movement_type[i], movement_summary$pct[i]))
-}
-
-cat("\nDIFFUSION ANALYSIS:\n")
-cat(sprintf("  MSD exponent (α): %.2f → %s\n", alpha,
-            ifelse(alpha < 0.8, "subdiffusive (confined)",
-                   ifelse(alpha > 1.2, "superdiffusive (directed)", "normal diffusion"))))
-
-cat("\nCELL INGRESSION (after ", INGRESSION_ONSET_MIN, " min, flow-residual method):\n", sep = "")
-cat(sprintf("  Overall: %.1f%% steps ingressing | %.1f%% high confidence (+Y & +X)\n",
-            overall_pct, high_conf_pct))
-for (i in 1:nrow(ingression_summary)) {
-  cat(sprintf("  %s: %d/%d tracks ingressing (%.1f%%)\n",
-              ingression_summary$z_layer[i],
-              ingression_summary$n_ingressing[i],
-              ingression_summary$n_total[i],
-              ingression_summary$pct[i]))
-}
-
-cat("\nOUTPUT FILES:\n")
-cat("  Velocity & Biological Analysis:\n")
-cat("    analysis_output/01_velocity_analysis.pdf\n")
-cat("    analysis_output/02_directionality.pdf\n")
-cat("    analysis_output/03_spatial_velocity.pdf\n")
-cat("    analysis_output/04_msd_analysis.pdf\n")
-cat("    analysis_output/05_movement_classification.pdf\n")
-cat("    analysis_output/06_clustering.pdf\n")
-cat("    analysis_output/07_confinement.pdf\n")
-cat("  4D Spatial-Temporal Analysis:\n")
-cat("    analysis_output/08_z_depth_basic.pdf\n")
-cat("    analysis_output/09_z_layer_xy_patterns.pdf\n")
-cat("    analysis_output/10_z_velocity_analysis.pdf\n")
-cat("    analysis_output/11_temporal_evolution.pdf\n")
-cat("    analysis_output/12_xz_yz_projections.pdf\n")
-cat("    analysis_output/13_parameter_correlations.pdf\n")
-cat("    analysis_output/14_movement_type_4d.pdf\n")
-cat("    analysis_output/15_pseudo_3d_tracks.pdf\n")
-cat("  Interactive 4D Visualizations (open in browser):\n")
-cat("    analysis_output/16_interactive_3d_movetype.html\n")
-cat("    analysis_output/17_interactive_3d_speed.html\n")
-cat("    analysis_output/18_interactive_3d_tracks.html\n")
-cat("    analysis_output/19_interactive_4d_timelapse.html\n")
-cat("  Additional Analyses:\n")
-cat("    analysis_output/20_persistence.pdf\n")
-cat("    analysis_output/21_phase_space.pdf\n")
-cat("    analysis_output/22_density_vs_speed.pdf\n")
-cat("    analysis_output/23_neighbor_correlation.pdf\n")
-cat("  Cell Ingression:\n")
-cat("    analysis_output/24_ingression.pdf\n")
-cat("  Data Exports:\n")
-
-# Save processed data
-write_csv(tracks_classified, "analysis_output/tracks_analyzed.csv")
-write_csv(spots_velocity, "analysis_output/spots_with_velocity.csv")
-cat("    analysis_output/tracks_analyzed.csv\n")
-cat("    analysis_output/spots_with_velocity.csv\n")
-cat("    analysis_output/tracks_3d_visualization.csv\n")
-cat("    analysis_output/track_centroids_3d.csv\n")
-cat("    analysis_output/track_ingression.csv\n")
-
-cat("\n", strrep("=", 70), "\n")
-cat("ANALYSIS COMPLETE\n")
+cat("  TRACKMATE COMPREHENSIVE ANALYSIS (per-species)\n")
 cat(strrep("=", 70), "\n")
+cat(sprintf("  Frame interval: %d sec | Speed conversion: x%.0f\n",
+            FRAME_INTERVAL_SEC, SPEED_CONVERSION))
+cat(sprintf("  Output: %s/\n", OUTPUT_DIR))
+
+# #############################################################################
+# SECTION 00: DATA LOADING
+# #############################################################################
+
+cat("\n=== SECTION 00: LOADING DATA ===\n")
+
+load_species_data <- function(sp) {
+  dir <- sp$data_dir
+  if (!dir.exists(dir)) {
+    warning(sprintf("Data directory '%s' not found -- skipping %s", dir, sp$name))
+    return(NULL)
+  }
+
+  cat(sprintf("\n  Loading %s from %s/ ...\n", sp$name, dir))
+
+  # --- Spots (prefer filtered version if filter_dir is set) ---
+  filtered_spots <- NULL
+  filtered_ts    <- NULL
+  if (!is.null(sp$filter_dir)) {
+    fp <- file.path(sp$filter_dir, "filtered_spots.csv")
+    ft <- file.path(sp$filter_dir, "filtered_track_summary.csv")
+    if (file.exists(fp)) filtered_spots <- fp
+    if (file.exists(ft)) filtered_ts    <- ft
+  }
+
+  if (!is.null(filtered_spots)) {
+    spots_path <- filtered_spots
+    cat(sprintf("    * Using FILTERED spots: %s\n", spots_path))
+  } else {
+    spots_path <- file.path(dir, "oriented_spots.csv")
+  }
+
+  spots <- fread(spots_path, showProgress = FALSE)
+  setDF(spots)
+  spots$species <- sp$name
+
+  # Ensure INGRESSING is logical
+  if ("INGRESSING" %in% names(spots)) {
+    spots$INGRESSING <- as.logical(spots$INGRESSING)
+  }
+  if ("IN_ROI" %in% names(spots)) {
+    spots$IN_ROI <- as.logical(spots$IN_ROI)
+  }
+
+  cat(sprintf("    Spots: %s rows, %d columns, frames %d-%d\n",
+              format(nrow(spots), big.mark = ","), ncol(spots),
+              min(spots$FRAME), max(spots$FRAME)))
+
+  # --- Track summary (prefer filtered version) ---
+  if (!is.null(filtered_ts)) {
+    ts_path <- filtered_ts
+    cat(sprintf("    * Using FILTERED track summary: %s\n", ts_path))
+  } else {
+    ts_path <- file.path(dir, "track_summary.csv")
+  }
+
+  tsummary <- read_csv(ts_path, show_col_types = FALSE)
+  tsummary$species <- sp$name
+  if ("INGRESSING" %in% names(tsummary)) {
+    tsummary$INGRESSING <- as.logical(tsummary$INGRESSING)
+  }
+  if ("IN_ROI" %in% names(tsummary)) {
+    tsummary$IN_ROI <- as.logical(tsummary$IN_ROI)
+  }
+  cat(sprintf("    Tracks: %s\n", format(nrow(tsummary), big.mark = ",")))
+
+  # --- Auxiliary data ---
+  sphere <- read_csv(file.path(dir, "sphere_params.csv"), show_col_types = FALSE)
+  sphere_list <- setNames(sphere$value, sphere$parameter)
+
+  roi <- read_csv(file.path(dir, "roi_bounds.csv"), show_col_types = FALSE)
+  roi_list <- setNames(roi$value, roi$parameter)
+
+  ingr <- read_csv(file.path(dir, "ingression_params.csv"), show_col_types = FALSE)
+  ingr_list <- setNames(as.character(ingr$value), ingr$parameter)
+
+  meta <- fromJSON(file.path(dir, "analysis_metadata.json"))
+
+  list(
+    spots      = spots,
+    tracks     = tsummary,
+    sphere     = sphere_list,
+    roi        = roi_list,
+    ingression = ingr_list,
+    metadata   = meta,
+    config     = sp
+  )
+}
+
+# Load all species
+DATA <- list()
+for (sp_key in names(SPECIES)) {
+  result <- load_species_data(SPECIES[[sp_key]])
+  if (!is.null(result)) DATA[[sp_key]] <- result
+}
+
+if (length(DATA) == 0) stop("No species data loaded. Check data directories.")
+
+cat(sprintf("\n  Loaded %d species: %s\n",
+            length(DATA),
+            paste(sapply(DATA, function(d) d$config$name), collapse = ", ")))
+
+# --- Data overview table ---
+overview_rows <- lapply(DATA, function(d) {
+  sp <- d$spots; ts <- d$tracks
+  tibble(
+    Species              = d$config$name,
+    `Total spots`        = nrow(sp),
+    `Total tracks`       = nrow(ts),
+    `Frames`             = length(unique(sp$FRAME)),
+    `Frame range`        = sprintf("%d - %d", min(sp$FRAME), max(sp$FRAME)),
+    `Duration (min)`     = round(max(sp$FRAME) * FRAME_INTERVAL_MIN, 1),
+    `Sphere R (um)`      = round(as.numeric(d$sphere["radius"]), 1),
+    `Median track length` = median(ts$n_spots),
+    `Mean spots/frame`   = round(nrow(sp) / length(unique(sp$FRAME)), 0),
+    `Depth range (um)`   = sprintf("%.1f - %.1f",
+                                    min(sp$SPHERICAL_DEPTH, na.rm = TRUE),
+                                    max(sp$SPHERICAL_DEPTH, na.rm = TRUE)),
+    `Ingression validated` = d$config$has_ingression,
+    `N ingressing tracks`  = if (d$config$has_ingression) sum(ts$INGRESSING, na.rm = TRUE) else NA_integer_
+  )
+})
+overview_df <- bind_rows(overview_rows)
+print(as_tibble(overview_df))
+write_csv(overview_df, file.path(OUTPUT_DIR, "analysis_summary.csv"))
+cat("  -> Saved analysis_summary.csv\n")
+
+# --- Compute instantaneous velocities for all species ---
+cat("\n  Computing instantaneous velocities ...\n")
+for (sp_key in names(DATA)) {
+  cat(sprintf("    %s ...\n", DATA[[sp_key]]$config$name))
+  DATA[[sp_key]]$spots_vel <- compute_inst_velocity(DATA[[sp_key]]$spots)
+}
+
+# #############################################################################
+#
+#          PER-SPECIES ANALYSIS (loop over each species)
+#
+# #############################################################################
+
+for (sp_key in names(DATA)) {
+  d       <- DATA[[sp_key]]
+  sp      <- d$config
+  prefix  <- sp$prefix
+  spots   <- d$spots
+  tracks  <- d$tracks
+  spots_v <- d$spots_vel
+  R_sphere <- as.numeric(d$sphere["radius"])
+  sp_col  <- sp$color
+
+  cat(sprintf("\n%s\n  PER-SPECIES ANALYSIS: %s\n%s\n",
+              strrep("=", 70), sp$name, strrep("=", 70)))
+
+  # =========================================================================
+  # S01: OVERVIEW & QC
+  # =========================================================================
+
+  cat(sprintf("\n=== %s S01: OVERVIEW & QC ===\n", sp$short))
+
+  # Nuclei count per frame
+  count_df <- spots %>%
+    group_by(FRAME) %>%
+    summarise(n_nuclei = n(), .groups = "drop") %>%
+    mutate(time_min = frame_to_min(FRAME))
+
+  p_count <- ggplot(count_df, aes(x = time_min, y = n_nuclei)) +
+    geom_line(color = sp_col, linewidth = 0.5, alpha = 0.7) +
+    geom_smooth(method = "loess", span = 0.3, se = TRUE, color = "black",
+                linewidth = 0.8) +
+    labs(title = sprintf("Detected Nuclei Over Time -- %s", sp$name),
+         subtitle = sprintf("Total: %s spots, %s tracks, %d frames",
+                            format(nrow(spots), big.mark = ","),
+                            format(nrow(tracks), big.mark = ","),
+                            length(unique(spots$FRAME))),
+         x = "Time (min)", y = "Number of nuclei") +
+    theme_pipe()
+
+  # Rate of change
+  rate_df <- count_df %>%
+    arrange(FRAME) %>%
+    mutate(delta = n_nuclei - lag(n_nuclei),
+           pct_change = delta / lag(n_nuclei) * 100)
+
+  p_rate <- rate_df %>%
+    filter(!is.na(delta)) %>%
+    ggplot(aes(x = time_min, y = delta)) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+    geom_line(alpha = 0.3, color = sp_col, linewidth = 0.3) +
+    geom_smooth(method = "loess", span = 0.2, se = FALSE,
+                color = sp_col, linewidth = 0.8) +
+    labs(title = "Frame-to-Frame Change in Nuclei Count",
+         subtitle = "Positive = gain (division/detection), Negative = loss (tracking dropout)",
+         x = "Time (min)", y = "Delta Nuclei / frame") +
+    theme_pipe()
+
+  # Data summary as text annotation plot
+  info_text <- sprintf(
+    paste0("Species: %s\nSphere R: %.1f um\nTotal spots: %s\nTotal tracks: %s\n",
+           "Frames: %d (%s - %s)\nDuration: %.1f min\n",
+           "Median track length: %d spots\nMean spots/frame: %.0f\n",
+           "Depth range: %.1f - %.1f um%s"),
+    sp$name, R_sphere,
+    format(nrow(spots), big.mark = ","),
+    format(nrow(tracks), big.mark = ","),
+    length(unique(spots$FRAME)),
+    min(spots$FRAME), max(spots$FRAME),
+    max(spots$FRAME) * FRAME_INTERVAL_MIN,
+    median(tracks$n_spots),
+    nrow(spots) / length(unique(spots$FRAME)),
+    min(spots$SPHERICAL_DEPTH, na.rm = TRUE),
+    max(spots$SPHERICAL_DEPTH, na.rm = TRUE),
+    if (sp$has_ingression) sprintf("\nIngressing tracks: %d (%.1f%%)",
+        sum(tracks$INGRESSING, na.rm = TRUE),
+        100 * sum(tracks$INGRESSING, na.rm = TRUE) / nrow(tracks)) else ""
+  )
+
+  p_info <- ggplot() +
+    annotate("text", x = 0.5, y = 0.5, label = info_text,
+             hjust = 0.5, vjust = 0.5, size = 3.5, family = "mono") +
+    theme_void() +
+    labs(title = "Dataset Summary") +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 12))
+
+  p01 <- p_count / p_rate / p_info +
+    plot_annotation(
+      title = sprintf("%s -- 01 Overview & QC", sp$name),
+      theme = theme(plot.title = element_text(face = "bold", size = 14, hjust = 0.5)))
+
+  save_pdf(p01, sprintf("%s_01_overview_qc.pdf", prefix), width = 14, height = 14)
+
+
+  # =========================================================================
+  # S02: SPATIAL DISTRIBUTION
+  # =========================================================================
+
+  cat(sprintf("\n=== %s S02: SPATIAL DISTRIBUTION ===\n", sp$short))
+
+  # Theta-phi coverage heatmap
+  p_angular <- spots %>%
+    filter(!is.na(THETA_DEG), !is.na(PHI_DEG)) %>%
+    ggplot(aes(x = PHI_DEG, y = THETA_DEG)) +
+    geom_bin2d(bins = c(60, 40)) +
+    scale_fill_viridis_c(option = "plasma", trans = "log10", labels = comma) +
+    labs(title = "Angular Coverage (Spherical Coordinates)",
+         subtitle = "Theta = polar angle from AP, Phi = azimuthal",
+         x = "Phi (azimuthal, deg)", y = "Theta (polar, deg)", fill = "Count") +
+    theme_pipe()
+
+  # XY projection density
+  p_xy <- spots %>%
+    ggplot(aes(x = POSITION_X, y = POSITION_Y)) +
+    geom_bin2d(bins = 80) +
+    scale_fill_viridis_c(option = "plasma", trans = "log10", labels = comma) +
+    labs(title = "XY Projection of All Nuclei",
+         x = "X (um)", y = "Y (um)", fill = "Count") +
+    theme_pipe()
+
+  # Spherical depth distribution
+  p_depth_hist <- spots %>%
+    ggplot(aes(x = SPHERICAL_DEPTH)) +
+    geom_histogram(bins = 60, fill = sp_col, alpha = 0.7) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey30") +
+    labs(title = "Spherical Depth Distribution",
+         subtitle = "0 = fitted surface, positive = inward",
+         x = "Spherical depth (um)", y = "Count") +
+    theme_pipe()
+
+  # Depth x Theta heatmap
+  p_depth_theta <- spots %>%
+    filter(!is.na(THETA_DEG)) %>%
+    ggplot(aes(x = THETA_DEG, y = SPHERICAL_DEPTH)) +
+    geom_bin2d(bins = c(50, 50)) +
+    scale_fill_viridis_c(option = "inferno", trans = "log10", labels = comma) +
+    labs(title = "Depth vs. Polar Angle",
+         x = "Theta (polar, deg)", y = "Spherical depth (um)", fill = "Count") +
+    theme_pipe()
+
+  # Depth over time heatmap
+  p_depth_time <- spots %>%
+    mutate(time_min = frame_to_min(FRAME)) %>%
+    ggplot(aes(x = time_min, y = SPHERICAL_DEPTH)) +
+    geom_bin2d(bins = c(80, 60)) +
+    scale_fill_viridis_c(option = "inferno", trans = "log10", labels = comma) +
+    labs(title = "Depth x Time Heatmap",
+         x = "Time (min)", y = "Spherical depth (um)", fill = "Count") +
+    theme_pipe()
+
+  # Track centroids colored by depth
+  p_centroids <- tracks %>%
+    ggplot(aes(x = mean_x, y = mean_y, color = mean_SPHERICAL_DEPTH)) +
+    geom_point(alpha = 0.15, size = 0.3) +
+    scale_color_viridis_c(option = "mako", direction = -1) +
+    labs(title = "Track Centroid Positions (XY)",
+         subtitle = "Coloured by mean spherical depth",
+         x = "Mean X (um)", y = "Mean Y (um)", color = "Depth (um)") +
+    theme_pipe()
+
+  p02 <- (p_angular | p_xy) / (p_depth_hist | p_depth_theta) / (p_depth_time | p_centroids) +
+    plot_annotation(
+      title = sprintf("%s -- 02 Spatial Distribution", sp$name),
+      theme = theme(plot.title = element_text(face = "bold", size = 14, hjust = 0.5)))
+
+  save_pdf(p02, sprintf("%s_02_spatial.pdf", prefix), width = 16, height = 16)
+
+
+  # =========================================================================
+  # S03: TRACK TOPOLOGY
+  # =========================================================================
+
+  cat(sprintf("\n=== %s S03: TRACK TOPOLOGY ===\n", sp$short))
+
+  # Track length distribution
+  p_tracklen <- tracks %>%
+    ggplot(aes(x = n_spots)) +
+    geom_histogram(bins = 80, fill = sp_col, alpha = 0.7) +
+    scale_x_log10(labels = comma) +
+    labs(title = "Track Length Distribution",
+         subtitle = sprintf("Median: %d spots", median(tracks$n_spots)),
+         x = "Track length (spots, log)", y = "Count") +
+    theme_pipe()
+
+  # Track temporal coverage
+  p_coverage <- tracks %>%
+    mutate(duration_min = frame_to_min(frame_end - frame_start),
+           coverage_pct = n_spots / (frame_end - frame_start + 1) * 100) %>%
+    ggplot(aes(x = duration_min, y = coverage_pct)) +
+    geom_point(alpha = 0.03, size = 0.3, color = sp_col) +
+    geom_density2d(linewidth = 0.4, color = "black") +
+    coord_cartesian(ylim = c(0, 105)) +
+    labs(title = "Duration vs. Temporal Coverage",
+         subtitle = "Coverage = spots / expected frames x 100%",
+         x = "Duration (min)", y = "Coverage (%)") +
+    theme_pipe()
+
+  # Birth/death timing
+  track_timing <- tracks %>%
+    select(frame_start, frame_end) %>%
+    pivot_longer(everything(), names_to = "event", values_to = "frame") %>%
+    mutate(event = ifelse(event == "frame_start", "Track starts", "Track ends"),
+           time_min = frame_to_min(frame))
+
+  p_timing <- track_timing %>%
+    ggplot(aes(x = time_min, fill = event)) +
+    geom_histogram(bins = 60, alpha = 0.7, position = "identity") +
+    scale_fill_manual(values = c("Track starts" = "#66C2A5", "Track ends" = "#FC8D62")) +
+    labs(title = "Track Birth / Death Over Time",
+         x = "Time (min)", y = "Count", fill = "") +
+    theme_pipe()
+
+  # Active tracks over time
+  frames_seq <- seq(min(tracks$frame_start), max(tracks$frame_end))
+  active_df <- tibble(
+    FRAME = frames_seq,
+    n_active = sapply(frames_seq, function(f) {
+      sum(tracks$frame_start <= f & tracks$frame_end >= f)
+    }),
+    time_min = frame_to_min(frames_seq)
+  )
+
+  p_active <- ggplot(active_df, aes(x = time_min, y = n_active)) +
+    geom_line(color = sp_col, linewidth = 0.6) +
+    labs(title = "Active Tracks Over Time",
+         x = "Time (min)", y = "Active tracks") +
+    theme_pipe()
+
+  p03 <- (p_tracklen | p_coverage) / (p_timing | p_active) +
+    plot_annotation(
+      title = sprintf("%s -- 03 Track Topology", sp$name),
+      theme = theme(plot.title = element_text(face = "bold", size = 14, hjust = 0.5)))
+
+  save_pdf(p03, sprintf("%s_03_track_topology.pdf", prefix), width = 14, height = 10)
+
+
+  # =========================================================================
+  # S04: NUCLEAR DENSITY
+  # =========================================================================
+
+  cat(sprintf("\n=== %s S04: NUCLEAR DENSITY ===\n", sp$short))
+
+  # 3D voxel density
+  dt <- as.data.table(spots)[, .(FRAME, POSITION_X, POSITION_Y, POSITION_Z, IN_ROI)]
+  dt[, `:=`(vx = floor(POSITION_X / VOXEL_SIZE_UM),
+            vy = floor(POSITION_Y / VOXEL_SIZE_UM),
+            vz = floor(POSITION_Z / VOXEL_SIZE_UM))]
+
+  voxel_counts <- dt[, .(count = .N), by = .(FRAME, vx, vy, vz)]
+
+  dens_stats <- voxel_counts[, .(
+    mean_density   = mean(count),
+    median_density = as.double(median(count)),
+    max_density    = max(count),
+    q25            = quantile(count, 0.25),
+    q75            = quantile(count, 0.75)
+  ), by = FRAME]
+  dens_stats[, time_min := frame_to_min(FRAME)]
+
+  p_dens_mean <- ggplot(as.data.frame(dens_stats), aes(x = time_min, y = mean_density)) +
+    geom_line(color = sp_col, linewidth = 0.6) +
+    labs(title = sprintf("Mean Nuclear Density per Voxel (%d um)", VOXEL_SIZE_UM),
+         x = "Time (min)", y = "Mean nuclei / voxel") +
+    theme_pipe()
+
+  p_dens_iqr <- ggplot(as.data.frame(dens_stats), aes(x = time_min)) +
+    geom_ribbon(aes(ymin = q25, ymax = q75), fill = sp_col, alpha = 0.3) +
+    geom_line(aes(y = median_density), color = sp_col, linewidth = 0.7) +
+    labs(title = "Voxel Density Over Time",
+         subtitle = "Median +/- IQR",
+         x = "Time (min)", y = "Nuclei per voxel") +
+    theme_pipe()
+
+  p_dens_max <- ggplot(as.data.frame(dens_stats), aes(x = time_min, y = max_density)) +
+    geom_line(color = sp_col, alpha = 0.5, linewidth = 0.5) +
+    geom_smooth(method = "loess", span = 0.3, se = FALSE,
+                color = sp_col, linewidth = 0.8) +
+    labs(title = "Max Voxel Density (Hotspot)",
+         x = "Time (min)", y = "Max nuclei in single voxel") +
+    theme_pipe()
+
+  # IN_ROI density over time
+  has_roi <- "IN_ROI" %in% names(spots) && any(spots$IN_ROI == TRUE, na.rm = TRUE)
+  if (has_roi) {
+    roi_density <- dt[, .(
+      n_in_roi     = sum(IN_ROI == TRUE, na.rm = TRUE),
+      n_outside    = sum(IN_ROI == FALSE | is.na(IN_ROI)),
+      total        = .N
+    ), by = FRAME]
+    roi_density[, `:=`(frac_roi = n_in_roi / total,
+                        time_min = frame_to_min(FRAME))]
+
+    p_roi_frac <- ggplot(as.data.frame(roi_density),
+                         aes(x = time_min, y = frac_roi)) +
+      geom_line(color = sp_col, linewidth = 0.6) +
+      scale_y_continuous(labels = percent) +
+      labs(title = "Fraction of Nuclei in ROI Over Time",
+           x = "Time (min)", y = "Fraction in ROI") +
+      theme_pipe()
+
+    p_roi_count <- ggplot(as.data.frame(roi_density), aes(x = time_min)) +
+      geom_line(aes(y = n_in_roi), color = sp_col, linewidth = 0.6) +
+      geom_line(aes(y = n_outside), color = "grey50", linewidth = 0.4,
+                linetype = "dashed") +
+      labs(title = "Nuclei Count: ROI vs. Outside",
+           subtitle = "Solid = in ROI, Dashed = outside",
+           x = "Time (min)", y = "Number of nuclei") +
+      theme_pipe()
+  } else {
+    p_roi_frac  <- plot_spacer()
+    p_roi_count <- plot_spacer()
+  }
+
+  p04 <- (p_dens_mean | p_dens_iqr) / (p_dens_max | p_roi_frac) / p_roi_count +
+    plot_annotation(
+      title = sprintf("%s -- 04 Nuclear Density", sp$name),
+      theme = theme(plot.title = element_text(face = "bold", size = 14, hjust = 0.5)))
+
+  save_pdf(p04, sprintf("%s_04_density.pdf", prefix), width = 14, height = 14)
+
+
+  # =========================================================================
+  # S05: VELOCITY ANALYSIS
+  # =========================================================================
+
+  cat(sprintf("\n=== %s S05: VELOCITY ANALYSIS ===\n", sp$short))
+
+  # Radial velocity distribution
+  p_vr_hist <- spots %>%
+    filter(!is.na(RADIAL_VELOCITY_SMOOTH)) %>%
+    ggplot(aes(x = RADIAL_VELOCITY_SMOOTH)) +
+    geom_histogram(bins = 100, fill = sp_col, alpha = 0.7) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey30") +
+    coord_cartesian(xlim = c(-5, 5)) +
+    labs(title = "Radial Velocity Distribution",
+         subtitle = "Negative = inward, Positive = outward",
+         x = "Smoothed radial velocity (um/frame)", y = "Count") +
+    theme_pipe()
+
+  # Instantaneous 3D speed distribution
+  p_speed_hist <- spots_v %>%
+    filter(!is.na(inst_speed_um_min), inst_speed_um_min < 20) %>%
+    ggplot(aes(x = inst_speed_um_min)) +
+    geom_histogram(bins = 100, fill = sp_col, alpha = 0.7) +
+    labs(title = "Instantaneous 3D Speed Distribution",
+         subtitle = "Step-to-step displacement / dt",
+         x = "Speed (um/min)", y = "Count") +
+    theme_pipe()
+
+  # Tangential vs radial speed scatter
+  p_vr_vt <- spots_v %>%
+    filter(!is.na(tangential_speed), !is.na(RADIAL_VELOCITY)) %>%
+    sample_n(min(100000, n())) %>%
+    ggplot(aes(x = abs(RADIAL_VELOCITY), y = tangential_speed)) +
+    geom_bin2d(bins = 80) +
+    scale_fill_viridis_c(option = "magma", trans = "log10") +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "white") +
+    coord_cartesian(xlim = c(0, 5), ylim = c(0, 5)) +
+    labs(title = "Tangential vs. |Radial| Speed",
+         subtitle = "Above diagonal = tangential-dominated movement",
+         x = "|Radial velocity| (um/frame)", y = "Tangential speed (um/frame)",
+         fill = "Count") +
+    theme_pipe()
+
+  # Radial velocity over time
+  vel_time <- spots %>%
+    filter(!is.na(RADIAL_VELOCITY_SMOOTH)) %>%
+    group_by(FRAME) %>%
+    summarise(
+      mean_vr   = mean(RADIAL_VELOCITY_SMOOTH),
+      median_vr = median(RADIAL_VELOCITY_SMOOTH),
+      q25_vr    = quantile(RADIAL_VELOCITY_SMOOTH, 0.25),
+      q75_vr    = quantile(RADIAL_VELOCITY_SMOOTH, 0.75),
+      .groups   = "drop"
+    ) %>%
+    mutate(time_min = frame_to_min(FRAME))
+
+  p_vr_time <- ggplot(vel_time, aes(x = time_min)) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+    geom_ribbon(aes(ymin = q25_vr, ymax = q75_vr), fill = sp_col, alpha = 0.2) +
+    geom_line(aes(y = median_vr), color = sp_col, linewidth = 0.7) +
+    labs(title = "Radial Velocity Over Time",
+         subtitle = "Median +/- IQR",
+         x = "Time (min)", y = "Radial velocity (um/frame)") +
+    theme_pipe()
+
+  # Instantaneous speed over time (binned)
+  speed_time <- spots_v %>%
+    filter(!is.na(inst_speed_um_min)) %>%
+    mutate(time_bin = floor(frame_to_min(FRAME) / 5) * 5) %>%
+    group_by(time_bin) %>%
+    summarise(mean_speed = mean(inst_speed_um_min),
+              median_speed = median(inst_speed_um_min),
+              .groups = "drop")
+
+  p_speed_time <- ggplot(speed_time, aes(x = time_bin, y = median_speed)) +
+    geom_line(color = sp_col, linewidth = 0.7) +
+    geom_point(color = sp_col, size = 1) +
+    labs(title = "Instantaneous Speed Over Time (5-min bins)",
+         x = "Time (min)", y = "Median speed (um/min)") +
+    theme_pipe()
+
+  # Velocity by depth layer
+  p_vr_depth <- add_depth_bin(spots) %>%
+    filter(!is.na(RADIAL_VELOCITY_SMOOTH)) %>%
+    ggplot(aes(x = depth_bin, y = RADIAL_VELOCITY_SMOOTH)) +
+    geom_boxplot(fill = sp_col, alpha = 0.5, outlier.alpha = 0) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey30") +
+    coord_cartesian(ylim = c(-3, 3)) +
+    labs(title = "Radial Velocity by Depth Layer",
+         x = "Depth layer", y = "Radial velocity (um/frame)") +
+    theme_pipe() +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+  # Per-track velocity distributions
+  p_track_vr <- tracks %>%
+    filter(!is.na(TRACK_MEDIAN_RADIAL_VEL)) %>%
+    ggplot(aes(x = TRACK_MEDIAN_RADIAL_VEL)) +
+    geom_histogram(bins = 80, fill = sp_col, alpha = 0.7) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey30") +
+    coord_cartesian(xlim = c(-3, 3)) +
+    labs(title = "Per-Track Median Radial Velocity",
+         x = "Median radial velocity (um/frame)", y = "Count") +
+    theme_pipe()
+
+  # Radial velocity x angle heatmap
+  p_vr_angle_heat <- spots %>%
+    filter(!is.na(RADIAL_VELOCITY_SMOOTH), !is.na(THETA_DEG)) %>%
+    ggplot(aes(x = THETA_DEG, y = RADIAL_VELOCITY_SMOOTH)) +
+    geom_bin2d(bins = c(50, 60)) +
+    scale_fill_viridis_c(option = "inferno", trans = "log10") +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "white") +
+    coord_cartesian(ylim = c(-4, 4)) +
+    labs(title = "Radial Velocity vs. Polar Angle",
+         x = "Theta (polar angle, deg)", y = "Radial velocity (um/frame)", fill = "Count") +
+    theme_pipe()
+
+  p05 <- (p_vr_hist | p_speed_hist | p_vr_vt) /
+         (p_vr_time | p_speed_time) /
+         (p_vr_depth | p_track_vr) /
+         p_vr_angle_heat +
+    plot_annotation(
+      title = sprintf("%s -- 05 Velocity Analysis", sp$name),
+      theme = theme(plot.title = element_text(face = "bold", size = 14, hjust = 0.5)))
+
+  save_pdf(p05, sprintf("%s_05_velocity.pdf", prefix), width = 18, height = 22)
+
+
+  # =========================================================================
+  # S06: FLOW FIELDS (VELOCITY VECTOR FIELDS)
+  # =========================================================================
+
+  cat(sprintf("\n=== %s S06: FLOW FIELDS ===\n", sp$short))
+
+  # --- Theta-Phi velocity field ---
+  flow_tp <- spots_v %>%
+    filter(!is.na(THETA_DEG), !is.na(PHI_DEG), !is.na(RADIAL_VELOCITY)) %>%
+    mutate(theta_bin = floor(THETA_DEG / FLOW_BIN_THETA) * FLOW_BIN_THETA + FLOW_BIN_THETA / 2,
+           phi_bin   = floor(PHI_DEG / FLOW_BIN_PHI) * FLOW_BIN_PHI + FLOW_BIN_PHI / 2) %>%
+    group_by(theta_bin, phi_bin) %>%
+    summarise(
+      mean_vr    = mean(RADIAL_VELOCITY_SMOOTH, na.rm = TRUE),
+      mean_vt    = mean(tangential_speed, na.rm = TRUE),
+      median_vr  = median(RADIAL_VELOCITY_SMOOTH, na.rm = TRUE),
+      mean_speed = mean(total_speed_frame, na.rm = TRUE),
+      inward_frac = mean(RADIAL_VELOCITY < 0, na.rm = TRUE),
+      n = n(),
+      .groups = "drop"
+    ) %>%
+    filter(n >= FLOW_MIN_N)
+
+  # Radial velocity heatmap on theta-phi grid
+  p_vr_tp_heat <- ggplot(flow_tp, aes(x = phi_bin, y = theta_bin, fill = mean_vr)) +
+    geom_tile() +
+    scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
+                         midpoint = 0, limits = c(-1.5, 1.5),
+                         oob = squish) +
+    labs(title = "Mean Radial Velocity on Theta-Phi Grid",
+         subtitle = "Blue = inward, Red = outward",
+         x = "Phi (azimuthal, deg)", y = "Theta (polar, deg)",
+         fill = "V_r (um/frame)") +
+    theme_pipe()
+
+  # Inward fraction heatmap
+  p_inward_tp <- ggplot(flow_tp, aes(x = phi_bin, y = theta_bin, fill = inward_frac)) +
+    geom_tile() +
+    scale_fill_viridis_c(option = "magma", limits = c(0.3, 0.7), oob = squish,
+                         labels = percent) +
+    labs(title = "Inward Fraction on Theta-Phi Grid",
+         subtitle = ">50% = predominantly inward flow",
+         x = "Phi (azimuthal, deg)", y = "Theta (polar, deg)",
+         fill = "Inward frac") +
+    theme_pipe()
+
+  # Speed magnitude on theta-phi grid
+  p_speed_tp <- ggplot(flow_tp, aes(x = phi_bin, y = theta_bin, fill = mean_speed)) +
+    geom_tile() +
+    scale_fill_viridis_c(option = "plasma") +
+    labs(title = "Mean Speed Magnitude on Theta-Phi Grid",
+         x = "Phi (azimuthal, deg)", y = "Theta (polar, deg)",
+         fill = "Speed (um/frame)") +
+    theme_pipe()
+
+  # --- XY velocity field (arrows) ---
+  flow_xy <- spots_v %>%
+    filter(!is.na(vx), !is.na(vy)) %>%
+    mutate(x_bin = floor(POSITION_X / FLOW_BIN_XY) * FLOW_BIN_XY + FLOW_BIN_XY / 2,
+           y_bin = floor(POSITION_Y / FLOW_BIN_XY) * FLOW_BIN_XY + FLOW_BIN_XY / 2) %>%
+    group_by(x_bin, y_bin) %>%
+    summarise(
+      mean_vx    = mean(vx, na.rm = TRUE),
+      mean_vy    = mean(vy, na.rm = TRUE),
+      mean_speed = mean(total_speed_frame, na.rm = TRUE),
+      n = n(),
+      .groups = "drop"
+    ) %>%
+    filter(n >= FLOW_MIN_N)
+
+  p_flow_xy <- ggplot(flow_xy) +
+    geom_segment(aes(x = x_bin, y = y_bin,
+                     xend = x_bin + mean_vx * 10,
+                     yend = y_bin + mean_vy * 10,
+                     color = mean_speed),
+                 arrow = arrow(length = unit(0.08, "cm")),
+                 linewidth = 0.4) +
+    scale_color_viridis_c(option = "plasma") +
+    labs(title = "XY Velocity Vector Field",
+         subtitle = "Arrows: mean displacement direction x 10",
+         x = "X (um)", y = "Y (um)", color = "Speed (um/frame)") +
+    theme_pipe()
+
+  # XY speed heatmap
+  p_speed_xy <- flow_xy %>%
+    ggplot(aes(x = x_bin, y = y_bin, fill = mean_speed)) +
+    geom_tile() +
+    scale_fill_viridis_c(option = "plasma") +
+    labs(title = "XY Speed Heatmap",
+         x = "X (um)", y = "Y (um)", fill = "Speed") +
+    theme_pipe()
+
+  # Temporal evolution of flow: radial velocity at time windows
+  time_range <- range(spots$FRAME)
+  n_windows <- 4
+  window_size <- ceiling(diff(time_range) / n_windows)
+  flow_windows <- spots_v %>%
+    filter(!is.na(THETA_DEG), !is.na(RADIAL_VELOCITY_SMOOTH)) %>%
+    mutate(
+      win_idx = pmin(floor((FRAME - time_range[1]) / window_size), n_windows - 1),
+      time_window = paste0(
+        sprintf("%.0f", frame_to_min(win_idx * window_size + time_range[1])),
+        "-",
+        sprintf("%.0f min", frame_to_min((win_idx + 1) * window_size + time_range[1]))
+      )
+    ) %>%
+    mutate(theta_bin = floor(THETA_DEG / FLOW_BIN_THETA) * FLOW_BIN_THETA + FLOW_BIN_THETA / 2,
+           phi_bin   = floor(PHI_DEG / FLOW_BIN_PHI) * FLOW_BIN_PHI + FLOW_BIN_PHI / 2) %>%
+    group_by(theta_bin, phi_bin, time_window) %>%
+    summarise(mean_vr = mean(RADIAL_VELOCITY_SMOOTH, na.rm = TRUE),
+              n = n(), .groups = "drop") %>%
+    filter(n >= 10)
+
+  p_flow_time <- ggplot(flow_windows, aes(x = phi_bin, y = theta_bin, fill = mean_vr)) +
+    geom_tile() +
+    scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
+                         midpoint = 0, limits = c(-1.5, 1.5), oob = squish) +
+    facet_wrap(~time_window, ncol = 2) +
+    labs(title = "Radial Velocity Field -- Temporal Evolution",
+         x = "Phi (deg)", y = "Theta (deg)", fill = "V_r") +
+    theme_pipe()
+
+  p06 <- (p_vr_tp_heat | p_inward_tp) / (p_speed_tp | p_flow_xy) / (p_speed_xy | plot_spacer()) / p_flow_time +
+    plot_annotation(
+      title = sprintf("%s -- 06 Flow Fields", sp$name),
+      theme = theme(plot.title = element_text(face = "bold", size = 14, hjust = 0.5)))
+
+  save_pdf(p06, sprintf("%s_06_flow_fields.pdf", prefix), width = 16, height = 24)
+
+
+  # =========================================================================
+  # S07: PHYSICAL PROPERTIES (MSD, CONFINEMENT, DISPLACEMENT)
+  # =========================================================================
+
+  cat(sprintf("\n=== %s S07: PHYSICAL PROPERTIES ===\n", sp$short))
+
+  # --- MSD analysis ---
+  cat("    Computing MSD ...\n")
+  msd_df <- compute_msd_ensemble(spots, max_lag = MSD_MAX_LAG, n_sample = MSD_N_TRACKS)
+
+  # Fit power law: MSD = D * t^alpha on log-log
+  msd_fit_data <- msd_df %>% filter(lag_min <= 10, mean_msd > 0)
+  if (nrow(msd_fit_data) >= 3) {
+    msd_fit <- lm(log(mean_msd) ~ log(lag_min), data = msd_fit_data)
+    alpha <- coef(msd_fit)[2]
+    D_apparent <- exp(coef(msd_fit)[1]) / 6  # 3D diffusion: MSD = 6D*t^alpha
+    alpha_label <- ifelse(alpha < 0.9, "Subdiffusive (confined)",
+                   ifelse(alpha < 1.1, "Normal diffusion",
+                          "Superdiffusive (directed)"))
+  } else {
+    alpha <- NA; D_apparent <- NA; alpha_label <- "N/A"
+  }
+  cat(sprintf("    MSD alpha = %.3f -> %s, D_app = %.3f um^2/min\n",
+              alpha, alpha_label, D_apparent))
+
+  p_msd <- ggplot(msd_df, aes(x = lag_min, y = mean_msd)) +
+    geom_point(color = sp_col, size = 1.5) +
+    geom_line(color = sp_col, linewidth = 0.5) +
+    { if (!is.na(alpha)) geom_smooth(method = "lm", formula = y ~ x,
+                                      se = FALSE, color = "black",
+                                      linetype = "dashed", linewidth = 0.6) } +
+    scale_x_log10() + scale_y_log10() +
+    labs(title = "Mean Squared Displacement (MSD)",
+         subtitle = sprintf("alpha = %.3f (%s), D_app = %.3f um^2/min",
+                            alpha, alpha_label, D_apparent),
+         x = "Lag time (min, log)", y = "MSD (um^2, log)") +
+    theme_pipe()
+
+  p_msd_linear <- ggplot(msd_df, aes(x = lag_min, y = mean_msd)) +
+    geom_point(color = sp_col, size = 1.5) +
+    geom_line(color = sp_col, linewidth = 0.5) +
+    labs(title = "MSD (Linear Scale)",
+         subtitle = "Curvature indicates anomalous diffusion",
+         x = "Lag time (min)", y = "MSD (um^2)") +
+    theme_pipe()
+
+  # --- Net radial displacement ---
+  p_netdisp <- tracks %>%
+    filter(!is.na(TRACK_NET_RADIAL_DISP)) %>%
+    ggplot(aes(x = TRACK_NET_RADIAL_DISP)) +
+    geom_histogram(bins = 80, fill = sp_col, alpha = 0.7) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey30") +
+    coord_cartesian(xlim = quantile(tracks$TRACK_NET_RADIAL_DISP,
+                                    c(0.01, 0.99), na.rm = TRUE)) +
+    labs(title = "Net Radial Displacement per Track",
+         subtitle = "Negative = net inward, Positive = net outward",
+         x = "Net radial displacement (um)", y = "Count") +
+    theme_pipe()
+
+  # --- Displacement vs track length colored by depth ---
+  p_disp_len <- tracks %>%
+    filter(!is.na(TRACK_NET_RADIAL_DISP)) %>%
+    ggplot(aes(x = n_spots, y = TRACK_NET_RADIAL_DISP, color = mean_SPHERICAL_DEPTH)) +
+    geom_point(alpha = 0.08, size = 0.3) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey30") +
+    scale_color_viridis_c(option = "mako", direction = -1) +
+    scale_x_log10() +
+    labs(title = "Net Displacement vs. Track Length",
+         subtitle = "Coloured by mean spherical depth",
+         x = "Track length (spots, log)", y = "Net radial displacement (um)",
+         color = "Depth") +
+    theme_pipe()
+
+  # --- Cumulative displacement distribution ---
+  cum_disp <- tracks %>%
+    filter(!is.na(TRACK_NET_RADIAL_DISP)) %>%
+    arrange(TRACK_NET_RADIAL_DISP) %>%
+    mutate(frac_below = row_number() / n())
+
+  p_cum_disp <- ggplot(cum_disp, aes(x = TRACK_NET_RADIAL_DISP, y = frac_below)) +
+    geom_line(color = sp_col, linewidth = 0.7) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey30") +
+    scale_y_continuous(labels = percent) +
+    labs(title = "Cumulative Distribution of Net Displacement",
+         subtitle = "Left half = net inward tracks",
+         x = "Net radial displacement (um)", y = "Cumulative fraction") +
+    theme_pipe()
+
+  # --- Instantaneous speed vs depth scatter ---
+  p_speed_depth <- spots_v %>%
+    filter(!is.na(inst_speed_um_min), !is.na(SPHERICAL_DEPTH),
+           inst_speed_um_min < 15) %>%
+    sample_n(min(100000, n())) %>%
+    ggplot(aes(x = SPHERICAL_DEPTH, y = inst_speed_um_min)) +
+    geom_bin2d(bins = c(50, 50)) +
+    scale_fill_viridis_c(option = "magma", trans = "log10") +
+    labs(title = "Speed vs. Depth",
+         x = "Spherical depth (um)", y = "Inst. speed (um/min)",
+         fill = "Count") +
+    theme_pipe()
+
+  p07 <- (p_msd | p_msd_linear) / (p_netdisp | p_cum_disp) / (p_disp_len | p_speed_depth) +
+    plot_annotation(
+      title = sprintf("%s -- 07 Physical Properties", sp$name),
+      theme = theme(plot.title = element_text(face = "bold", size = 14, hjust = 0.5)))
+
+  save_pdf(p07, sprintf("%s_07_physical_properties.pdf", prefix), width = 16, height = 16)
+
+
+  # =========================================================================
+  # S08: DIRECTIONALITY
+  # =========================================================================
+
+  cat(sprintf("\n=== %s S08: DIRECTIONALITY ===\n", sp$short))
+
+  # Inward fraction distribution per track
+  p_inward_dist <- tracks %>%
+    filter(!is.na(TRACK_INWARD_FRACTION)) %>%
+    ggplot(aes(x = TRACK_INWARD_FRACTION)) +
+    geom_histogram(bins = 50, fill = sp_col, alpha = 0.7) +
+    geom_vline(xintercept = 0.5, linetype = "dashed", color = "grey30") +
+    labs(title = "Inward Fraction per Track",
+         subtitle = ">0.5 = predominantly inward",
+         x = "Inward fraction", y = "Count") +
+    theme_pipe()
+
+  # Sustained inward movement
+  p_sustained <- tracks %>%
+    filter(!is.na(TRACK_SUSTAINED_INWARD), TRACK_SUSTAINED_INWARD > 0) %>%
+    ggplot(aes(x = TRACK_SUSTAINED_INWARD)) +
+    geom_histogram(bins = 50, fill = sp_col, alpha = 0.7) +
+    labs(title = "Max Consecutive Inward Frames",
+         x = "Consecutive inward frames", y = "Count") +
+    theme_pipe()
+
+  # Turning angle distribution
+  p_turning <- spots_v %>%
+    filter(!is.na(turning_angle)) %>%
+    ggplot(aes(x = turning_angle)) +
+    geom_histogram(bins = 60, fill = sp_col, alpha = 0.7) +
+    geom_vline(xintercept = 90, linetype = "dashed", color = "grey30") +
+    labs(title = "Turning Angle Distribution",
+         subtitle = "90 deg = random, <90 = persistent, >90 = reversing",
+         x = "Turning angle (deg)", y = "Count") +
+    theme_pipe()
+
+  # Turn angle vs speed
+  p_turn_speed <- spots_v %>%
+    filter(!is.na(turning_angle), !is.na(inst_speed_um_min),
+           inst_speed_um_min < 15) %>%
+    sample_n(min(100000, n())) %>%
+    ggplot(aes(x = turning_angle, y = inst_speed_um_min)) +
+    geom_bin2d(bins = c(60, 50)) +
+    scale_fill_viridis_c(option = "magma", trans = "log10") +
+    labs(title = "Turning Angle vs. Instantaneous Speed",
+         x = "Turning angle (deg)", y = "Speed (um/min)", fill = "Count") +
+    theme_pipe()
+
+  # Rose diagram of XY direction
+  p_rose <- spots_v %>%
+    filter(!is.na(direction_xy)) %>%
+    ggplot(aes(x = direction_xy)) +
+    geom_histogram(bins = 36, fill = sp_col, alpha = 0.7) +
+    coord_polar(start = 0) +
+    scale_x_continuous(breaks = seq(-180, 135, 45)) +
+    labs(title = "XY Direction Rose Diagram",
+         subtitle = "Uniform = isotropic, peaks = preferred axes",
+         x = "Direction (deg)", y = "Count") +
+    theme_pipe()
+
+  # Mean turning angle by depth
+  turn_depth <- spots_v %>%
+    filter(!is.na(turning_angle)) %>%
+    add_depth_bin() %>%
+    group_by(depth_bin) %>%
+    summarise(mean_angle = mean(turning_angle),
+              median_angle = median(turning_angle),
+              n = n(), .groups = "drop")
+
+  p_turn_depth <- ggplot(turn_depth, aes(x = depth_bin, y = median_angle)) +
+    geom_col(fill = sp_col, alpha = 0.7) +
+    geom_hline(yintercept = 90, linetype = "dashed", color = "grey30") +
+    labs(title = "Median Turning Angle by Depth",
+         x = "Depth layer", y = "Median angle (deg)") +
+    theme_pipe() +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+  p08 <- (p_inward_dist | p_sustained | p_turning) /
+         (p_turn_speed  | p_rose      | p_turn_depth) +
+    plot_annotation(
+      title = sprintf("%s -- 08 Directionality", sp$name),
+      theme = theme(plot.title = element_text(face = "bold", size = 14, hjust = 0.5)))
+
+  save_pdf(p08, sprintf("%s_08_directionality.pdf", prefix), width = 18, height = 12)
+
+
+  # =========================================================================
+  # S09: INTENSITY & SIGNAL QUALITY
+  # =========================================================================
+
+  cat(sprintf("\n=== %s S09: INTENSITY QC ===\n", sp$short))
+
+  # Intensity over time
+  int_time <- spots %>%
+    filter(!is.na(MEAN_INTENSITY_CH1)) %>%
+    group_by(FRAME) %>%
+    summarise(median_int = median(MEAN_INTENSITY_CH1),
+              mean_snr = mean(SNR_CH1, na.rm = TRUE),
+              .groups = "drop") %>%
+    mutate(time_min = frame_to_min(FRAME))
+
+  p_int <- ggplot(int_time, aes(x = time_min, y = median_int)) +
+    geom_line(color = sp_col, linewidth = 0.6) +
+    labs(title = "Median Spot Intensity Over Time",
+         x = "Time (min)", y = "Median intensity (CH1)") +
+    theme_pipe()
+
+  p_snr <- ggplot(int_time, aes(x = time_min, y = mean_snr)) +
+    geom_line(color = sp_col, linewidth = 0.6) +
+    labs(title = "Mean SNR Over Time",
+         x = "Time (min)", y = "Mean SNR (CH1)") +
+    theme_pipe()
+
+  # Intensity vs depth
+  p_int_depth <- spots %>%
+    filter(!is.na(MEAN_INTENSITY_CH1)) %>%
+    ggplot(aes(x = SPHERICAL_DEPTH, y = MEAN_INTENSITY_CH1)) +
+    geom_bin2d(bins = c(50, 50)) +
+    scale_fill_viridis_c(option = "magma", trans = "log10") +
+    labs(title = "Intensity vs. Depth",
+         subtitle = "Deeper nuclei likely have lower signal (scattering)",
+         x = "Spherical depth (um)", y = "Mean intensity (CH1)", fill = "Count") +
+    theme_pipe()
+
+  # Quality score
+  p_quality <- spots %>%
+    ggplot(aes(x = QUALITY)) +
+    geom_histogram(bins = 80, fill = sp_col, alpha = 0.7) +
+    scale_x_log10(labels = comma) +
+    labs(title = "Spot Quality Score Distribution",
+         x = "Quality (log)", y = "Count") +
+    theme_pipe()
+
+  p09 <- (p_int | p_snr) / (p_int_depth | p_quality) +
+    plot_annotation(
+      title = sprintf("%s -- 09 Intensity & Signal QC", sp$name),
+      theme = theme(plot.title = element_text(face = "bold", size = 14, hjust = 0.5)))
+
+  save_pdf(p09, sprintf("%s_09_intensity_qc.pdf", prefix), width = 14, height = 10)
+
+
+  # =========================================================================
+  # S10: COMPREHENSIVE INGRESSION ANALYSIS (validated species only)
+  # =========================================================================
+
+  if (sp$has_ingression) {
+
+    cat(sprintf("\n=== %s S10: INGRESSION ANALYSIS ===\n", sp$short))
+
+    ingr_tracks <- tracks %>% filter(INGRESSING == TRUE)
+    non_ingr_tracks <- tracks %>% filter(INGRESSING == FALSE | is.na(INGRESSING))
+    n_ingr <- nrow(ingr_tracks)
+    n_total <- nrow(tracks)
+
+    cat(sprintf("    Ingressing: %d / %d tracks (%.1f%%)\n",
+                n_ingr, n_total, 100 * n_ingr / n_total))
+
+    ingr_ids <- ingr_tracks$TRACK_ID
+    spots_ingr_flag <- spots %>%
+      mutate(is_ingressing = TRACK_ID %in% ingr_ids)
+
+    onset_frames <- ingr_tracks %>%
+      filter(!is.na(INGRESSION_ONSET_FRAME)) %>%
+      select(TRACK_ID, onset = INGRESSION_ONSET_FRAME)
+
+    # --- 10a: Onset timing ---
+    p_onset <- ingr_tracks %>%
+      filter(!is.na(INGRESSION_ONSET_FRAME)) %>%
+      mutate(onset_min = frame_to_min(INGRESSION_ONSET_FRAME)) %>%
+      ggplot(aes(x = onset_min)) +
+      geom_histogram(bins = 40, fill = "#E41A1C", alpha = 0.7) +
+      labs(title = "Ingression Onset Timing",
+           subtitle = sprintf("%d ingressing tracks, %d with known onset",
+                              n_ingr, nrow(onset_frames)),
+           x = "Onset time (min)", y = "Count") +
+      theme_pipe()
+
+    # --- 10b: Depth at onset ---
+    onset_spots <- spots_ingr_flag %>%
+      filter(is_ingressing, !is.na(INGRESSION_ONSET_FRAME)) %>%
+      group_by(TRACK_ID) %>%
+      arrange(FRAME) %>%
+      filter(FRAME == INGRESSION_ONSET_FRAME[1]) %>%
+      slice(1) %>%
+      ungroup()
+
+    p_onset_depth <- onset_spots %>%
+      ggplot(aes(x = SPHERICAL_DEPTH)) +
+      geom_histogram(bins = 30, fill = "#E41A1C", alpha = 0.7) +
+      labs(title = "Spherical Depth at Ingression Onset",
+           x = "Spherical depth (um)", y = "Count") +
+      theme_pipe()
+
+    # --- 10c: Angular position of ingression onset ---
+    p_onset_angular <- onset_spots %>%
+      filter(!is.na(THETA_DEG), !is.na(PHI_DEG)) %>%
+      ggplot(aes(x = PHI_DEG, y = THETA_DEG)) +
+      geom_bin2d(bins = c(30, 20)) +
+      scale_fill_viridis_c(option = "inferno") +
+      labs(title = "Angular Position at Ingression Onset",
+           subtitle = "Where on the embryo surface do cells ingress?",
+           x = "Phi (deg)", y = "Theta (deg)", fill = "Count") +
+      theme_pipe()
+
+    # --- 10d: Spatial distribution ingressing vs non-ingressing (theta-depth) ---
+    p_spatial_ingr <- spots_ingr_flag %>%
+      ggplot(aes(x = THETA_DEG, y = SPHERICAL_DEPTH, color = is_ingressing)) +
+      geom_point(data = . %>% filter(!is_ingressing),
+                 alpha = 0.003, size = 0.1, color = "grey70") +
+      geom_point(data = . %>% filter(is_ingressing),
+                 alpha = 0.02, size = 0.3, color = "#E41A1C") +
+      labs(title = "Ingressing (red) vs. Non-Ingressing (grey)",
+           subtitle = "Theta-depth projection",
+           x = "Theta (polar, deg)", y = "Spherical depth (um)") +
+      theme_pipe() + theme(legend.position = "none")
+
+    # --- 10e: Ingression score distribution ---
+    p_score <- tracks %>%
+      filter(!is.na(INGRESSION_SCORE)) %>%
+      mutate(label = ifelse(INGRESSING == TRUE, "Ingressing", "Non-ingressing")) %>%
+      ggplot(aes(x = INGRESSION_SCORE, fill = label)) +
+      geom_histogram(bins = 50, alpha = 0.7, position = "identity") +
+      scale_fill_manual(values = c("Ingressing" = "#E41A1C",
+                                   "Non-ingressing" = "grey60")) +
+      labs(title = "Ingression Score Distribution",
+           x = "Score (0 = none, 1 = strong)", y = "Count", fill = "") +
+      theme_pipe()
+
+    # --- 10f: Ingression rate over time (5-min bins) ---
+    ingr_rate <- ingr_tracks %>%
+      filter(!is.na(INGRESSION_ONSET_FRAME)) %>%
+      mutate(onset_min = frame_to_min(INGRESSION_ONSET_FRAME),
+             time_bin = floor(onset_min / 5) * 5) %>%
+      group_by(time_bin) %>%
+      summarise(n_new = n(), .groups = "drop")
+
+    p_rate_ingr <- ggplot(ingr_rate, aes(x = time_bin, y = n_new)) +
+      geom_col(fill = "#E41A1C", alpha = 0.7) +
+      labs(title = "Ingression Rate Over Time",
+           subtitle = "New onsets per 5-min window",
+           x = "Time (min)", y = "New ingressing tracks") +
+      theme_pipe()
+
+    # Cumulative ingression over time
+    ingr_cum <- ingr_tracks %>%
+      filter(!is.na(INGRESSION_ONSET_FRAME)) %>%
+      arrange(INGRESSION_ONSET_FRAME) %>%
+      mutate(cum_n = row_number(),
+             onset_min = frame_to_min(INGRESSION_ONSET_FRAME))
+
+    p_cum_ingr <- ggplot(ingr_cum, aes(x = onset_min, y = cum_n)) +
+      geom_line(color = "#E41A1C", linewidth = 0.8) +
+      labs(title = "Cumulative Ingression Onsets",
+           x = "Time (min)", y = "Cumulative ingressing tracks") +
+      theme_pipe()
+
+    # --- 10g: Velocity pseudo-trajectory aligned to onset ---
+    aligned_vel <- spots %>%
+      filter(TRACK_ID %in% onset_frames$TRACK_ID,
+             !is.na(RADIAL_VELOCITY_SMOOTH)) %>%
+      inner_join(onset_frames, by = "TRACK_ID") %>%
+      mutate(rel_frame = FRAME - onset)
+
+    vel_profile <- aligned_vel %>%
+      group_by(rel_frame) %>%
+      summarise(
+        mean_vr   = mean(RADIAL_VELOCITY_SMOOTH),
+        median_vr = median(RADIAL_VELOCITY_SMOOTH),
+        se_vr     = sd(RADIAL_VELOCITY_SMOOTH) / sqrt(n()),
+        q25_vr    = quantile(RADIAL_VELOCITY_SMOOTH, 0.25),
+        q75_vr    = quantile(RADIAL_VELOCITY_SMOOTH, 0.75),
+        n         = n(),
+        .groups   = "drop"
+      ) %>%
+      filter(n >= 5, abs(rel_frame) <= 30)
+
+    p_vel_pseudo <- ggplot(vel_profile,
+                           aes(x = rel_frame * FRAME_INTERVAL_MIN, y = mean_vr)) +
+      geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+      geom_vline(xintercept = 0, linetype = "dashed", color = "#E41A1C",
+                 linewidth = 0.8) +
+      geom_ribbon(aes(ymin = q25_vr, ymax = q75_vr),
+                  fill = "#E41A1C", alpha = 0.15) +
+      geom_ribbon(aes(ymin = mean_vr - se_vr, ymax = mean_vr + se_vr),
+                  fill = "#E41A1C", alpha = 0.3) +
+      geom_line(linewidth = 0.8, color = "#E41A1C") +
+      annotate("text", x = 0.3, y = max(vel_profile$mean_vr, na.rm = TRUE) * 0.8,
+               label = "Onset", color = "#E41A1C", hjust = 0, fontface = "italic") +
+      labs(title = "Radial Velocity -- Pseudo-Trajectory",
+           subtitle = "Aligned to ingression onset (mean +/- SE, ribbon = IQR)",
+           x = "Time relative to onset (min)", y = "Radial velocity (um/frame)") +
+      theme_pipe()
+
+    # --- 10h: Depth pseudo-trajectory aligned to onset ---
+    depth_traj <- spots %>%
+      filter(TRACK_ID %in% onset_frames$TRACK_ID) %>%
+      inner_join(onset_frames, by = "TRACK_ID") %>%
+      mutate(rel_frame = FRAME - onset)
+
+    depth_profile <- depth_traj %>%
+      group_by(rel_frame) %>%
+      summarise(
+        mean_depth   = mean(SPHERICAL_DEPTH, na.rm = TRUE),
+        median_depth = median(SPHERICAL_DEPTH, na.rm = TRUE),
+        q25_depth    = quantile(SPHERICAL_DEPTH, 0.25, na.rm = TRUE),
+        q75_depth    = quantile(SPHERICAL_DEPTH, 0.75, na.rm = TRUE),
+        n = n(), .groups = "drop"
+      ) %>%
+      filter(n >= 5, abs(rel_frame) <= 30)
+
+    p_depth_pseudo <- ggplot(depth_profile,
+                             aes(x = rel_frame * FRAME_INTERVAL_MIN)) +
+      geom_vline(xintercept = 0, linetype = "dashed", color = "#E41A1C",
+                 linewidth = 0.8) +
+      geom_ribbon(aes(ymin = q25_depth, ymax = q75_depth),
+                  fill = "#E41A1C", alpha = 0.15) +
+      geom_line(aes(y = median_depth), color = "#E41A1C", linewidth = 0.8) +
+      labs(title = "Depth -- Pseudo-Trajectory",
+           subtitle = "Median +/- IQR, aligned to onset",
+           x = "Time relative to onset (min)", y = "Spherical depth (um)") +
+      theme_pipe()
+
+    # --- 10i: Radial distance pseudo-trajectory ---
+    radial_profile <- depth_traj %>%
+      group_by(rel_frame) %>%
+      summarise(
+        mean_rdist   = mean(RADIAL_DIST_TO_CENTER, na.rm = TRUE),
+        median_rdist = median(RADIAL_DIST_TO_CENTER, na.rm = TRUE),
+        q25_rdist    = quantile(RADIAL_DIST_TO_CENTER, 0.25, na.rm = TRUE),
+        q75_rdist    = quantile(RADIAL_DIST_TO_CENTER, 0.75, na.rm = TRUE),
+        n = n(), .groups = "drop"
+      ) %>%
+      filter(n >= 5, abs(rel_frame) <= 30)
+
+    p_rdist_pseudo <- ggplot(radial_profile,
+                             aes(x = rel_frame * FRAME_INTERVAL_MIN)) +
+      geom_vline(xintercept = 0, linetype = "dashed", color = "#E41A1C",
+                 linewidth = 0.8) +
+      geom_ribbon(aes(ymin = q25_rdist, ymax = q75_rdist),
+                  fill = "#E41A1C", alpha = 0.15) +
+      geom_line(aes(y = median_rdist), color = "#E41A1C", linewidth = 0.8) +
+      geom_hline(yintercept = R_sphere, linetype = "dotted", color = "grey40") +
+      annotate("text", x = min(radial_profile$rel_frame) * FRAME_INTERVAL_MIN,
+               y = R_sphere * 1.01, label = "R_sphere", hjust = 0,
+               color = "grey40", size = 3, fontface = "italic") +
+      labs(title = "Radial Distance -- Pseudo-Trajectory",
+           subtitle = "Distance from sphere centre; dashed = sphere surface",
+           x = "Time relative to onset (min)",
+           y = "Radial distance to centre (um)") +
+      theme_pipe()
+
+    # --- 10j: Speed pseudo-trajectory (absolute inst. speed around onset) ---
+    aligned_speed <- d$spots_vel %>%
+      filter(TRACK_ID %in% onset_frames$TRACK_ID,
+             !is.na(inst_speed_um_min)) %>%
+      inner_join(onset_frames, by = "TRACK_ID") %>%
+      mutate(rel_frame = FRAME - onset)
+
+    speed_profile <- aligned_speed %>%
+      group_by(rel_frame) %>%
+      summarise(
+        mean_speed   = mean(inst_speed_um_min),
+        median_speed = median(inst_speed_um_min),
+        q25          = quantile(inst_speed_um_min, 0.25),
+        q75          = quantile(inst_speed_um_min, 0.75),
+        n = n(), .groups = "drop"
+      ) %>%
+      filter(n >= 5, abs(rel_frame) <= 30)
+
+    p_speed_pseudo <- ggplot(speed_profile,
+                             aes(x = rel_frame * FRAME_INTERVAL_MIN)) +
+      geom_vline(xintercept = 0, linetype = "dashed", color = "#E41A1C",
+                 linewidth = 0.8) +
+      geom_ribbon(aes(ymin = q25, ymax = q75), fill = "#E41A1C", alpha = 0.15) +
+      geom_line(aes(y = median_speed), color = "#E41A1C", linewidth = 0.8) +
+      labs(title = "3D Speed -- Pseudo-Trajectory",
+           subtitle = "Median +/- IQR, aligned to onset",
+           x = "Time relative to onset (min)", y = "Speed (um/min)") +
+      theme_pipe()
+
+    # --- 10k: Pre-ingression signatures ---
+    # Compare velocity 5 frames before onset to all non-ingressing at same time
+    pre_onset_window <- 5  # frames before onset
+    pre_ingr <- aligned_vel %>%
+      filter(rel_frame >= -pre_onset_window, rel_frame < 0) %>%
+      group_by(TRACK_ID) %>%
+      summarise(pre_mean_vr = mean(RADIAL_VELOCITY_SMOOTH),
+                .groups = "drop") %>%
+      mutate(group = "Pre-ingression")
+
+    # Non-ingressing tracks: average velocity
+    non_ingr_vel <- spots %>%
+      filter(!TRACK_ID %in% ingr_ids, !is.na(RADIAL_VELOCITY_SMOOTH)) %>%
+      group_by(TRACK_ID) %>%
+      summarise(pre_mean_vr = mean(RADIAL_VELOCITY_SMOOTH),
+                .groups = "drop") %>%
+      mutate(group = "Non-ingressing")
+
+    pre_comp <- bind_rows(pre_ingr, non_ingr_vel)
+
+    p_pre_sig <- ggplot(pre_comp, aes(x = pre_mean_vr, fill = group)) +
+      geom_density(alpha = 0.5) +
+      geom_vline(xintercept = 0, linetype = "dashed") +
+      scale_fill_manual(values = c("Pre-ingression" = "#E41A1C",
+                                   "Non-ingressing" = "grey60")) +
+      coord_cartesian(xlim = c(-3, 3)) +
+      labs(title = "Pre-Ingression Velocity Signature",
+           subtitle = sprintf("Mean V_r in %d frames before onset vs. all non-ingressing",
+                              pre_onset_window),
+           x = "Mean radial velocity (um/frame)", y = "Density", fill = "") +
+      theme_pipe()
+
+    # --- 10l: Comparison violin plots (ingr vs non-ingr) ---
+    comp_data <- tracks %>%
+      mutate(group = ifelse(INGRESSING == TRUE, "Ingressing", "Non-ingressing"))
+
+    p_comp_len <- comp_data %>%
+      ggplot(aes(x = group, y = n_spots, fill = group)) +
+      geom_violin(alpha = 0.7, draw_quantiles = c(0.25, 0.5, 0.75)) +
+      scale_fill_manual(values = c("Ingressing" = "#E41A1C",
+                                   "Non-ingressing" = "grey60")) +
+      labs(title = "Track Length", y = "Spots", x = "") +
+      theme_pipe() + theme(legend.position = "none")
+
+    p_comp_depth <- comp_data %>%
+      ggplot(aes(x = group, y = mean_SPHERICAL_DEPTH, fill = group)) +
+      geom_violin(alpha = 0.7, draw_quantiles = c(0.25, 0.5, 0.75)) +
+      scale_fill_manual(values = c("Ingressing" = "#E41A1C",
+                                   "Non-ingressing" = "grey60")) +
+      labs(title = "Mean Depth", y = "Depth (um)", x = "") +
+      theme_pipe() + theme(legend.position = "none")
+
+    p_comp_vel <- comp_data %>%
+      filter(!is.na(TRACK_MEDIAN_RADIAL_VEL)) %>%
+      ggplot(aes(x = group, y = TRACK_MEDIAN_RADIAL_VEL, fill = group)) +
+      geom_violin(alpha = 0.7, draw_quantiles = c(0.25, 0.5, 0.75)) +
+      scale_fill_manual(values = c("Ingressing" = "#E41A1C",
+                                   "Non-ingressing" = "grey60")) +
+      coord_cartesian(ylim = c(-3, 3)) +
+      labs(title = "Median V_r", y = "um/frame", x = "") +
+      theme_pipe() + theme(legend.position = "none")
+
+    p_comp_inward <- comp_data %>%
+      filter(!is.na(TRACK_INWARD_FRACTION)) %>%
+      ggplot(aes(x = group, y = TRACK_INWARD_FRACTION, fill = group)) +
+      geom_violin(alpha = 0.7, draw_quantiles = c(0.25, 0.5, 0.75)) +
+      scale_fill_manual(values = c("Ingressing" = "#E41A1C",
+                                   "Non-ingressing" = "grey60")) +
+      labs(title = "Inward Fraction", y = "Fraction", x = "") +
+      theme_pipe() + theme(legend.position = "none")
+
+    p_comp_theta <- comp_data %>%
+      filter(!is.na(mean_THETA_DEG)) %>%
+      ggplot(aes(x = group, y = mean_THETA_DEG, fill = group)) +
+      geom_violin(alpha = 0.7, draw_quantiles = c(0.25, 0.5, 0.75)) +
+      scale_fill_manual(values = c("Ingressing" = "#E41A1C",
+                                   "Non-ingressing" = "grey60")) +
+      labs(title = "Mean Theta (Polar)", y = "Theta (deg)", x = "") +
+      theme_pipe() + theme(legend.position = "none")
+
+    p_comp_score <- comp_data %>%
+      filter(!is.na(INGRESSION_SCORE)) %>%
+      ggplot(aes(x = group, y = INGRESSION_SCORE, fill = group)) +
+      geom_violin(alpha = 0.7, draw_quantiles = c(0.25, 0.5, 0.75)) +
+      scale_fill_manual(values = c("Ingressing" = "#E41A1C",
+                                   "Non-ingressing" = "grey60")) +
+      labs(title = "Ingression Score", y = "Score", x = "") +
+      theme_pipe() + theme(legend.position = "none")
+
+    # --- Assemble Section 10 ---
+    p10_row1 <- (p_onset | p_onset_depth | p_onset_angular)
+    p10_row2 <- (p_spatial_ingr | p_score | p_rate_ingr)
+    p10_row3 <- (p_cum_ingr | p_pre_sig)
+    p10_row4 <- (p_vel_pseudo | p_depth_pseudo | p_rdist_pseudo)
+    p10_row5 <- p_speed_pseudo
+    p10_row6 <- (p_comp_len | p_comp_depth | p_comp_vel)
+    p10_row7 <- (p_comp_inward | p_comp_theta | p_comp_score)
+
+    p10 <- p10_row1 / p10_row2 / p10_row3 / p10_row4 / p10_row5 / p10_row6 / p10_row7 +
+      plot_annotation(
+        title = sprintf("%s -- 10 Ingression Analysis", sp$name),
+        subtitle = sprintf("%d ingressing / %s total (%.1f%%)",
+                           n_ingr, format(n_total, big.mark = ","),
+                           100 * n_ingr / n_total),
+        theme = theme(plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+                      plot.subtitle = element_text(hjust = 0.5, color = "grey50")))
+
+    save_pdf(p10, sprintf("%s_10_ingression.pdf", prefix), width = 18, height = 36)
+
+
+    # =====================================================================
+    # S11: MARGIN / ROI DENSITY ANALYSIS (ingression zone)
+    # =====================================================================
+
+    cat(sprintf("\n=== %s S11: MARGIN DENSITY ===\n", sp$short))
+
+    # Density of nuclei in ROI over time
+    margin_density <- spots %>%
+      mutate(in_roi = as.logical(IN_ROI),
+             time_min = frame_to_min(FRAME)) %>%
+      group_by(FRAME, time_min, in_roi) %>%
+      summarise(n = n(), .groups = "drop") %>%
+      pivot_wider(names_from = in_roi, values_from = n,
+                  names_prefix = "roi_", values_fill = 0)
+
+    # Handle possible missing columns
+    if (!"roi_TRUE" %in% names(margin_density)) margin_density$roi_TRUE <- 0
+    if (!"roi_FALSE" %in% names(margin_density)) margin_density$roi_FALSE <- 0
+
+    margin_density <- margin_density %>%
+      mutate(total = roi_TRUE + roi_FALSE,
+             frac_roi = roi_TRUE / total)
+
+    p_margin_count <- ggplot(margin_density, aes(x = time_min)) +
+      geom_line(aes(y = roi_TRUE), color = "#E41A1C", linewidth = 0.7) +
+      geom_line(aes(y = roi_FALSE), color = "grey50", linewidth = 0.4,
+                linetype = "dashed") +
+      labs(title = "Nuclei Count: In ROI (red) vs. Outside (grey)",
+           x = "Time (min)", y = "Number of nuclei") +
+      theme_pipe()
+
+    p_margin_frac <- ggplot(margin_density, aes(x = time_min, y = frac_roi)) +
+      geom_line(color = "#E41A1C", linewidth = 0.7) +
+      scale_y_continuous(labels = percent) +
+      labs(title = "Fraction of Nuclei in ROI Over Time",
+           x = "Time (min)", y = "Fraction in ROI") +
+      theme_pipe()
+
+    # Density of ingressing cells in ROI specifically
+    ingr_in_roi <- spots_ingr_flag %>%
+      mutate(in_roi = as.logical(IN_ROI),
+             time_min = frame_to_min(FRAME)) %>%
+      filter(in_roi) %>%
+      group_by(FRAME, time_min) %>%
+      summarise(n_total_roi = n(),
+                n_ingr_roi  = sum(is_ingressing),
+                .groups = "drop") %>%
+      mutate(frac_ingr = n_ingr_roi / n_total_roi)
+
+    p_ingr_roi_frac <- ggplot(ingr_in_roi, aes(x = time_min, y = frac_ingr)) +
+      geom_line(color = "#E41A1C", linewidth = 0.5, alpha = 0.5) +
+      geom_smooth(method = "loess", span = 0.3, se = TRUE,
+                  color = "#E41A1C", fill = "#E41A1C", alpha = 0.2) +
+      scale_y_continuous(labels = percent) +
+      labs(title = "Fraction of ROI Nuclei That Are Ingressing",
+           subtitle = "In the margin zone over time",
+           x = "Time (min)", y = "Ingressing / total in ROI") +
+      theme_pipe()
+
+    # Depth distribution within ROI: ingressing vs non-ingressing
+    p_roi_depth_comp <- spots_ingr_flag %>%
+      filter(as.logical(IN_ROI)) %>%
+      mutate(label = ifelse(is_ingressing, "Ingressing", "Non-ingressing")) %>%
+      ggplot(aes(x = SPHERICAL_DEPTH, fill = label)) +
+      geom_density(alpha = 0.5) +
+      scale_fill_manual(values = c("Ingressing" = "#E41A1C",
+                                   "Non-ingressing" = "grey60")) +
+      labs(title = "Depth Distribution Within ROI",
+           subtitle = "Ingressing vs. Non-ingressing nuclei in the margin",
+           x = "Spherical depth (um)", y = "Density", fill = "") +
+      theme_pipe()
+
+    # Theta distribution of all ROI nuclei vs ingressing
+    p_roi_theta <- spots_ingr_flag %>%
+      filter(as.logical(IN_ROI)) %>%
+      mutate(label = ifelse(is_ingressing, "Ingressing", "Non-ingressing")) %>%
+      ggplot(aes(x = THETA_DEG, fill = label)) +
+      geom_histogram(bins = 40, alpha = 0.6, position = "identity") +
+      scale_fill_manual(values = c("Ingressing" = "#E41A1C",
+                                   "Non-ingressing" = "grey60")) +
+      labs(title = "Theta Distribution Within ROI",
+           x = "Theta (polar, deg)", y = "Count", fill = "") +
+      theme_pipe()
+
+    # Radial velocity in ROI vs outside
+    roi_vel_comp <- spots %>%
+      filter(!is.na(RADIAL_VELOCITY_SMOOTH)) %>%
+      mutate(location = ifelse(as.logical(IN_ROI), "In ROI", "Outside ROI"))
+
+    p_roi_vel <- ggplot(roi_vel_comp,
+                        aes(x = RADIAL_VELOCITY_SMOOTH, fill = location)) +
+      geom_density(alpha = 0.5) +
+      geom_vline(xintercept = 0, linetype = "dashed") +
+      scale_fill_manual(values = c("In ROI" = "#E41A1C", "Outside ROI" = "grey60")) +
+      coord_cartesian(xlim = c(-4, 4)) +
+      labs(title = "Radial Velocity: In ROI vs. Outside",
+           x = "Radial velocity (um/frame)", y = "Density", fill = "") +
+      theme_pipe()
+
+    # Density heatmap on theta-phi: ingressing cell locations
+    p_ingr_heat <- spots_ingr_flag %>%
+      filter(is_ingressing, !is.na(THETA_DEG), !is.na(PHI_DEG)) %>%
+      ggplot(aes(x = PHI_DEG, y = THETA_DEG)) +
+      geom_bin2d(bins = c(40, 30)) +
+      scale_fill_viridis_c(option = "inferno") +
+      labs(title = "Ingressing Cell Density on Theta-Phi Grid",
+           x = "Phi (deg)", y = "Theta (deg)", fill = "Count") +
+      theme_pipe()
+
+    # Ingressing cell depth over absolute time (not aligned)
+    ingr_depth_time <- spots_ingr_flag %>%
+      filter(is_ingressing) %>%
+      mutate(time_min = frame_to_min(FRAME)) %>%
+      group_by(FRAME, time_min) %>%
+      summarise(mean_depth = mean(SPHERICAL_DEPTH, na.rm = TRUE),
+                median_depth = median(SPHERICAL_DEPTH, na.rm = TRUE),
+                q25 = quantile(SPHERICAL_DEPTH, 0.25, na.rm = TRUE),
+                q75 = quantile(SPHERICAL_DEPTH, 0.75, na.rm = TRUE),
+                .groups = "drop")
+
+    p_ingr_depth_time <- ggplot(ingr_depth_time, aes(x = time_min)) +
+      geom_ribbon(aes(ymin = q25, ymax = q75), fill = "#E41A1C", alpha = 0.15) +
+      geom_line(aes(y = median_depth), color = "#E41A1C", linewidth = 0.7) +
+      labs(title = "Ingressing Cell Depth Over Time",
+           subtitle = "Median +/- IQR (absolute time)",
+           x = "Time (min)", y = "Spherical depth (um)") +
+      theme_pipe()
+
+    p11 <- (p_margin_count | p_margin_frac) /
+           (p_ingr_roi_frac | p_roi_vel) /
+           (p_roi_depth_comp | p_roi_theta) /
+           (p_ingr_heat | p_ingr_depth_time) +
+      plot_annotation(
+        title = sprintf("%s -- 11 Margin & ROI Density Analysis", sp$name),
+        subtitle = "Cell density and behaviour in the ingression zone",
+        theme = theme(plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+                      plot.subtitle = element_text(hjust = 0.5, color = "grey50")))
+
+    save_pdf(p11, sprintf("%s_11_margin_density.pdf", prefix), width = 16, height = 20)
+
+  }  # end ingression-specific sections
+
+  cat(sprintf("  %s per-species analysis complete.\n", sp$name))
+
+}  # end per-species loop
+
+
+# #############################################################################
+#
+#         CROSS-SPECIES COMPARISON DASHBOARD
+#
+# #############################################################################
+
+cat("\n=== SECTION 12: CROSS-SPECIES COMPARISON ===\n")
+
+if (length(DATA) >= 2) {
+
+  all_tracks <- bind_rows(lapply(DATA, function(d) d$tracks))
+
+  # --- 12a: Normalised nuclei count ---
+  norm_counts <- bind_rows(lapply(DATA, function(d) {
+    d$spots %>%
+      group_by(FRAME) %>%
+      summarise(n = n(), .groups = "drop") %>%
+      mutate(species  = d$config$name,
+             time_min = frame_to_min(FRAME))
+  })) %>%
+    group_by(species) %>%
+    mutate(norm_n    = n / max(n),
+           norm_time = (time_min - min(time_min)) / (max(time_min) - min(time_min))) %>%
+    ungroup()
+
+  p12a <- ggplot(norm_counts, aes(x = norm_time, y = norm_n, color = species)) +
+    geom_line(linewidth = 0.7) +
+    scale_color_manual(values = species_colors) +
+    labs(title = "Normalised Nuclei Count",
+         subtitle = "Both axes [0, 1]",
+         x = "Normalised time", y = "Normalised count", color = "Species") +
+    theme_pipe()
+
+  # --- 12b: Normalised depth (depth / R) ---
+  p12b <- bind_rows(lapply(DATA, function(d) {
+    d$spots %>%
+      mutate(depth_norm = SPHERICAL_DEPTH / as.numeric(d$sphere["radius"])) %>%
+      select(depth_norm, species)
+  })) %>%
+    ggplot(aes(x = depth_norm, fill = species, color = species)) +
+    geom_density(alpha = 0.3, linewidth = 0.6) +
+    scale_fill_manual(values = species_colors) +
+    scale_color_manual(values = species_colors) +
+    labs(title = "Normalised Depth (depth / R)",
+         x = "Depth / Radius", y = "Density") +
+    theme_pipe()
+
+  # --- 12c: Normalised radial velocity ---
+  p12c <- bind_rows(lapply(DATA, function(d) {
+    d$spots %>%
+      filter(!is.na(RADIAL_VELOCITY_SMOOTH)) %>%
+      mutate(vel_norm = RADIAL_VELOCITY_SMOOTH / as.numeric(d$sphere["radius"]) * 1000) %>%
+      select(vel_norm, species)
+  })) %>%
+    ggplot(aes(x = vel_norm, fill = species, color = species)) +
+    geom_density(alpha = 0.3, linewidth = 0.6) +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    scale_fill_manual(values = species_colors) +
+    scale_color_manual(values = species_colors) +
+    coord_cartesian(xlim = c(-10, 10)) +
+    labs(title = "Normalised Radial Velocity",
+         subtitle = "V_r / R x 1000",
+         x = "Normalised velocity (x10^-3 R/frame)", y = "Density") +
+    theme_pipe()
+
+  # --- 12d: Instantaneous speed comparison ---
+  p12d <- bind_rows(lapply(DATA, function(d) {
+    d$spots_vel %>%
+      filter(!is.na(inst_speed_um_min), inst_speed_um_min < 20) %>%
+      select(inst_speed_um_min, species)
+  })) %>%
+    ggplot(aes(x = inst_speed_um_min, fill = species, color = species)) +
+    geom_density(alpha = 0.3, linewidth = 0.6) +
+    scale_fill_manual(values = species_colors) +
+    scale_color_manual(values = species_colors) +
+    labs(title = "Instantaneous 3D Speed Comparison",
+         x = "Speed (um/min)", y = "Density") +
+    theme_pipe()
+
+  # --- 12e: Track length comparison ---
+  max_frames <- sapply(DATA, function(d) max(d$tracks$frame_end))
+  p12e <- all_tracks %>%
+    mutate(norm_len = n_spots / max_frames[ifelse(species == "Zebrafish",
+                                                   "zebrafish", "medaka")]) %>%
+    ggplot(aes(x = norm_len, fill = species, color = species)) +
+    geom_density(alpha = 0.3, linewidth = 0.6) +
+    scale_fill_manual(values = species_colors) +
+    scale_color_manual(values = species_colors) +
+    scale_x_log10() +
+    labs(title = "Normalised Track Length",
+         x = "Track length / total frames (log)", y = "Density") +
+    theme_pipe()
+
+  # --- 12f: Depth-stratified velocity comparison ---
+  depth_vel_comp <- bind_rows(lapply(DATA, function(d) {
+    add_depth_bin(d$spots) %>%
+      filter(!is.na(RADIAL_VELOCITY_SMOOTH)) %>%
+      group_by(depth_bin) %>%
+      summarise(median_vr = median(RADIAL_VELOCITY_SMOOTH),
+                n = n(), .groups = "drop") %>%
+      mutate(species = d$config$name)
+  }))
+
+  p12f <- depth_vel_comp %>%
+    ggplot(aes(x = depth_bin, y = median_vr, fill = species)) +
+    geom_col(position = "dodge", alpha = 0.7) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey30") +
+    scale_fill_manual(values = species_colors) +
+    labs(title = "Median Radial Velocity by Depth",
+         x = "Depth layer", y = "Median V_r (um/frame)", fill = "Species") +
+    theme_pipe() +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+  # --- 12g: Inward fraction by depth ---
+  inward_depth <- bind_rows(lapply(DATA, function(d) {
+    add_depth_bin(d$spots) %>%
+      filter(!is.na(RADIAL_VELOCITY_SMOOTH)) %>%
+      group_by(depth_bin) %>%
+      summarise(inward_frac = mean(RADIAL_VELOCITY_SMOOTH < 0),
+                n = n(), .groups = "drop") %>%
+      mutate(species = d$config$name)
+  }))
+
+  p12g <- inward_depth %>%
+    ggplot(aes(x = depth_bin, y = inward_frac, fill = species)) +
+    geom_col(position = "dodge", alpha = 0.7) +
+    geom_hline(yintercept = 0.5, linetype = "dashed", color = "grey30") +
+    scale_fill_manual(values = species_colors) +
+    scale_y_continuous(labels = percent, limits = c(0, 1)) +
+    labs(title = "Inward Fraction by Depth",
+         x = "Depth layer", y = "Fraction inward", fill = "Species") +
+    theme_pipe() +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+  # --- 12h: Turning angle comparison ---
+  p12h <- bind_rows(lapply(DATA, function(d) {
+    d$spots_vel %>%
+      filter(!is.na(turning_angle)) %>%
+      select(turning_angle, species)
+  })) %>%
+    ggplot(aes(x = turning_angle, fill = species, color = species)) +
+    geom_density(alpha = 0.3, linewidth = 0.6) +
+    geom_vline(xintercept = 90, linetype = "dashed", color = "grey30") +
+    scale_fill_manual(values = species_colors) +
+    scale_color_manual(values = species_colors) +
+    labs(title = "Turning Angle Comparison",
+         subtitle = "90 deg = random",
+         x = "Turning angle (deg)", y = "Density") +
+    theme_pipe()
+
+  p12 <- (p12a | p12b) / (p12c | p12d) / (p12e | p12f) / (p12g | p12h) +
+    plot_annotation(
+      title = "12 -- Cross-Species Comparison Dashboard",
+      subtitle = "Normalised metrics for scale-independent comparison",
+      theme = theme(plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+                    plot.subtitle = element_text(hjust = 0.5, color = "grey50")))
+
+  save_pdf(p12, "12_cross_species.pdf", width = 16, height = 20)
+
+} else {
+  cat("  Only one species loaded -- skipping cross-species dashboard\n")
+}
+
+
+# #############################################################################
+# DONE
+# #############################################################################
+
+cat("\n")
+cat(strrep("=", 70), "\n")
+cat("  ANALYSIS COMPLETE\n")
+cat(strrep("=", 70), "\n")
+cat(sprintf("  Output directory: %s/\n", OUTPUT_DIR))
+cat("  Files generated:\n")
+for (f in sort(list.files(OUTPUT_DIR, pattern = "\\.pdf$|\\.csv$"))) {
+  cat(sprintf("    %s\n", f))
+}
+cat("\n")

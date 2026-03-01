@@ -63,9 +63,34 @@ MANUAL_DIR <- "high_res_mannualtracking"
 IMARIS_DIR <- "all_tracks"
 OUTPUT_DIR <- "analysis_output"
 
-# Input files: use oriented CSVs if available, otherwise raw TrackMate
-SPOTS_FILE  <- if (file.exists("oriented_spots.csv")) "oriented_spots.csv" else "4D_spots.csv"
-TRACKS_FILE <- if (file.exists("oriented_tracks.csv")) "oriented_tracks.csv" else "4D_tracks.csv"
+# Input files: search for medaka data in priority order
+#  1. Oriented CSVs from napari viewer (analysis_output_medaka/)
+#  2. Oriented CSVs in root (from orientation_interactive.R)
+#  3. Species-specific raw TrackMate exports
+#  4. Generic 4D files (fallback — WARNING: may be wrong species!)
+find_input <- function(candidates) {
+  for (f in candidates) if (file.exists(f)) return(f)
+  stop(sprintf("No input file found. Searched:\n  %s", paste(candidates, collapse = "\n  ")))
+}
+
+SPOTS_FILE <- find_input(c(
+  "analysis_output_medaka/oriented_spots.csv",
+  "oriented_spots.csv",
+  "medaka_25082025_combined_spots.csv",
+  "medaka_spots.csv",
+  "4D_spots.csv"
+))
+
+# Track file: use oriented if available, otherwise raw TrackMate tracks
+# NOTE: oriented_tracks.csv from napari = per-spot data (same as spots),
+#       so for track-level stats we need the raw TrackMate tracks export.
+TRACKS_FILE <- find_input(c(
+  "medaka_25082025_combined_tracks.csv",
+  "medaka_tracks.csv",
+  "oriented_tracks.csv",
+  "analysis_output_medaka/oriented_tracks.csv",
+  "4D_tracks.csv"
+))
 
 # --- Selection method ---
 #   "pareto" = balanced trade-off (Pareto knee)
@@ -118,28 +143,32 @@ cat(sprintf("  Frame interval: %d sec | Speed conversion: ×%.0f\n",
 
 cat("\n=== STEP 1: LOADING TRACKMATE DATA ===\n")
 
-# Detect if files are oriented (have extra columns or standard TM format)
-is_oriented <- grepl("oriented", SPOTS_FILE)
-
-if (is_oriented) {
-  # Oriented CSVs don't have the 3 metadata rows
-  tm_spots <- read_csv(SPOTS_FILE, show_col_types = FALSE) %>%
-    mutate(across(c(ID, TRACK_ID, POSITION_X, POSITION_Y, POSITION_Z, FRAME),
-                  ~as.numeric(.))) %>%
-    filter(!is.na(TRACK_ID))
-
-  tm_tracks <- read_csv(TRACKS_FILE, show_col_types = FALSE) %>%
-    mutate(across(-LABEL, ~suppressWarnings(as.numeric(.))))
-} else {
-  # Raw TrackMate CSVs: skip 3 metadata rows
-  tm_spots <- read_csv(SPOTS_FILE, show_col_types = FALSE)[-c(1:3), ] %>%
-    mutate(across(c(ID, TRACK_ID, POSITION_X, POSITION_Y, POSITION_Z, FRAME),
-                  ~as.numeric(.))) %>%
-    filter(!is.na(TRACK_ID))
-
-  tm_tracks <- read_csv(TRACKS_FILE, show_col_types = FALSE)[-c(1:3), ] %>%
-    mutate(across(-LABEL, ~suppressWarnings(as.numeric(.))))
+# Detect file format by checking if the file has TrackMate's 3 metadata rows
+# (row 2 starts with "Label," for metadata rows; oriented CSVs don't have this)
+has_tm_metadata <- function(filepath) {
+  lines <- readLines(filepath, n = 3)
+  length(lines) >= 2 && grepl("^Label,", lines[2], ignore.case = TRUE)
 }
+
+read_tm_csv <- function(filepath, type = "spots") {
+  has_meta <- has_tm_metadata(filepath)
+  cat(sprintf("    %s: %s [%s format]\n", type, filepath,
+              if (has_meta) "raw TrackMate" else "oriented/clean"))
+  if (has_meta) {
+    df <- read_csv(filepath, show_col_types = FALSE)[-c(1:3), ]
+  } else {
+    df <- read_csv(filepath, show_col_types = FALSE)
+  }
+  df
+}
+
+tm_spots <- read_tm_csv(SPOTS_FILE, "spots") %>%
+  mutate(across(c(ID, TRACK_ID, POSITION_X, POSITION_Y, POSITION_Z, FRAME),
+                ~as.numeric(.))) %>%
+  filter(!is.na(TRACK_ID))
+
+tm_tracks <- read_tm_csv(TRACKS_FILE, "tracks") %>%
+  mutate(across(-LABEL, ~suppressWarnings(as.numeric(.))))
 
 # Convert units
 tm_tracks <- tm_tracks %>%
@@ -177,6 +206,16 @@ cat(sprintf("  Unfiltered inst. speed median: %.3f µm/min\n",
 
 cat("\n=== STEP 2: MANUAL GROUND TRUTH (YSL DRIFT CORRECTION) ===\n")
 
+if (!dir.exists(MANUAL_DIR)) {
+  stop(sprintf(paste0(
+    "Manual tracking directory '%s' not found.\n",
+    "  This script requires manually tracked ground truth data (medaka only).\n",
+    "  Expected: %s/ with sub-folders Spots_cell_* and Spots_nuclei_ysl_*\n",
+    "  If you don't have manual GT data, skip this script and go straight to\n",
+    "  trackmate_analysis.R (Step 3)."),
+    MANUAL_DIR, MANUAL_DIR))
+}
+
 # Helper: read one Imaris Position CSV
 read_manual_position <- function(folder_name) {
   prefix <- sub("_Statistics$", "", folder_name)
@@ -199,6 +238,13 @@ ysl_folders  <- grep("^Spots_nuclei_ysl_", all_folders, value = TRUE)
 
 cell_data <- map_dfr(cell_folders, read_manual_position) %>% mutate(cell_type = "cell")
 ysl_data  <- map_dfr(ysl_folders, read_manual_position)  %>% mutate(cell_type = "ysl")
+
+if (nrow(cell_data) == 0 || !("cell_name" %in% names(cell_data))) {
+  stop(sprintf("No cell tracking data found in '%s/Spots_cell_*' folders.", MANUAL_DIR))
+}
+if (nrow(ysl_data) == 0 || !("cell_name" %in% names(ysl_data))) {
+  stop(sprintf("No YSL tracking data found in '%s/Spots_nuclei_ysl_*' folders.\n  YSL tracks are required for drift correction.", MANUAL_DIR))
+}
 
 cat(sprintf("  Loaded %d cells, %d YSL tracks\n",
             n_distinct(cell_data$cell_name), n_distinct(ysl_data$cell_name)))
@@ -334,7 +380,7 @@ p_gt_drift <- (p_raw_xy + p_drift_path) / (p_drift_axes + p_speed_corr) +
   plot_annotation(title = "Ground Truth: YSL Drift Correction",
                   theme = theme(plot.title = element_text(size = 15, face = "bold", hjust = 0.5)))
 
-ggsave(file.path(OUTPUT_DIR, "00_ground_truth_drift.pdf"), p_gt_drift, width = 14, height = 10)
+ggsave(file.path(OUTPUT_DIR, "00_ground_truth_drift.pdf"), p_gt_drift, width = 14, height = 10, create.dir = TRUE)
 cat("  Saved: 00_ground_truth_drift.pdf\n")
 
 # Per-cell summary plot
@@ -355,7 +401,7 @@ p_gt_summary <- (p_cell_speeds + p_confine) +
   plot_annotation(title = "Ground Truth: Per-Cell Summary",
                   theme = theme(plot.title = element_text(size = 15, face = "bold", hjust = 0.5)))
 
-ggsave(file.path(OUTPUT_DIR, "00_ground_truth_summary.pdf"), p_gt_summary, width = 14, height = 6)
+ggsave(file.path(OUTPUT_DIR, "00_ground_truth_summary.pdf"), p_gt_summary, width = 14, height = 6, create.dir = TRUE)
 cat("  Saved: 00_ground_truth_summary.pdf\n")
 
 # #############################################################################
@@ -688,7 +734,7 @@ p1 <- p1_speed / p1_score / p1_n +
                   plot.subtitle = element_text(size = 10, hjust = 0.5, color = "grey50"))
   )
 
-ggsave(file.path(OUTPUT_DIR, "01_filter_impact.pdf"), p1, width = 16, height = 10)
+ggsave(file.path(OUTPUT_DIR, "01_filter_impact.pdf"), p1, width = 16, height = 10, create.dir = TRUE)
 cat("  Saved: 01_filter_impact.pdf\n")
 
 # ─── PLOT 2: 2D Heatmaps (separate color scales) ─────────────────────────────
@@ -728,7 +774,7 @@ p2 <- p2a + p2b + p2c +
                   theme = theme(plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
                                 plot.subtitle = element_text(size = 10, hjust = 0.5, color = "grey50")))
 
-ggsave(file.path(OUTPUT_DIR, "02_parameter_heatmaps.pdf"), p2, width = 18, height = 6)
+ggsave(file.path(OUTPUT_DIR, "02_parameter_heatmaps.pdf"), p2, width = 18, height = 6, create.dir = TRUE)
 cat("  Saved: 02_parameter_heatmaps.pdf\n")
 
 # ─── PLOT 3: Pareto front ────────────────────────────────────────────────────
@@ -757,7 +803,7 @@ p3 <- ggplot(sweep_scored, aes(x = n_tracks, y = score)) +
        x = "Tracks retained (log)", y = "Score (lower = closer to GT)") +
   theme_pipe()
 
-ggsave(file.path(OUTPUT_DIR, "03_pareto_front.pdf"), p3, width = 10, height = 7)
+ggsave(file.path(OUTPUT_DIR, "03_pareto_front.pdf"), p3, width = 10, height = 7, create.dir = TRUE)
 cat("  Saved: 03_pareto_front.pdf\n")
 
 # ─── PLOT 4: Speed comparison (faceted + overlay + box) ───────────────────────
@@ -822,7 +868,7 @@ p4 <- p4a / (p4b + p4c) +
   plot_annotation(title = "Speed Comparison Across Pipelines",
                   theme = theme(plot.title = element_text(size = 14, face = "bold", hjust = 0.5)))
 
-ggsave(file.path(OUTPUT_DIR, "04_speed_comparison.pdf"), p4, width = 16, height = 10)
+ggsave(file.path(OUTPUT_DIR, "04_speed_comparison.pdf"), p4, width = 16, height = 10, create.dir = TRUE)
 cat("  Saved: 04_speed_comparison.pdf\n")
 
 # ─── PLOT 5: Filtering effect (duration + spots before/after) ────────────────
@@ -860,7 +906,7 @@ p5 <- p5a / p5b +
   plot_annotation(title = "What the Filters Remove",
                   theme = theme(plot.title = element_text(size = 14, face = "bold", hjust = 0.5)))
 
-ggsave(file.path(OUTPUT_DIR, "05_filtering_effect.pdf"), p5, width = 16, height = 8)
+ggsave(file.path(OUTPUT_DIR, "05_filtering_effect.pdf"), p5, width = 16, height = 8, create.dir = TRUE)
 cat("  Saved: 05_filtering_effect.pdf\n")
 
 # #############################################################################
@@ -901,19 +947,24 @@ tracks_out <- tm_filtered %>%
 
 write_csv(tracks_out, file.path(OUTPUT_DIR, "filtered_tracks.csv"))
 
-# Filtered spots — preserve spherical coords & margin flags from orientation step
-spots_out <- tm_filtered_spots %>%
-  select(any_of(c("ID", "LABEL", "TRACK_ID", "QUALITY",
-                   "POSITION_X", "POSITION_Y", "POSITION_Z",
-                   "FRAME", "RADIUS", "VISIBILITY",
-                   "MEAN_INTENSITY_CH1", "MEDIAN_INTENSITY_CH1",
-                   "MIN_INTENSITY_CH1", "MAX_INTENSITY_CH1",
-                   "TOTAL_INTENSITY_CH1", "STD_INTENSITY_CH1",
-                   "CONTRAST_CH1", "SNR_CH1",
-                   "RADIAL_DIST", "SPHERICAL_DEPTH", "SPHERICAL_DEPTH_NORM",
-                   "THETA_DEG", "PHI_DEG", "IN_MARGIN")))
+# Filtered spots — preserve ALL enriched columns from napari viewer
+spots_out <- tm_filtered_spots
 
 write_csv(spots_out, file.path(OUTPUT_DIR, "filtered_spots.csv"))
+
+# Filtered track summary — subset napari track_summary.csv to surviving tracks
+spots_dir <- dirname(SPOTS_FILE)
+ts_path   <- file.path(spots_dir, "track_summary.csv")
+if (file.exists(ts_path)) {
+  ts_all <- read_csv(ts_path, show_col_types = FALSE)
+  ts_filtered <- ts_all %>% filter(TRACK_ID %in% tm_filtered$TRACK_ID)
+  write_csv(ts_filtered, file.path(OUTPUT_DIR, "filtered_track_summary.csv"))
+  cat(sprintf("    filtered_track_summary.csv      — %s / %s tracks\n",
+              format(nrow(ts_filtered), big.mark = ","),
+              format(nrow(ts_all), big.mark = ",")))
+} else {
+  cat(sprintf("    (track_summary.csv not found in %s — skipped)\n", spots_dir))
+}
 
 # Sweep results + params
 write_csv(sweep_scored, file.path(OUTPUT_DIR, "sweep_results.csv"))
@@ -941,8 +992,9 @@ write_csv(
 cat(sprintf("  Exported to %s/:\n", OUTPUT_DIR))
 cat(sprintf("    filtered_tracks.csv            — %s tracks\n",
             format(nrow(tracks_out), big.mark = ",")))
-cat(sprintf("    filtered_spots.csv             — %s spots\n",
-            format(nrow(spots_out), big.mark = ",")))
+cat(sprintf("    filtered_spots.csv             — %s spots (%d columns)\n",
+            format(nrow(spots_out), big.mark = ","), ncol(spots_out)))
+cat("    filtered_track_summary.csv     — napari track summary (filtered)\n")
 cat("    sweep_results.csv              — all scored parameter combos\n")
 cat("    recommended_params.csv         — chosen filter parameters\n")
 cat("    ground_truth_cells_corrected.csv\n")

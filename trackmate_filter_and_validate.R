@@ -901,7 +901,7 @@ tracks_out <- tm_filtered %>%
 
 write_csv(tracks_out, file.path(OUTPUT_DIR, "filtered_tracks.csv"))
 
-# Filtered spots
+# Filtered spots — preserve spherical coords & margin flags from orientation step
 spots_out <- tm_filtered_spots %>%
   select(any_of(c("ID", "LABEL", "TRACK_ID", "QUALITY",
                    "POSITION_X", "POSITION_Y", "POSITION_Z",
@@ -909,7 +909,9 @@ spots_out <- tm_filtered_spots %>%
                    "MEAN_INTENSITY_CH1", "MEDIAN_INTENSITY_CH1",
                    "MIN_INTENSITY_CH1", "MAX_INTENSITY_CH1",
                    "TOTAL_INTENSITY_CH1", "STD_INTENSITY_CH1",
-                   "CONTRAST_CH1", "SNR_CH1")))
+                   "CONTRAST_CH1", "SNR_CH1",
+                   "RADIAL_DIST", "SPHERICAL_DEPTH", "SPHERICAL_DEPTH_NORM",
+                   "THETA_DEG", "PHI_DEG", "IN_MARGIN")))
 
 write_csv(spots_out, file.path(OUTPUT_DIR, "filtered_spots.csv"))
 

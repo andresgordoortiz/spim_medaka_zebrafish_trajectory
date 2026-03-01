@@ -1,12 +1,25 @@
+# ── R ──
 .Rproj.user
 .Rhistory
 .Rprofile
 .RData*
-rsconnect
-*data*
-*tracking
 .Ruserdata
-analysis_output
-renv*
 rsconnect
+renv/library/
+renv/staging/
+renv/local/
+
+# ── Python ──
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.python-version
+
+# ── Data (too large for git) ──
+*.csv
+analysis_output/
+
+# ── OS ──
 .DS_Store
+Thumbs.db

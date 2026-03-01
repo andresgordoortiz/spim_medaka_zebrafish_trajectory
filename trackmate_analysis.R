@@ -856,6 +856,152 @@ ggsave("analysis_output/08_z_depth_basic.pdf", p17, width = 8, height = 5)
 cat("  Saved: 08_z_depth_basic.pdf\n")
 
 # =============================================================================
+# PART 9B: SPHERICAL DEPTH ANALYSIS (from orientation step sphere fit)
+# =============================================================================
+#
+# BIOLOGICAL INTERPRETATION:
+#   Cartesian Z is a poor proxy for embryo depth because the embryo is curved.
+#   If orientation_interactive.R fitted a sphere and exported SPHERICAL_DEPTH,
+#   we use that instead:
+#     SPHERICAL_DEPTH = R_sphere − radial_distance  (0 at surface, + inward)
+#     THETA_DEG       = latitude from animal pole   (0° AP, 90° equator, 180° VP)
+#     IN_MARGIN       = flag for cells in the ingression margin band
+#
+#   This section is skipped if the enriched columns are absent.
+#
+
+HAS_SPHERICAL <- all(c("SPHERICAL_DEPTH", "THETA_DEG") %in% names(spots_clean))
+
+if (HAS_SPHERICAL) {
+  cat("\n=== PART 9B: SPHERICAL DEPTH ANALYSIS ===\n")
+
+  # Propagate spherical columns into velocity data
+  if (!"SPHERICAL_DEPTH" %in% names(spots_velocity)) {
+    spots_velocity <- spots_velocity %>%
+      left_join(spots_clean %>% select(ID, SPHERICAL_DEPTH, SPHERICAL_DEPTH_NORM,
+                                        THETA_DEG, PHI_DEG,
+                                        any_of("IN_MARGIN"), RADIAL_DIST),
+                by = "ID")
+  }
+
+  # Spherical depth layers (5 equal-width bands from surface to deep)
+  sd_range <- range(spots_velocity$SPHERICAL_DEPTH, na.rm = TRUE)
+  sd_breaks <- seq(sd_range[1], sd_range[2], length.out = 6)
+  sd_labels <- sprintf("%.0f–%.0f µm", sd_breaks[1:5], sd_breaks[2:6])
+  sd_labels[1] <- paste0("Surface (", sd_labels[1], ")")
+  sd_labels[5] <- paste0("Deep (", sd_labels[5], ")")
+
+  spots_velocity <- spots_velocity %>%
+    mutate(sph_layer = cut(SPHERICAL_DEPTH, breaks = sd_breaks, labels = sd_labels,
+                           include.lowest = TRUE))
+
+  # Latitude bands (animal pole zones)
+  spots_velocity <- spots_velocity %>%
+    mutate(lat_band = cut(THETA_DEG, breaks = c(0, 30, 60, 90, 120, 150, 180),
+                          labels = c("AP (0–30°)", "Sub-AP (30–60°)",
+                                     "Equatorial (60–90°)", "Sub-VP (90–120°)",
+                                     "VP zone (120–150°)", "VP (150–180°)"),
+                          include.lowest = TRUE))
+
+  # --- Plot: Speed by spherical depth layer ---
+  p_sph_speed <- ggplot(spots_velocity %>% filter(!is.na(sph_layer) & !is.na(inst_speed_um_min)),
+                        aes(x = sph_layer, y = inst_speed_um_min, fill = sph_layer)) +
+    geom_boxplot(alpha = 0.7, outlier.alpha = 0.1, outlier.size = 0.3) +
+    scale_fill_viridis_d(guide = "none") +
+    coord_cartesian(ylim = c(0, 10)) +
+    labs(title = "Speed by Spherical Depth (distance from embryo surface)",
+         subtitle = "Depth measured from fitted sphere — not Cartesian Z",
+         x = "Spherical depth layer", y = "Instantaneous speed (µm/min)") +
+    theme_track() + theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+  # --- Plot: Speed by latitude from AP ---
+  p_lat_speed <- ggplot(spots_velocity %>% filter(!is.na(lat_band) & !is.na(inst_speed_um_min)),
+                        aes(x = lat_band, y = inst_speed_um_min, fill = lat_band)) +
+    geom_boxplot(alpha = 0.7, outlier.alpha = 0.1, outlier.size = 0.3) +
+    scale_fill_viridis_d(option = "C", guide = "none") +
+    coord_cartesian(ylim = c(0, 10)) +
+    labs(title = "Speed by Latitude from Animal Pole",
+         subtitle = "0° = animal pole; 90° = equator; 180° = vegetal pole",
+         x = "Latitude band", y = "Instantaneous speed (µm/min)") +
+    theme_track() + theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+  # --- Plot: Spherical depth vs Cartesian Z comparison ---
+  depth_compare_sample <- spots_velocity %>%
+    filter(!is.na(SPHERICAL_DEPTH) & !is.na(POSITION_Z)) %>%
+    sample_n(min(20000, n()))
+
+  p_depth_compare <- ggplot(depth_compare_sample,
+                            aes(x = POSITION_Z, y = SPHERICAL_DEPTH, color = THETA_DEG)) +
+    geom_point(alpha = 0.15, size = 0.3) +
+    scale_color_viridis_c(name = "Latitude (°)", option = "C") +
+    geom_abline(slope = -1, intercept = 0, linetype = "dashed", color = "red", alpha = 0.5) +
+    labs(title = "Spherical Depth vs Cartesian Z",
+         subtitle = "Curvature correction — diagonal = perfect flat approximation",
+         x = "Cartesian Z (µm)", y = "Spherical depth (µm)") +
+    theme_track()
+
+  sph_combined <- (p_sph_speed + p_lat_speed) / p_depth_compare +
+    plot_annotation(title = "Spherical Coordinate Depth Analysis",
+                    theme = theme(plot.title = element_text(size = 14, face = "bold", hjust = 0.5)))
+
+  ggsave("analysis_output/08b_spherical_depth.pdf", sph_combined, width = 16, height = 12)
+  cat("  Saved: 08b_spherical_depth.pdf\n")
+
+  # --- Margin-specific analysis ---
+  HAS_MARGIN <- "IN_MARGIN" %in% names(spots_velocity)
+  if (HAS_MARGIN && any(spots_velocity$IN_MARGIN, na.rm = TRUE)) {
+    n_margin <- sum(spots_velocity$IN_MARGIN, na.rm = TRUE)
+    n_total  <- nrow(spots_velocity)
+    cat(sprintf("  Margin cells: %s / %s (%.1f%%)\n",
+                format(n_margin, big.mark = ","), format(n_total, big.mark = ","),
+                n_margin / n_total * 100))
+
+    margin_speed <- spots_velocity %>%
+      filter(!is.na(inst_speed_um_min)) %>%
+      mutate(region = ifelse(IN_MARGIN, "Margin", "Non-margin"))
+
+    p_margin_speed <- ggplot(margin_speed, aes(x = inst_speed_um_min, fill = region)) +
+      geom_density(alpha = 0.5) +
+      scale_fill_manual(values = c("Margin" = "#E41A1C", "Non-margin" = "#2166AC")) +
+      labs(title = "Instantaneous speed: Margin vs Non-margin cells",
+           subtitle = "Margin cells selected by latitude band in orientation step",
+           x = "Speed (µm/min)", y = "Density", fill = NULL) +
+      theme_track()
+
+    p_margin_vz <- ggplot(margin_speed %>% filter(!is.na(vz) & abs(vz) < 10),
+                          aes(x = vz, fill = region)) +
+      geom_density(alpha = 0.5) +
+      geom_vline(xintercept = 0, linetype = "dashed") +
+      scale_fill_manual(values = c("Margin" = "#E41A1C", "Non-margin" = "#2166AC")) +
+      labs(title = "Vertical (Z) velocity: Margin vs Non-margin",
+           subtitle = "Positive = outward from embryo centre; Negative = inward (ingression)",
+           x = "Z-velocity (µm/min)", y = "Density", fill = NULL) +
+      theme_track()
+
+    margin_combined <- p_margin_speed + p_margin_vz +
+      plot_annotation(title = "Margin Cell Analysis",
+                      theme = theme(plot.title = element_text(size = 14, face = "bold", hjust = 0.5)))
+    ggsave("analysis_output/08c_margin_analysis.pdf", margin_combined, width = 14, height = 6)
+    cat("  Saved: 08c_margin_analysis.pdf\n")
+  }
+
+  # Summary stats
+  sph_summary <- spots_velocity %>%
+    filter(!is.na(sph_layer) & !is.na(inst_speed_um_min)) %>%
+    group_by(sph_layer) %>%
+    summarise(median_speed = median(inst_speed_um_min), n = n(), .groups = "drop")
+  cat("  Speed by spherical depth:\n")
+  for (i in seq_len(nrow(sph_summary))) {
+    cat(sprintf("    %s: %.2f µm/min (n=%s)\n",
+                sph_summary$sph_layer[i], sph_summary$median_speed[i],
+                format(sph_summary$n[i], big.mark = ",")))
+  }
+} else {
+  cat("\n  [Spherical coordinates not found — skipping Part 9B]\n")
+  cat("  (Run orientation_interactive.R with sphere fit to enable this analysis)\n")
+}
+
+# =============================================================================
 # PART 10: COMPREHENSIVE 4D SPATIAL-TEMPORAL ANALYSIS
 # =============================================================================
 #
@@ -912,6 +1058,23 @@ spots_4d <- spots_velocity %>%
                             "Surface (75-100%)"),
                   include.lowest = TRUE)
   )
+
+# Add spherical depth layers if available (from orientation step sphere fit)
+if (HAS_SPHERICAL && "SPHERICAL_DEPTH" %in% names(spots_4d)) {
+  sd_range_4d <- range(spots_4d$SPHERICAL_DEPTH, na.rm = TRUE)
+  sd_breaks_4d <- seq(sd_range_4d[1], sd_range_4d[2], length.out = 5)
+  spots_4d <- spots_4d %>%
+    mutate(
+      sph_layer = cut(SPHERICAL_DEPTH, breaks = sd_breaks_4d,
+                      labels = c("Surface", "Sub-surface", "Mid-deep", "Deep"),
+                      include.lowest = TRUE),
+      lat_band = cut(THETA_DEG, breaks = c(0, 45, 90, 135, 180),
+                     labels = c("AP (0-45°)", "Sub-AP (45-90°)",
+                                "Sub-VP (90-135°)", "VP (135-180°)"),
+                     include.lowest = TRUE)
+    )
+  cat("  Added spherical depth layers and latitude bands to 4D data\n")
+}
 
 # -----------------------------------------------------------------------------
 # 12B.2: Z-layer specific XY velocity patterns
@@ -2081,11 +2244,14 @@ for (i in 1:nrow(movetype_z_summary)) {
 #     3. Flagging ingression when residual vy > 0 (upward deviation from flow)
 #        A positive residual vx (toward dorsal/interior) adds confidence.
 #
-#   This captures cells whose movement diverges from what their neighbors do,
-#   rather than using absolute direction (which may just reflect bulk flow).
+#   If spherical coordinates are available (from orientation step), we also
+#   detect ingression as INWARD RADIAL MOVEMENT (decreasing radial distance
+#   from sphere centre, i.e. moving deeper into the embryo) specifically
+#   in the margin latitude band. This is the most biologically accurate
+#   definition of ingression during gastrulation.
 #
 #   Ingression is expected after a configurable onset time (default: 100 min).
-#   Z-layer breakdown reveals depth-dependent ingression patterns.
+#   Spherical-depth-layer breakdown reveals depth-dependent ingression patterns.
 #
 
 cat("\n=== PART 13: CELL INGRESSION ANALYSIS ===\n")
@@ -2167,7 +2333,46 @@ steps <- steps %>%
                        include.lowest = TRUE)) %>%
   filter(!is.na(z_layer))
 
-# Overall ingression summary
+# --- Spherical ingression detection (if sphere-fit data available) ---
+# Ingression in spherical coordinates = inward radial movement (decreasing radius)
+# This is more biologically accurate than Cartesian residual methods on a curved embryo
+if (HAS_SPHERICAL && "SPHERICAL_DEPTH" %in% names(steps)) {
+  cat("  Using spherical coordinates for enhanced ingression detection...\n")
+
+  # Compute radial velocity (dr/dt): positive = moving outward, negative = moving inward
+  steps <- steps %>%
+    arrange(TRACK_ID, FRAME) %>%
+    group_by(TRACK_ID) %>%
+    mutate(
+      d_radial = RADIAL_DIST - lag(RADIAL_DIST),
+      radial_velocity = d_radial / dt_min  # µm/min; negative = inward = ingression
+    ) %>%
+    ungroup()
+
+  # Spherical ingression: inward radial movement (negative radial velocity)
+  steps <- steps %>%
+    mutate(
+      is_ingressing_sph = !is.na(radial_velocity) & radial_velocity < 0,
+      # Enhanced: ingressing AND in the margin latitude band
+      is_ingressing_margin = is_ingressing_sph &
+        !is.na(IN_MARGIN) & IN_MARGIN
+    )
+
+  # Use spherical depth layers instead of Cartesian Z
+  steps <- steps %>%
+    mutate(sph_depth_layer = cut(SPHERICAL_DEPTH,
+                                  breaks = quantile(SPHERICAL_DEPTH, probs = seq(0, 1, length.out = 6), na.rm = TRUE),
+                                  labels = paste0("SD", 1:5),
+                                  include.lowest = TRUE))
+
+  sph_pct <- mean(steps$is_ingressing_sph, na.rm = TRUE) * 100
+  margin_pct <- if (any(steps$IN_MARGIN, na.rm = TRUE))
+    mean(steps$is_ingressing_sph[steps$IN_MARGIN], na.rm = TRUE) * 100 else NA
+  cat(sprintf("  Spherical ingression: %.1f%% all steps | %.1f%% in margin band\n",
+              sph_pct, if (is.na(margin_pct)) 0 else margin_pct))
+}
+
+# Overall ingression summary (flow-residual method)
 overall_pct <- mean(steps$is_ingressing) * 100
 high_conf_pct <- mean(steps$ingression_confidence == "High (+Y, +X)") * 100
 cat(sprintf("  Overall: %.1f%% steps ingressing (%.1f%% high confidence)\n",

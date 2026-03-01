@@ -2117,9 +2117,7 @@ class EmbryoViewer:
                     & (result["POSITION_Y"] >= b["y_min"])
                     & (result["POSITION_Y"] <= b["y_max"])
                 )
-                track_ever_in_box = in_box.groupby(result["TRACK_ID"]).transform(
-                    "any"
-                )
+                track_ever_in_box = in_box.groupby(result["TRACK_ID"]).transform("any")
                 result.loc[~track_ever_in_box, "INGRESSING"] = False
                 vegetal_breach = (
                     result.groupby("TRACK_ID")["POSITION_Y"].transform("max")

@@ -49,8 +49,11 @@ from pathlib import Path
 # ── Wayland / DPI fixes for Fedora GNOME ──────────────────────────────────
 # Must be set before any Qt import
 if os.environ.get("XDG_SESSION_TYPE") == "wayland":
-    os.environ.setdefault("QT_QPA_PLATFORM", "wayland")
+    os.environ["QT_QPA_PLATFORM"] = "wayland"
 os.environ.setdefault("QT_AUTO_SCREEN_SCALE_FACTOR", "1")
+os.environ.setdefault("QT_FONT_DPI", "96")
+# Suppress harmless Qt C++ warnings (QSocketNotifier, DPI messages)
+os.environ.setdefault("QT_LOGGING_RULES", "*.warning=false")
 
 import numpy as np
 import pandas as pd
@@ -519,7 +522,10 @@ def compute_radial_velocity(
     dr = np.diff(r, prepend=np.nan)
     dt = np.diff(f, prepend=-9999)
     same_track = np.diff(tid.astype(float), prepend=-9999) == 0
-    vel = np.where(same_track & (dt > 0), dr / dt, np.nan)
+    # Use np.maximum to avoid divide-by-zero; results where dt<=0 are
+    # masked to NaN by the np.where condition anyway.
+    dt_safe = np.maximum(dt, 1e-12)
+    vel = np.where(same_track & (dt > 0), dr / dt_safe, np.nan)
 
     rv = np.full(len(df), np.nan)
     rv[sorted_idx] = vel
@@ -575,12 +581,27 @@ def flag_ingressing(
     min_track_frames: int = 5,
     min_inward_fraction: float = 0.5,
 ) -> pd.DataFrame:
-    """Flag tracks as ingressing using robust multi-criteria detection.
+    """Flag tracks as ingressing using embryology-informed multi-criteria detection.
 
-    A track is flagged as INGRESSING if ALL of:
-      1. Track has ≥ *min_track_frames* points
+    During gastrulation in medaka/zebrafish, ingressing cells move
+    radially inward through the blastoderm, transitioning from the
+    epiblast to the hypoblast (or mesendoderm). True ingression is
+    characterised by:
+      - Sustained inward radial motion (not transient fluctuation)
+      - Net radial displacement toward the sphere centre
+      - Consistently negative radial velocity over most of the track
+
+    Criteria — a track is flagged INGRESSING if ALL of:
+      1. Track has ≥ *min_track_frames* time points
       2. Track **median** smoothed V_r ≤ *threshold*
       3. ≥ *min_inward_fraction* of track points have V_r < 0
+      4. Net radial displacement is inward (first→last distance decreases)
+      5. Track has ≥ 3 consecutive frames of inward movement (sustained)
+
+    Also computes per-track columns for downstream analysis:
+      INGRESSION_ONSET_FRAME  – first frame of sustained inward movement
+      TRACK_NET_RADIAL_DISP   – net change in radial distance (neg = inward)
+      TRACK_SUSTAINED_INWARD  – max consecutive inward frames
 
     Parameters
     ----------
@@ -591,7 +612,7 @@ def flag_ingressing(
 
     Returns
     -------
-    DataFrame with INGRESSING (bool) column
+    DataFrame with INGRESSING (bool) column + enrichment columns
     """
     has_med = "TRACK_MEDIAN_RADIAL_VEL" in df.columns
     has_mean = "TRACK_MEAN_RADIAL_VEL" in df.columns
@@ -612,7 +633,97 @@ def flag_ingressing(
     else:
         inward_ok = np.ones(len(df), dtype=bool)
 
-    df["INGRESSING"] = long_enough & (~np.isnan(vel)) & (vel <= threshold) & inward_ok
+    # ── Net radial displacement criterion ──
+    # True ingressing cells end up closer to the sphere centre than
+    # they started (epiblast→hypoblast transition).
+    net_disp = np.full(len(df), np.nan)
+    sustained_inward = np.zeros(len(df), dtype=int)
+    onset_frame = np.full(len(df), np.nan)
+
+    if "RADIAL_DIST_TO_CENTER" in df.columns:
+        sorted_df = df.sort_values(["TRACK_ID", "FRAME"])
+
+        # Vectorised net radial displacement: last - first per track
+        first_r = sorted_df.groupby("TRACK_ID")["RADIAL_DIST_TO_CENTER"].transform(
+            "first"
+        )
+        last_r = sorted_df.groupby("TRACK_ID")["RADIAL_DIST_TO_CENTER"].transform(
+            "last"
+        )
+        net_per_spot = (last_r - first_r).values
+        net_disp[sorted_df.index] = net_per_spot
+
+        # Sustained inward: max consecutive frames with V_r < 0 (per track)
+        # This requires run-length logic so we iterate per track
+        if "RADIAL_VELOCITY_SMOOTH" in sorted_df.columns:
+            for tid, grp in sorted_df.groupby("TRACK_ID"):
+                idx = grp.index
+                vr = grp["RADIAL_VELOCITY_SMOOTH"].values
+                max_run, cur_run, first_inward = 0, 0, np.nan
+                for j, v in enumerate(vr):
+                    if not np.isnan(v) and v < 0:
+                        cur_run += 1
+                        if cur_run == 1 and np.isnan(first_inward):
+                            first_inward = grp["FRAME"].values[j]
+                        if cur_run > max_run:
+                            max_run = cur_run
+                    else:
+                        if cur_run < 3:  # reset onset if run was too short
+                            first_inward = np.nan
+                        cur_run = 0
+                sustained_inward[idx] = max_run
+                onset_frame[idx] = first_inward
+
+    df["TRACK_NET_RADIAL_DISP"] = net_disp
+    df["TRACK_SUSTAINED_INWARD"] = sustained_inward
+    df["INGRESSION_ONSET_FRAME"] = onset_frame
+
+    # Net displacement is inward — require meaningful movement, not noise
+    net_inward = np.where(
+        np.isnan(net_disp),
+        True,  # if no data, don't block
+        net_disp < -0.5,  # at least 0.5 µm net inward
+    )
+
+    # Sustained movement: scale with track length — at least 15% of frames
+    # or 3, whichever is larger.  Short noise bursts get filtered out while
+    # long tracks need proportionally more consecutive inward evidence.
+    min_sustained = np.maximum(3, (track_len * 0.15).astype(int))
+    sustained_ok = sustained_inward >= min_sustained
+
+    df["INGRESSING"] = (
+        long_enough
+        & (~np.isnan(vel))
+        & (vel <= threshold)
+        & inward_ok
+        & net_inward
+        & sustained_ok
+    )
+
+    # ── Continuous ingression score (0–1) for visualisation ──
+    # Combines all criteria into a smooth score so the visualisation can
+    # show confidence rather than binary on/off.
+    abs_thresh = max(abs(threshold), 0.01)
+    s_vel = np.clip((threshold - vel) / abs_thresh, 0, 2) / 2
+    s_vel = np.nan_to_num(s_vel, nan=0.0)
+
+    if "TRACK_INWARD_FRACTION" in df.columns:
+        s_inward = np.clip(df["TRACK_INWARD_FRACTION"].values, 0, 1)
+    else:
+        s_inward = np.full(len(df), 0.5)
+
+    s_sustained = np.clip(sustained_inward / np.maximum(track_len.values, 1), 0, 1)
+
+    disp_for_score = np.where(np.isnan(net_disp), 0.0, -net_disp)
+    s_disp = np.clip(
+        disp_for_score / np.maximum(track_len.values.astype(float), 1), 0, 1
+    )
+
+    raw_score = 0.30 * s_vel + 0.20 * s_inward + 0.25 * s_sustained + 0.25 * s_disp
+    # Zero out score for non-ingressing tracks to keep it interpretable
+    raw_score[~df["INGRESSING"].values] = 0.0
+    df["INGRESSION_SCORE"] = raw_score
+
     return df
 
 
@@ -772,8 +883,12 @@ class EmbryoViewer:
         self._roi_shapes_layer = None
         self._roi_updating: bool = False  # guard for event recursion
         self._drawing_roi: bool = False  # guard: suppress rebuilds while drawing
-        self._current_color_mode: str = "track_id"  # tracks colour mode
+        self._current_color_mode: str = "frame"  # tracks colour mode
         self._tracks_cache_key: tuple | None = None  # for caching track builds
+        self._display_idx: np.ndarray | None = (
+            None  # indices into self.spots for displayed subset
+        )
+        self._track_width: float = 2.0  # track line width
 
         # Create viewer
         self.viewer = napari.Viewer(title="Embryo 4D Viewer", ndisplay=3)
@@ -802,7 +917,9 @@ class EmbryoViewer:
 
     def _add_spots_layer(self):
         """Add the main nuclei points layer."""
-        data, colors = self._build_display_points()
+        data, idx = self._build_display_points()
+        self._display_idx = idx
+        colors = self._get_display_colors()
         self.spots_layer = self.viewer.add_points(
             data,
             name="Nuclei",
@@ -810,6 +927,7 @@ class EmbryoViewer:
             face_color=colors,
             border_width=0,
             ndim=4,
+            out_of_slice_display=False,
         )
 
     def _build_display_points(self):
@@ -856,9 +974,94 @@ class EmbryoViewer:
                 df["POSITION_X"].values[idx],
             ]
         )
-        frame = df["FRAME"].values[idx].astype(float)
-        frame_norm = (frame - frame.min()) / max(np.ptp(frame), 1)
-        return data, _viridis_colors(frame_norm)
+        return data, idx
+
+    def _get_display_colors(self) -> np.ndarray:
+        """Compute face colors for the currently displayed subset based on current color mode."""
+        idx = self._display_idx
+        if idx is None or self.spots is None:
+            return np.array([[0.5, 0.5, 0.5, 1.0]])
+        df = self.spots
+        mode = self._current_color_mode
+
+        # ── Ingression mode: color by inward radial velocity ──
+        # Each spot is colored by how strongly it is moving inward at
+        # that moment.  Non-ingressing spots are ghostly grey; ingressing
+        # spots transition from warm orange (gentle inward) to bright
+        # magenta (strong inward dive), making the ingression movement
+        # itself visually pop.
+        if mode == "ingressing" and "INGRESSING" in df.columns:
+            flags = df["INGRESSING"].values[idx].astype(bool)
+            n_pts = len(idx)
+            colors = np.tile([0.45, 0.45, 0.45, 0.06], (n_pts, 1))
+            if flags.any() and "RADIAL_VELOCITY_SMOOTH" in df.columns:
+                vr = df["RADIAL_VELOCITY_SMOOTH"].values[idx][flags].copy()
+                vr = np.nan_to_num(vr, nan=0.0)
+                # Normalise: 0 = no inward motion, 1 = strongest inward
+                # Only negative V_r matters; clip positives to 0
+                inward = np.clip(-vr, 0, None)  # flip sign: positive = inward
+                vmax = (
+                    np.percentile(inward[inward > 0], 95) if (inward > 0).any() else 1.0
+                )
+                t = np.clip(inward / max(vmax, 1e-6), 0, 1)
+                # Gradient: warm orange (t=0) → hot magenta (t=0.5) → bright white-pink (t=1)
+                colors[flags, 0] = 0.85 + 0.15 * t  # R: stays high
+                colors[flags, 1] = 0.35 * (1 - t**0.8)  # G: fades
+                colors[flags, 2] = 0.15 + 0.70 * t**0.6  # B: rises → magenta
+                colors[flags, 3] = 0.65 + 0.35 * t  # A: brighter when diving
+            elif flags.any():
+                colors[flags] = [0.9, 0.2, 0.5, 0.85]  # flat magenta fallback
+            return colors
+
+        if mode == "roi" and "IN_ROI" in df.columns:
+            flags = df["IN_ROI"].values[idx].astype(bool)
+            hi = np.array([1, 0.9, 0, 1])
+            lo = np.array([0.5, 0.5, 0.5, 0.12])
+            return np.where(flags[:, None], hi, lo)
+
+        # ── Diverging mode ──
+        if mode == "radial_vel" and "RADIAL_VELOCITY_SMOOTH" in df.columns:
+            v = df["RADIAL_VELOCITY_SMOOTH"].values[idx].copy()
+            nan_mask = np.isnan(v)
+            v[nan_mask] = 0.0
+            valid = v[~nan_mask]
+            vmax = (
+                max(np.abs(np.nanpercentile(valid, [2, 98])).max(), 1e-6)
+                if len(valid) > 0
+                else 1.0
+            )
+            v_clip = np.clip(v / vmax, -1, 1)
+            colors = np.zeros((len(v), 4))
+            colors[:, 3] = 1.0
+            neg = v_clip < 0
+            pos = v_clip >= 0
+            t_neg = 1 + v_clip[neg]
+            colors[neg, 0] = t_neg
+            colors[neg, 1] = t_neg
+            colors[neg, 2] = 1.0
+            t_pos = v_clip[pos]
+            colors[pos, 0] = 1.0
+            colors[pos, 1] = 1.0 - t_pos
+            colors[pos, 2] = 1.0 - t_pos
+            colors[nan_mask] = [0.5, 0.5, 0.5, 0.3]
+            return colors
+
+        # ── Continuous modes ──
+        if mode == "depth" and "SPHERICAL_DEPTH" in df.columns:
+            v = df["SPHERICAL_DEPTH"].values[idx]
+        elif mode == "theta" and "THETA_DEG" in df.columns:
+            v = df["THETA_DEG"].values[idx]
+        elif mode == "phi" and "PHI_DEG" in df.columns:
+            v = df["PHI_DEG"].values[idx]
+        elif mode == "speed":
+            v = self._compute_spot_speed()[idx]
+        else:
+            # Default: colour by frame
+            v = df["FRAME"].values[idx].astype(float)
+
+        v = v.astype(float)
+        v_norm = (v - np.nanmin(v)) / max(np.nanmax(v) - np.nanmin(v), 1e-10)
+        return _viridis_colors(v_norm)
 
     def _add_tracks_layer(self):
         """Add tracks as a napari Tracks layer."""
@@ -961,13 +1164,24 @@ class EmbryoViewer:
         mode = self._current_color_mode
 
         # ── Dual-layer mode for ingression classification view ──
+        #
+        # Background layer: all non-ingressing tracks rendered in faint
+        # uniform grey so they provide spatial context without distracting.
+        #
+        # Foreground layer: ingressing tracks colored by ONSET FRAME
+        # using a warm 'inferno' colormap.  Early ingressors appear in
+        # deep red/orange while later ones glow yellow/white, creating a
+        # beautiful temporal accumulation effect as you scrub through time.
+        # Ghost-point extension keeps every track visible through the
+        # movie's last frame.
+        #
         if mode == "ingressing" and "INGRESSING" in df_t.columns:
             ing_mask = df_t["INGRESSING"].values.astype(bool)
-            # Non-ingressing tracks
+
+            # ── Background: non-ingressing tracks ──
             if (~ing_mask).any():
                 df_other = df_t[~ing_mask]
                 if len(df_other) >= 3:
-                    # filter to tracks with ≥2 points
                     tc = df_other.groupby("TRACK_ID")["FRAME"].transform("count")
                     df_other = df_other[tc >= 2].sort_values(["TRACK_ID", "FRAME"])
                     if len(df_other) > 0:
@@ -983,18 +1197,31 @@ class EmbryoViewer:
                         self._tracks_layer_secondary = self.viewer.add_tracks(
                             t_other,
                             name="Other Tracks",
-                            tail_width=0.5,
-                            tail_length=30,
+                            tail_width=max(0.5, self._track_width * 0.2),
+                            tail_length=15,
                             color_by="track_id",
                             colormap="gray",
-                            opacity=0.25,
+                            opacity=0.10,
                         )
-            # Ingressing tracks
+
+            # ── Foreground: ingressing tracks (onset-coloured) ──
             if ing_mask.any():
                 df_ing = df_t[ing_mask]
                 tc = df_ing.groupby("TRACK_ID")["FRAME"].transform("count")
                 df_ing = df_ing[tc >= 2].sort_values(["TRACK_ID", "FRAME"])
                 if len(df_ing) > 0:
+                    # Ghost-point extension: add synthetic point at the
+                    # dataset's maximum frame so ingressing tracks persist
+                    # visually through the end of the recording.
+                    max_frame = int(self.spots["FRAME"].max())
+                    last_pts = df_ing.groupby("TRACK_ID").tail(1).copy()
+                    needs_ext = last_pts[last_pts["FRAME"] < max_frame]
+                    if len(needs_ext) > 0:
+                        ext = needs_ext.copy()
+                        ext["FRAME"] = max_frame
+                        df_ing = pd.concat([df_ing, ext], ignore_index=True)
+                        df_ing = df_ing.sort_values(["TRACK_ID", "FRAME"])
+
                     t_ing = np.column_stack(
                         [
                             df_ing["TRACK_ID"].values,
@@ -1004,14 +1231,42 @@ class EmbryoViewer:
                             df_ing["POSITION_X"].values,
                         ]
                     )
-                    self.tracks_layer = self.viewer.add_tracks(
-                        t_ing,
-                        name="Ingressing Tracks",
-                        tail_width=2,
-                        tail_length=50,
-                        color_by="track_id",
-                        colormap="magenta",
+                    n_frames = (
+                        int(self.spots["FRAME"].nunique())
+                        if self.spots is not None
+                        else 9999
                     )
+
+                    # Color by radial velocity → emphasises the
+                    # ingression movement itself.  Each point along the
+                    # track is colored by how fast the cell dives inward
+                    # at that moment: gentle inward = warm orange,
+                    # strong dive = bright magenta/pink.
+                    kw_ing = dict(
+                        name="Ingressing Tracks",
+                        tail_width=self._track_width,
+                        tail_length=n_frames,
+                    )
+                    if "RADIAL_VELOCITY_SMOOTH" in df_ing.columns:
+                        vr = df_ing["RADIAL_VELOCITY_SMOOTH"].values.copy()
+                        vr = np.nan_to_num(vr, nan=0.0)
+                        # Inward speed: flip sign so positive = diving in
+                        inward = np.clip(-vr, 0, None)
+                        vmax = (
+                            np.percentile(inward[inward > 0], 95)
+                            if (inward > 0).any()
+                            else 1.0
+                        )
+                        # Normalize 0–1 for colormap
+                        normed = np.clip(inward / max(vmax, 1e-6), 0, 1)
+                        kw_ing["properties"] = {"inward_speed": normed}
+                        kw_ing["color_by"] = "inward_speed"
+                        kw_ing["colormap"] = "magma"
+                    else:
+                        kw_ing["color_by"] = "track_id"
+                        kw_ing["colormap"] = "magenta"
+
+                    self.tracks_layer = self.viewer.add_tracks(t_ing, **kw_ing)
             return
 
         # ── Single-layer mode (all other colour modes) ──
@@ -1045,7 +1300,7 @@ class EmbryoViewer:
 
         kw = dict(
             name="Tracks",
-            tail_width=1,
+            tail_width=self._track_width,
             tail_length=40,
             color_by=color_by,
             colormap=cmap,
@@ -1261,6 +1516,11 @@ class EmbryoViewer:
         )
         self.max_tracks_slider.changed.connect(self._on_max_tracks_changed)
 
+        self.track_width_slider = FloatSlider(
+            value=2.0, min=0.5, max=10.0, step=0.5, label="Track width"
+        )
+        self.track_width_slider.changed.connect(self._on_track_width_changed)
+
         # ── Track time range ──
         self.track_frame_start = FloatSlider(
             value=fmin_data, min=fmin_data, max=fmax_data, step=1, label="▶ Start frame"
@@ -1338,6 +1598,8 @@ class EmbryoViewer:
         )
         self.ingression_tracks_only.changed.connect(self._on_ingression_tracks_toggle)
 
+        self.ingression_roi_only = CheckBox(value=False, text="Flag only within ROI")
+
         # ── Colour mode ──
         btn_color_frame = PushButton(text="Colour by Frame")
         btn_color_frame.changed.connect(lambda: self._recolor("frame"))
@@ -1376,6 +1638,7 @@ class EmbryoViewer:
                 Label(value="── Display ──"),
                 self.display_pct_slider,
                 self.max_tracks_slider,
+                self.track_width_slider,
                 Label(value="── Landmarks ──"),
                 btn_ap,
                 self.lbl_ap,
@@ -1397,6 +1660,7 @@ class EmbryoViewer:
                 self.ingression_inward_frac,
                 self.ingression_min_frames,
                 btn_auto_threshold,
+                self.ingression_roi_only,
                 btn_flag_ingression,
                 self.lbl_ingression,
                 self.ingression_tracks_only,
@@ -1658,83 +1922,27 @@ class EmbryoViewer:
             self.viewer.status = "Load spots first!"
             return
 
-        self._current_color_mode = mode
+        # Validate mode is available
         df = self.spots
-        if mode == "frame":
-            v = df["FRAME"].values.astype(float)
-        elif mode == "depth" and "SPHERICAL_DEPTH" in df.columns:
-            v = df["SPHERICAL_DEPTH"].values
-        elif mode == "theta" and "THETA_DEG" in df.columns:
-            v = df["THETA_DEG"].values
-        elif mode == "phi" and "PHI_DEG" in df.columns:
-            v = df["PHI_DEG"].values
-        elif mode == "speed":
-            v = self._compute_spot_speed()
-        elif mode == "radial_vel" and "RADIAL_VELOCITY_SMOOTH" in df.columns:
-            v = df["RADIAL_VELOCITY_SMOOTH"].values.copy()
-            self._recolor_diverging(v, "Radial Velocity")
-            self._rebuild_tracks()
-            return
-        elif mode == "ingressing" and "INGRESSING" in df.columns:
-            self._recolor_binary("INGRESSING", "red", "Ingressing")
-            self._rebuild_tracks()
-            return
-        elif mode == "roi" and "IN_ROI" in df.columns:
-            self._recolor_binary("IN_ROI", "yellow", "ROI")
-            self._rebuild_tracks()
-            return
-        else:
+        needed = {
+            "depth": "SPHERICAL_DEPTH",
+            "theta": "THETA_DEG",
+            "phi": "PHI_DEG",
+            "radial_vel": "RADIAL_VELOCITY_SMOOTH",
+            "ingressing": "INGRESSING",
+            "roi": "IN_ROI",
+        }
+        if mode in needed and needed[mode] not in df.columns:
             self.viewer.status = (
                 f"'{mode}' not available — fit sphere / apply ROI first."
             )
             return
 
-        v_norm = (v - np.nanmin(v)) / max(np.nanmax(v) - np.nanmin(v), 1e-10)
-        self.spots_layer.face_color = _viridis_colors(v_norm)
+        self._current_color_mode = mode
+        colors = self._get_display_colors()
+        self.spots_layer.face_color = colors
         self._rebuild_tracks()
         self.viewer.status = f"Coloured by {mode}"
-
-    def _recolor_binary(self, column: str, highlight_color: str, label: str):
-        """Recolour spots by a boolean column (IN_ROI, INGRESSING, etc)."""
-        flags = self.spots[column].values.astype(bool)
-        color_map = {
-            "red": np.array([0.95, 0.1, 0.35, 1.0]),  # magenta-red for ingressing
-            "yellow": np.array([1, 0.9, 0, 1]),
-            "green": np.array([0, 0.8, 0, 1]),
-        }
-        hi = color_map.get(highlight_color, np.array([1, 0, 0, 1]))
-        lo = np.array([0.5, 0.5, 0.5, 0.12])  # very dim grey for non-highlighted
-        colors = np.where(flags[:, None], hi, lo)
-        self.spots_layer.face_color = colors
-        n = int(flags.sum())
-        self.viewer.status = f"Coloured by {label}: {n:,} highlighted"
-
-    def _recolor_diverging(self, values: np.ndarray, label: str):
-        """Diverging colourmap: blue (negative) — white (0) — red (positive)."""
-        v = values.copy()
-        nan_mask = np.isnan(v)
-        v[nan_mask] = 0.0
-        vmax = max(np.abs(np.nanpercentile(values[~nan_mask], [2, 98])).max(), 1e-6)
-        v_clip = np.clip(v / vmax, -1, 1)
-        # Map [-1, 1] → RGBA: blue → white → red
-        colors = np.zeros((len(v), 4))
-        colors[:, 3] = 1.0
-        neg = v_clip < 0
-        pos = v_clip >= 0
-        # Negative: blue (0,0,1) → white (1,1,1)
-        t_neg = 1 + v_clip[neg]  # 0..1 (0=full blue, 1=white)
-        colors[neg, 0] = t_neg
-        colors[neg, 1] = t_neg
-        colors[neg, 2] = 1.0
-        # Positive: white (1,1,1) → red (1,0,0)
-        t_pos = v_clip[pos]  # 0..1 (0=white, 1=full red)
-        colors[pos, 0] = 1.0
-        colors[pos, 1] = 1.0 - t_pos
-        colors[pos, 2] = 1.0 - t_pos
-        # NaN → grey
-        colors[nan_mask] = [0.5, 0.5, 0.5, 0.3]
-        self.spots_layer.face_color = colors
-        self.viewer.status = f"Coloured by {label} (blue=inward, red=outward)"
 
     def _compute_spot_speed(self) -> np.ndarray:
         """Compute per-spot displacement speed (µm/frame) from track data."""
@@ -1824,6 +2032,38 @@ class EmbryoViewer:
             min_inward_fraction=inward_frac,
         )
 
+        # If "Flag only within ROI" is checked, apply two spatial filters:
+        #
+        #  (1) ROI PRESENCE — the track must have ≥1 spot inside the ROI
+        #      box.  This removes false positives near the animal pole
+        #      (entirely above the box) while preserving tracks that start
+        #      outside the ROI and later migrate down into the marginal
+        #      zone during ingression.
+        #
+        #  (2) VEGETAL BREACH — any track where ANY spot crosses past the
+        #      vegetal boundary (y_max, after orientation +Y = vegetal) is
+        #      epiboly / spreading, not ingression, so it is excluded.
+        #
+        if self.ingression_roi_only.value and self._roi_bounds is not None:
+            b = self._roi_bounds
+            df = self.spots
+
+            # (1) Track must touch the ROI at least once
+            in_box = (
+                (df["POSITION_X"] >= b["x_min"])
+                & (df["POSITION_X"] <= b["x_max"])
+                & (df["POSITION_Y"] >= b["y_min"])
+                & (df["POSITION_Y"] <= b["y_max"])
+            )
+            track_ever_in_box = in_box.groupby(df["TRACK_ID"]).transform("any")
+            self.spots.loc[~track_ever_in_box, "INGRESSING"] = False
+
+            # (2) Exclude tracks breaching the vegetal boundary
+            vegetal_breach = (
+                df.groupby("TRACK_ID")["POSITION_Y"].transform("max") > b["y_max"]
+            )
+            self.spots.loc[vegetal_breach, "INGRESSING"] = False
+
         n_ing = int(self.spots["INGRESSING"].sum())
         n_total = len(self.spots)
         n_tracks = 0
@@ -1832,12 +2072,13 @@ class EmbryoViewer:
                 self.spots.loc[self.spots["INGRESSING"], "TRACK_ID"].nunique()
             )
         pct = n_ing / max(n_total, 1) * 100
+        roi_tag = " [ROI-only]" if self.ingression_roi_only.value else ""
         self.lbl_ingression.value = (
-            f"Ingressing: {n_ing:,} spots ({n_tracks} tracks, {pct:.1f}%)\n"
-            f"V_r≤{thresh:.3f} µm/f, inward≥{inward_frac:.0%}, ≥{min_f} frames"
+            f"Ingressing: {n_ing:,} spots ({n_tracks} tracks, {pct:.1f}%){roi_tag}\n"
+            f"V_r≤{thresh:.3f}, inward≥{inward_frac:.0%}, ≥{min_f}f, net-in+sustained"
         )
         self.viewer.status = (
-            f"Flagged {n_ing:,} ingressing spots ({n_tracks} tracks). "
+            f"Flagged {n_ing:,} ingressing spots ({n_tracks} tracks){roi_tag}. "
             f"Use 'Colour Ingressing' to visualise."
         )
 
@@ -1858,7 +2099,9 @@ class EmbryoViewer:
         """Update the points layer data after orientation or slider change."""
         if self.spots_layer is None:
             return
-        data, colors = self._build_display_points()
+        data, idx = self._build_display_points()
+        self._display_idx = idx
+        colors = self._get_display_colors()
         self.spots_layer.data = data
         self.spots_layer.face_color = colors
 
@@ -1875,6 +2118,11 @@ class EmbryoViewer:
     def _on_max_tracks_changed(self):
         """Handle max tracks slider change (debounced)."""
         self._max_tracks = int(self.max_tracks_slider.value)
+        self._schedule_track_rebuild()
+
+    def _on_track_width_changed(self):
+        """Handle track width slider change (debounced)."""
+        self._track_width = float(self.track_width_slider.value)
         self._schedule_track_rebuild()
 
     # ── Track time range ──────────────────────────────────────────────
@@ -2100,121 +2348,233 @@ class EmbryoViewer:
     # ── Export & Video ────────────────────────────────────────────────
 
     def _export(self):
-        """Export comprehensive analysis output for downstream R pipeline."""
+        """Export comprehensive analysis output for downstream R pipeline.
+
+        Runs the heavy CSV writes in a background thread to avoid freezing
+        the UI on large datasets (millions of rows).
+        """
         import json
+
+        if self.spots is None:
+            self.viewer.status = "Load spots first!"
+            return
+
+        from qtpy.QtCore import QTimer
 
         out_dir = Path("analysis_output")
         out_dir.mkdir(exist_ok=True)
-        files_written = []
 
-        # 1. Enriched spots CSV (all computed columns)
-        self.spots.to_csv(out_dir / "oriented_spots.csv", index=False)
-        files_written.append("oriented_spots.csv")
+        self.lbl_export.value = "Exporting (please wait)..."
+        self.viewer.status = "Exporting analysis files in background..."
 
-        # 2. Sphere parameters
-        if self.sphere_fit_result is not None:
-            c = self.sphere_fit_result["center"]
-            params = pd.DataFrame(
-                {
-                    "parameter": [
-                        "center_x",
-                        "center_y",
-                        "center_z",
-                        "radius",
-                        "rmse",
-                        "coverage",
-                        "surface_used",
-                        "cap_height",
-                        "cap_base_radius",
-                    ],
-                    "value": [
-                        c[0],
-                        c[1],
-                        c[2],
-                        self.sphere_fit_result["radius"],
-                        self.sphere_fit_result["rmse"],
-                        self.sphere_fit_result["coverage"],
-                        self.sphere_fit_result["surface_used"],
-                        self.sphere_fit_result["cap_height"],
-                        self.sphere_fit_result["cap_base_radius"],
-                    ],
+        # Snapshot everything we need — avoids touching GUI state from thread
+        spots_df = self.spots.copy()
+        tracks_raw = self.tracks_raw.copy() if self.tracks_raw is not None else None
+        sphere = (
+            dict(self.sphere_fit_result) if self.sphere_fit_result is not None else None
+        )
+        roi = dict(self._roi_bounds) if self._roi_bounds is not None else None
+        roi_flag = getattr(self, "ingression_roi_only", None)
+        roi_restricted = roi_flag is not None and roi_flag.value
+        thresh_val = self.ingression_threshold.value
+        min_f_val = int(self.ingression_min_frames.value)
+        inward_frac_val = self.ingression_inward_frac.value
+        oriented = self.oriented
+        track_frame_min = self._track_frame_min
+        track_frame_max = self._track_frame_max
+        display_pct = self._display_pct
+        max_tracks = self._max_tracks
+        color_mode = self._current_color_mode
+
+        self._pending_export_err = None
+        self._pending_export_files = None
+
+        def _bg():
+            try:
+                files_written = []
+
+                # 1. Enriched spots CSV (all computed columns)
+                spots_df.to_csv(out_dir / "oriented_spots.csv", index=False)
+                files_written.append("oriented_spots.csv")
+
+                # 2. Enriched tracks CSV — spots filtered to tracked nuclei
+                #    only, sorted by TRACK_ID + FRAME for easy downstream use
+                if "TRACK_ID" in spots_df.columns:
+                    tracked = spots_df.dropna(subset=["TRACK_ID"]).sort_values(
+                        ["TRACK_ID", "FRAME"]
+                    )
+                    if len(tracked) > 0:
+                        tracked.to_csv(out_dir / "oriented_tracks.csv", index=False)
+                        files_written.append("oriented_tracks.csv")
+
+                # 3. Sphere parameters
+                if sphere is not None:
+                    c = sphere["center"]
+                    params = pd.DataFrame(
+                        {
+                            "parameter": [
+                                "center_x",
+                                "center_y",
+                                "center_z",
+                                "radius",
+                                "rmse",
+                                "coverage",
+                                "surface_used",
+                                "cap_height",
+                                "cap_base_radius",
+                            ],
+                            "value": [
+                                c[0],
+                                c[1],
+                                c[2],
+                                sphere["radius"],
+                                sphere["rmse"],
+                                sphere["coverage"],
+                                sphere["surface_used"],
+                                sphere["cap_height"],
+                                sphere["cap_base_radius"],
+                            ],
+                        }
+                    )
+                    params.to_csv(out_dir / "sphere_params.csv", index=False)
+                    files_written.append("sphere_params.csv")
+
+                # 4. ROI bounds
+                if roi is not None:
+                    roi_df = pd.DataFrame(
+                        {"parameter": list(roi.keys()), "value": list(roi.values())}
+                    )
+                    roi_df.to_csv(out_dir / "roi_bounds.csv", index=False)
+                    files_written.append("roi_bounds.csv")
+
+                # 5. Ingression parameters
+                if "INGRESSING" in spots_df.columns:
+                    n_ing = int(spots_df["INGRESSING"].sum())
+                    n_tracks_ing = 0
+                    if "TRACK_ID" in spots_df.columns:
+                        n_tracks_ing = int(
+                            spots_df.loc[
+                                spots_df["INGRESSING"].astype(bool), "TRACK_ID"
+                            ].nunique()
+                        )
+                    ing_df = pd.DataFrame(
+                        {
+                            "parameter": [
+                                "threshold_um_per_frame",
+                                "min_track_frames",
+                                "min_inward_fraction",
+                                "roi_restricted",
+                                "detection_method",
+                                "criteria",
+                                "n_ingressing_spots",
+                                "n_ingressing_tracks",
+                            ],
+                            "value": [
+                                thresh_val,
+                                min_f_val,
+                                inward_frac_val,
+                                roi_restricted,
+                                "embryology-informed multi-criteria",
+                                "median_Vr+inward_frac+net_disp+sustained",
+                                n_ing,
+                                n_tracks_ing,
+                            ],
+                        }
+                    )
+                    ing_df.to_csv(out_dir / "ingression_params.csv", index=False)
+                    files_written.append("ingression_params.csv")
+
+                # 6. Per-track summary CSV
+                if "TRACK_ID" in spots_df.columns:
+                    track_cols = [
+                        "TRACK_MEDIAN_RADIAL_VEL",
+                        "TRACK_MEAN_RADIAL_VEL",
+                        "TRACK_INWARD_FRACTION",
+                        "TRACK_MAX_INWARD_VEL",
+                        "TRACK_NET_RADIAL_DISP",
+                        "TRACK_SUSTAINED_INWARD",
+                        "INGRESSION_ONSET_FRAME",
+                        "INGRESSING",
+                        "INGRESSION_SCORE",
+                    ]
+                    avail_cols = [c for c in track_cols if c in spots_df.columns]
+                    if avail_cols:
+                        grp = spots_df.dropna(subset=["TRACK_ID"]).groupby("TRACK_ID")
+                        track_summary = grp.agg(
+                            n_spots=("FRAME", "count"),
+                            frame_start=("FRAME", "min"),
+                            frame_end=("FRAME", "max"),
+                            mean_x=("POSITION_X", "mean"),
+                            mean_y=("POSITION_Y", "mean"),
+                            mean_z=("POSITION_Z", "mean"),
+                        )
+                        first_per_track = grp[avail_cols].first()
+                        track_summary = track_summary.join(first_per_track)
+                        for sc in ["SPHERICAL_DEPTH", "THETA_DEG", "PHI_DEG"]:
+                            if sc in spots_df.columns:
+                                track_summary[f"mean_{sc}"] = grp[sc].mean()
+                        if "IN_ROI" in spots_df.columns:
+                            track_summary["IN_ROI"] = grp["IN_ROI"].any()
+                        track_summary.to_csv(out_dir / "track_summary.csv")
+                        files_written.append("track_summary.csv")
+
+                # 7. Analysis metadata (JSON)
+                meta = {
+                    "oriented": oriented,
+                    "sphere_fitted": sphere is not None,
+                    "roi_set": roi is not None,
+                    "roi_restricted_ingression": roi_restricted,
+                    "time_window": {
+                        "frame_min": track_frame_min,
+                        "frame_max": track_frame_max,
+                    },
+                    "display": {
+                        "display_pct": display_pct,
+                        "max_tracks": max_tracks,
+                        "current_color_mode": color_mode,
+                    },
+                    "n_spots": len(spots_df),
+                    "n_frames": int(spots_df["FRAME"].nunique()),
+                    "columns_exported": list(spots_df.columns),
+                    "ingression_criteria": {
+                        "method": "multi-criteria embryology-informed",
+                        "criteria": [
+                            "median V_r <= threshold",
+                            "inward fraction >= min_inward_fraction",
+                            "track length >= min_track_frames",
+                            "net radial displacement >= 0.5 µm inward",
+                            "sustained consecutive inward >= max(3, 15% of track)",
+                        ],
+                    },
                 }
-            )
-            params.to_csv(out_dir / "sphere_params.csv", index=False)
-            files_written.append("sphere_params.csv")
+                if sphere is not None:
+                    meta["sphere_radius"] = float(sphere["radius"])
+                if roi is not None:
+                    meta["roi_bounds"] = {k: float(v) for k, v in roi.items()}
+                with open(out_dir / "analysis_metadata.json", "w") as f:
+                    json.dump(meta, f, indent=2, default=str)
+                files_written.append("analysis_metadata.json")
 
-        # 3. ROI bounds
-        if self._roi_bounds is not None:
-            roi_df = pd.DataFrame(
-                {
-                    "parameter": list(self._roi_bounds.keys()),
-                    "value": list(self._roi_bounds.values()),
-                }
-            )
-            roi_df.to_csv(out_dir / "roi_bounds.csv", index=False)
-            files_written.append("roi_bounds.csv")
+                self._pending_export_files = files_written
+            except Exception as e:
+                self._pending_export_err = str(e)
 
-        # 4. Ingression parameters
-        if "INGRESSING" in self.spots.columns:
-            n_ing = int(self.spots["INGRESSING"].sum())
-            n_tracks_ing = 0
-            if "TRACK_ID" in self.spots.columns:
-                n_tracks_ing = int(
-                    self.spots.loc[
-                        self.spots["INGRESSING"].astype(bool), "TRACK_ID"
-                    ].nunique()
-                )
-            ing_df = pd.DataFrame(
-                {
-                    "parameter": [
-                        "threshold_um_per_frame",
-                        "min_track_frames",
-                        "min_inward_fraction",
-                        "detection_method",
-                        "n_ingressing_spots",
-                        "n_ingressing_tracks",
-                    ],
-                    "value": [
-                        self.ingression_threshold.value,
-                        int(self.ingression_min_frames.value),
-                        self.ingression_inward_frac.value,
-                        "multi-criteria (smoothed median V_r + inward fraction)",
-                        n_ing,
-                        n_tracks_ing,
-                    ],
-                }
-            )
-            ing_df.to_csv(out_dir / "ingression_params.csv", index=False)
-            files_written.append("ingression_params.csv")
+        t = threading.Thread(target=_bg, daemon=True)
+        t.start()
 
-        # 5. Analysis metadata (JSON)
-        meta = {
-            "oriented": self.oriented,
-            "sphere_fitted": self.sphere_fit_result is not None,
-            "roi_set": self._roi_bounds is not None,
-            "time_window": {
-                "frame_min": self._track_frame_min,
-                "frame_max": self._track_frame_max,
-            },
-            "display": {
-                "display_pct": self._display_pct,
-                "max_tracks": self._max_tracks,
-                "current_color_mode": self._current_color_mode,
-            },
-            "n_spots": len(self.spots),
-            "n_frames": int(self.spots["FRAME"].nunique()),
-            "columns_exported": list(self.spots.columns),
-        }
-        if self.sphere_fit_result is not None:
-            meta["sphere_radius"] = float(self.sphere_fit_result["radius"])
-        if self._roi_bounds is not None:
-            meta["roi_bounds"] = {k: float(v) for k, v in self._roi_bounds.items()}
-        with open(out_dir / "analysis_metadata.json", "w") as f:
-            json.dump(meta, f, indent=2, default=str)
-        files_written.append("analysis_metadata.json")
+        def _poll():
+            if t.is_alive():
+                QTimer.singleShot(500, _poll)
+                return
+            if self._pending_export_err:
+                self.lbl_export.value = f"Export error: {self._pending_export_err}"
+                self.viewer.status = f"Export failed: {self._pending_export_err}"
+                return
+            files = self._pending_export_files or []
+            self.lbl_export.value = f"Exported {len(files)} files to {out_dir}/"
+            self.viewer.status = f"Exported: {', '.join(files)}"
 
-        self.lbl_export.value = f"Exported {len(files_written)} files to {out_dir}/"
-        self.viewer.status = f"Exported: {', '.join(files_written)}"
+        QTimer.singleShot(500, _poll)
 
     def _record_video(self):
         """Record a time-lapse video iterating through the time window."""
@@ -2297,6 +2657,12 @@ class EmbryoViewer:
 
             def _screenshot():
                 img = self.viewer.screenshot(canvas_only=True)
+                # Convert RGBA → RGB and ensure even dimensions for libx264
+                if img.ndim == 3 and img.shape[2] == 4:
+                    img = img[:, :, :3]
+                h, w = img.shape[:2]
+                if h % 2 or w % 2:
+                    img = img[: h - h % 2, : w - w % 2]
                 self._vid_images.append(img)
                 self._vid_idx += 1
                 if self._vid_idx % 10 == 0:

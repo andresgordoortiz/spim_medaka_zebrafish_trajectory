@@ -1939,6 +1939,14 @@ class EmbryoViewer:
             return
 
         self._current_color_mode = mode
+        # Rebuild display points first to ensure spots_layer.data and
+        # napari's internal _indices_view are consistent with the current
+        # display subset before we set face_color.  Without this, stale
+        # _indices_view entries from a previous (larger) display set cause
+        # an IndexError in VispyPointsLayer._on_data_change.
+        data, idx = self._build_display_points()
+        self._display_idx = idx
+        self.spots_layer.data = data
         colors = self._get_display_colors()
         self.spots_layer.face_color = colors
         self._rebuild_tracks()

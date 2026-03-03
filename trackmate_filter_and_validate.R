@@ -57,7 +57,8 @@ library(scales)
 
 FRAME_INTERVAL_SEC <- 30
 FRAME_INTERVAL_MIN <- FRAME_INTERVAL_SEC / 60
-SPEED_CONVERSION   <- 60 / FRAME_INTERVAL_SEC   # µm/frame → µm/min
+# TrackMate exports speeds in µm/sec — multiply by 60 to get µm/min
+SPEED_CONVERSION   <- 60   # µm/sec → µm/min
 
 MANUAL_DIR <- "high_res_mannualtracking"
 IMARIS_DIR <- "all_tracks"
@@ -74,37 +75,37 @@ find_input <- function(candidates) {
 }
 
 SPOTS_FILE <- find_input(c(
-  "analysis_output_medaka/oriented_spots.csv",
-  "oriented_spots.csv",
-  "medaka_25082025_combined_spots.csv",
-  "medaka_spots.csv",
-  "4D_spots.csv"
+
+  "medaka_25082025_combined_spots.csv"
+
 ))
 
 # Track file: use oriented if available, otherwise raw TrackMate tracks
 # NOTE: oriented_tracks.csv from napari = per-spot data (same as spots),
 #       so for track-level stats we need the raw TrackMate tracks export.
 TRACKS_FILE <- find_input(c(
-  "medaka_25082025_combined_tracks.csv",
-  "medaka_tracks.csv",
-  "oriented_tracks.csv",
-  "analysis_output_medaka/oriented_tracks.csv",
-  "4D_tracks.csv"
+  "medaka_25082025_combined_tracks.csv"
 ))
 
-# --- Selection method ---
-#   "pareto" = balanced trade-off (Pareto knee)
-#   "score"  = prioritise ground truth similarity, then max tracks
-SELECTION_METHOD <- "score"
-SCORE_TOLERANCE  <- 0.05     # only for "score" mode: 0.05 = within 5% of GT speeds
+# --- Selection method  ────────────────────────────────────────────────────
+#   "closest_gt"  = pick the combo whose speed distribution is closest to
+#                   ground truth, regardless of how many tracks survive
+#   "pareto"      = find the Pareto-optimal knee that balances GT similarity
+#                   AND number of retained tracks (keeps more data)
+#
+# Both modes always compute the full Pareto front for diagnostics.
+SELECTION_METHOD <- "pareto"   # <-- change to "closest_gt" for pure GT matching
 
 # --- Sweep grid ---
+# NOTE: speed values are in µm/min (TrackMate exports µm/sec × 60)
+#       max_gaps removed (data has max 1 gap → no discriminating power)
+#       added min_displacement and min_confinement as biologically meaningful filters
 SWEEP_GRID <- list(
-  min_spots       = c(3, 5, 10, 15, 20, 30, 50, 75, 100),
-  max_mean_speed  = c(3, 4, 5, 7, 10, Inf),
-  max_max_speed   = c(5, 8, 10, 15, Inf),
-  max_gaps        = c(0, 1, 2, 5, Inf),
-  quality_pctile  = c(0, 0.1, 0.2, 0.3)
+  min_spots          = c(3, 4, 5, 7, 10, 15, 20, 30, 50),
+  max_mean_speed     = c(3, 5, 7, 10, 15, Inf),           # µm/min
+  max_max_speed      = c(8, 12, 18, 25, Inf),              # µm/min
+  min_displacement   = c(0, 1, 3, 5),                      # µm total displacement
+  quality_pctile     = c(0, 0.10, 0.20)
 )
 
 if (!dir.exists(OUTPUT_DIR)) dir.create(OUTPUT_DIR, recursive = TRUE)
@@ -134,7 +135,7 @@ cat(strrep("=", 70), "\n")
 cat("  TRACKMATE FILTER & VALIDATE\n")
 cat(strrep("=", 70), "\n")
 cat(sprintf("  Input:  %s / %s\n", SPOTS_FILE, TRACKS_FILE))
-cat(sprintf("  Frame interval: %d sec | Speed conversion: ×%.0f\n",
+cat(sprintf("  Frame interval: %d sec | Speed conversion: ×%.0f (µm/sec → µm/min)\n",
             FRAME_INTERVAL_SEC, SPEED_CONVERSION))
 
 # #############################################################################
@@ -171,12 +172,16 @@ tm_tracks <- read_tm_csv(TRACKS_FILE, "tracks") %>%
   mutate(across(-LABEL, ~suppressWarnings(as.numeric(.))))
 
 # Convert units
+# TRACK_DURATION is in seconds (confirmed: N_SPOTS-1 gaps × 30 sec = TRACK_DURATION)
+# TRACK_MEAN_SPEED etc. are in µm/sec (confirmed from TrackMate units row)
 tm_tracks <- tm_tracks %>%
   mutate(
-    DURATION_MIN      = TRACK_DURATION * FRAME_INTERVAL_MIN,
-    SPEED_MEAN_UM_MIN = TRACK_MEAN_SPEED * SPEED_CONVERSION,
+    DURATION_MIN      = TRACK_DURATION / 60,               # sec → min
+    SPEED_MEAN_UM_MIN = TRACK_MEAN_SPEED * SPEED_CONVERSION,  # µm/sec × 60 → µm/min
     SPEED_MAX_UM_MIN  = TRACK_MAX_SPEED  * SPEED_CONVERSION,
     SPEED_STD_UM_MIN  = TRACK_STD_SPEED  * SPEED_CONVERSION,
+    # TRACK_DISPLACEMENT is in µm (already correct)
+    DISPLACEMENT_UM   = TRACK_DISPLACEMENT,
     N_SPOTS           = NUMBER_SPOTS
   )
 
@@ -315,9 +320,11 @@ cell_summaries <- cells_corrected %>%
 
 # Ground truth targets
 GT <- list(
-  inst_speed_median      = median(cells_corrected$corr_speed, na.rm = TRUE),
-  inst_speed_mean        = mean(cells_corrected$corr_speed, na.rm = TRUE),
-  track_mean_speed_median = median(cell_summaries$mean_corr_speed, na.rm = TRUE)
+  inst_speed_median       = median(cells_corrected$corr_speed, na.rm = TRUE),
+  inst_speed_mean         = mean(cells_corrected$corr_speed, na.rm = TRUE),
+  track_mean_speed_median = median(cell_summaries$mean_corr_speed, na.rm = TRUE),
+  inst_speed_iqr          = IQR(cells_corrected$corr_speed, na.rm = TRUE),
+  inst_speed_values       = cells_corrected$corr_speed[!is.na(cells_corrected$corr_speed)]
 )
 
 cat(sprintf("\n  Ground truth targets (drift-corrected, %d cells):\n", nrow(cell_summaries)))
@@ -481,49 +488,59 @@ cat(sprintf("  Sweeping %s filter combinations...\n",
 vel_by_track <- split(tm_all_vel$inst_speed, tm_all_vel$TRACK_ID)
 
 # Evaluation function
-eval_combo <- function(min_spots, max_mean_speed, max_max_speed, max_gaps, quality_pctile) {
+eval_combo <- function(min_spots, max_mean_speed, max_max_speed, min_displacement, quality_pctile) {
   q_thresh <- quantile(tm_tracks$TRACK_MEAN_QUALITY, quality_pctile, na.rm = TRUE)
 
   passing <- tm_tracks %>%
     filter(NUMBER_SPOTS >= min_spots,
            SPEED_MEAN_UM_MIN <= max_mean_speed,
            SPEED_MAX_UM_MIN  <= max_max_speed,
-           NUMBER_GAPS <= max_gaps,
+           DISPLACEMENT_UM   >= min_displacement,
            TRACK_MEAN_QUALITY >= q_thresh)
 
   n <- nrow(passing)
   if (n < 5) return(list(n_tracks = n, inst_speed_median = NA,
-                          inst_speed_mean = NA, track_speed_median = NA))
+                          inst_speed_mean = NA, track_speed_median = NA,
+                          ks_stat = NA))
 
   passing_ids <- as.character(passing$TRACK_ID)
   all_speeds <- unlist(vel_by_track[passing_ids], use.names = FALSE)
 
+  # KS statistic: distribution similarity to ground truth (lower = more similar)
+  ks_stat <- tryCatch(
+    suppressWarnings(ks.test(all_speeds, GT$inst_speed_values)$statistic),
+    error = function(e) NA_real_
+  )
+
   list(n_tracks = n,
        inst_speed_median  = median(all_speeds, na.rm = TRUE),
        inst_speed_mean    = mean(all_speeds, na.rm = TRUE),
-       track_speed_median = median(passing$SPEED_MEAN_UM_MIN, na.rm = TRUE))
+       track_speed_median = median(passing$SPEED_MEAN_UM_MIN, na.rm = TRUE),
+       ks_stat            = unname(ks_stat))
 }
 
 # Run sweep
 sweep_results <- tibble(
-  min_spots      = param_grid$min_spots,
-  max_mean_speed = param_grid$max_mean_speed,
-  max_max_speed  = param_grid$max_max_speed,
-  max_gaps       = param_grid$max_gaps,
-  quality_pctile = param_grid$quality_pctile,
+  min_spots        = param_grid$min_spots,
+  max_mean_speed   = param_grid$max_mean_speed,
+  max_max_speed    = param_grid$max_max_speed,
+  min_displacement = param_grid$min_displacement,
+  quality_pctile   = param_grid$quality_pctile,
   n_tracks = NA_real_, inst_speed_median = NA_real_,
-  inst_speed_mean = NA_real_, track_speed_median = NA_real_
+  inst_speed_mean = NA_real_, track_speed_median = NA_real_,
+  ks_stat = NA_real_
 )
 
 pb <- txtProgressBar(min = 0, max = nrow(param_grid), style = 3)
 for (i in seq_len(nrow(param_grid))) {
   r <- eval_combo(param_grid$min_spots[i], param_grid$max_mean_speed[i],
-                  param_grid$max_max_speed[i], param_grid$max_gaps[i],
+                  param_grid$max_max_speed[i], param_grid$min_displacement[i],
                   param_grid$quality_pctile[i])
   sweep_results$n_tracks[i]          <- r$n_tracks
   sweep_results$inst_speed_median[i] <- r$inst_speed_median
   sweep_results$inst_speed_mean[i]   <- r$inst_speed_mean
   sweep_results$track_speed_median[i] <- r$track_speed_median
+  sweep_results$ks_stat[i]           <- r$ks_stat
   setTxtProgressBar(pb, i)
 }
 close(pb)
@@ -546,12 +563,15 @@ sweep_scored <- sweep_results %>%
     err_inst_median = abs(inst_speed_median - GT$inst_speed_median) / GT$inst_speed_median,
     err_inst_mean   = abs(inst_speed_mean   - GT$inst_speed_mean)   / GT$inst_speed_mean,
     err_track_speed = abs(track_speed_median - GT$track_mean_speed_median) / GT$track_mean_speed_median,
-    score = 0.4 * err_inst_median + 0.3 * err_inst_mean + 0.3 * err_track_speed,
+    ks_norm         = ifelse(is.na(ks_stat), 1, ks_stat),  # KS stat already 0-1
+    # Score: 30% inst median + 20% inst mean + 20% track speed + 30% KS distribution
+    score = 0.30 * err_inst_median + 0.20 * err_inst_mean +
+            0.20 * err_track_speed + 0.30 * ks_norm,
     frac_tracks = n_tracks / N_TOTAL_TRACKS
   ) %>%
   arrange(score)
 
-# Pareto front (always computed for visualisation)
+# --- Pareto front (always computed, used by both modes for plotting) ---
 identify_pareto <- function(df) {
   df <- df %>% arrange(score)
   is_pareto <- rep(TRUE, nrow(df))
@@ -570,8 +590,21 @@ pareto_front <- sweep_scored %>% filter(is_pareto) %>% arrange(score)
 cat(sprintf("  Valid combos: %d | Pareto-optimal: %d\n",
             nrow(sweep_scored), nrow(pareto_front)))
 
-# Select best
-if (SELECTION_METHOD == "pareto") {
+# --- Selection ---
+if (SELECTION_METHOD == "closest_gt") {
+  # ─── Mode 1: Pure GT match ─────────────────────────────────────────────
+  # Simply pick the combo with the lowest score (best GT match).
+  best <- sweep_scored[1, ]
+  score_cutoff <- best$score
+  cat(sprintf("  Closest-GT: score=%.4f, %s tracks (%.1f%% retained)\n",
+              best$score,
+              format(best$n_tracks, big.mark = ","),
+              best$frac_tracks * 100))
+
+} else if (SELECTION_METHOD == "pareto") {
+  # ─── Mode 2: Pareto knee — balance GT similarity & data retention ──────
+  # Normalise score (0 = best GT) and n_tracks (1 = most tracks) to [0,1],
+  # then pick the Pareto-front point closest to the ideal corner (0, 1).
   pareto_norm <- pareto_front %>%
     mutate(score_norm  = (score - min(score)) / (max(score) - min(score) + 1e-9),
            tracks_norm = (n_tracks - min(n_tracks)) / (max(n_tracks) - min(n_tracks) + 1e-9),
@@ -579,24 +612,18 @@ if (SELECTION_METHOD == "pareto") {
   best_idx <- which.min(pareto_norm$dist_to_ideal)
   best <- pareto_norm[best_idx, ]
   score_cutoff <- NA
-  cat(sprintf("  Pareto knee: score=%.4f, %s tracks\n",
-              best$score, format(best$n_tracks, big.mark = ",")))
+
+  # Also report what the pure-GT pick would have been
+  pure_gt <- sweep_scored[1, ]
+  cat(sprintf("  (For reference, closest_gt would give: score=%.4f, %s tracks)\n",
+              pure_gt$score, format(pure_gt$n_tracks, big.mark = ",")))
+  cat(sprintf("  Pareto knee:  score=%.4f, %s tracks (%.1f%% retained)\n",
+              best$score,
+              format(best$n_tracks, big.mark = ","),
+              best$frac_tracks * 100))
+
 } else {
-  score_cutoff <- SCORE_TOLERANCE
-  near_best <- sweep_scored %>% filter(score <= score_cutoff) %>% arrange(desc(n_tracks))
-  if (nrow(near_best) == 0) {
-    cat(sprintf("  WARNING: No combos within %.0f%% of GT. Using best available.\n",
-                SCORE_TOLERANCE * 100))
-    best <- sweep_scored[1, ]
-    score_cutoff <- best$score
-  } else {
-    best <- near_best[1, ]
-  }
-  best_idx <- NA
-  cat(sprintf("  GT tolerance: ±%.0f%% (score ≤ %.4f)\n", SCORE_TOLERANCE * 100, score_cutoff))
-  cat(sprintf("  Combos in range: %d\n", nrow(near_best)))
-  cat(sprintf("  Selected: score=%.4f, %s tracks\n",
-              best$score, format(best$n_tracks, big.mark = ",")))
+  stop(sprintf("Unknown SELECTION_METHOD='%s'. Use 'closest_gt' or 'pareto'.", SELECTION_METHOD))
 }
 
 cat(sprintf("\n  RECOMMENDED PARAMETERS:\n"))
@@ -604,7 +631,7 @@ cat(sprintf("  ┌────────────────────�
 cat(sprintf("  │  min_spots       = %-5d  (min detections per track)       │\n", best$min_spots))
 cat(sprintf("  │  max_mean_speed  = %-5.1f  µm/min                         │\n", best$max_mean_speed))
 cat(sprintf("  │  max_max_speed   = %-5.1f  µm/min                         │\n", best$max_max_speed))
-cat(sprintf("  │  max_gaps        = %-5.0f  (max frame gaps)               │\n", best$max_gaps))
+cat(sprintf("  │  min_displacement= %-5.1f  µm (min track displacement)    │\n", best$min_displacement))
 cat(sprintf("  │  quality_pctile  = %-5.0f%% (bottom quality removed)       │\n", best$quality_pctile * 100))
 cat(sprintf("  └─────────────────────────────────────────────────────────────┘\n"))
 cat(sprintf("\n  Closeness to ground truth:\n"))
@@ -615,6 +642,8 @@ cat(sprintf("    Inst speed mean:    %8.3f  %8.3f  %5.1f%%\n",
             best$inst_speed_mean, GT$inst_speed_mean, best$err_inst_mean * 100))
 cat(sprintf("    Track speed median: %8.3f  %8.3f  %5.1f%%\n",
             best$track_speed_median, GT$track_mean_speed_median, best$err_track_speed * 100))
+cat(sprintf("    KS statistic:       %8.3f  %8s  (distribution shape)\n",
+            best$ks_norm, "—"))
 cat(sprintf("  Tracks retained: %s / %s (%.1f%%)\n",
             format(best$n_tracks, big.mark = ","),
             format(N_TOTAL_TRACKS, big.mark = ","),
@@ -632,7 +661,7 @@ tm_filtered <- tm_tracks %>%
   filter(NUMBER_SPOTS >= best$min_spots,
          SPEED_MEAN_UM_MIN <= best$max_mean_speed,
          SPEED_MAX_UM_MIN  <= best$max_max_speed,
-         NUMBER_GAPS <= best$max_gaps,
+         DISPLACEMENT_UM   >= best$min_displacement,
          TRACK_MEAN_QUALITY >= q_thresh)
 
 tm_filtered_spots <- tm_spots %>%
@@ -676,11 +705,11 @@ marginal_data <- bind_rows(
     summarise(inst_median = median(inst_speed_median), track_median = median(track_speed_median),
               score_med = median(score), n_tracks_med = median(n_tracks), .groups = "drop") %>%
     mutate(param = "max_max_speed"),
-  sweep_scored %>% filter(is.finite(max_gaps)) %>%
-    group_by(value = max_gaps) %>%
+  sweep_scored %>%
+    group_by(value = min_displacement) %>%
     summarise(inst_median = median(inst_speed_median), track_median = median(track_speed_median),
               score_med = median(score), n_tracks_med = median(n_tracks), .groups = "drop") %>%
-    mutate(param = "max_gaps"),
+    mutate(param = "min_displacement"),
   sweep_scored %>%
     group_by(value = quality_pctile * 100) %>%
     summarise(inst_median = median(inst_speed_median), track_median = median(track_speed_median),
@@ -688,7 +717,7 @@ marginal_data <- bind_rows(
     mutate(param = "quality_%_removed")
 ) %>%
   mutate(param = factor(param, levels = c("min_spots", "max_mean_speed", "max_max_speed",
-                                           "max_gaps", "quality_%_removed")))
+                                           "min_displacement", "quality_%_removed")))
 
 # Row 1: Speed metrics vs GT
 marginal_speed <- marginal_data %>%
@@ -779,27 +808,44 @@ cat("  Saved: 02_parameter_heatmaps.pdf\n")
 
 # ─── PLOT 3: Pareto front ────────────────────────────────────────────────────
 
+# Also show the alternative pick for comparison on the plot
+if (SELECTION_METHOD == "pareto") {
+  alt_pick <- sweep_scored[1, ]  # closest-GT alternative
+  alt_label <- sprintf("closest_gt alternative\n%s tracks, score=%.3f",
+                       format(alt_pick$n_tracks, big.mark = ","), alt_pick$score)
+} else {
+  # For closest_gt mode, show where the Pareto knee would be
+  pareto_norm_tmp <- pareto_front %>%
+    mutate(score_norm  = (score - min(score)) / (max(score) - min(score) + 1e-9),
+           tracks_norm = (n_tracks - min(n_tracks)) / (max(n_tracks) - min(n_tracks) + 1e-9),
+           dist_to_ideal = sqrt(score_norm^2 + (1 - tracks_norm)^2))
+  alt_pick <- pareto_norm_tmp[which.min(pareto_norm_tmp$dist_to_ideal), ]
+  alt_label <- sprintf("pareto alternative\n%s tracks, score=%.3f",
+                       format(alt_pick$n_tracks, big.mark = ","), alt_pick$score)
+}
+
 p3 <- ggplot(sweep_scored, aes(x = n_tracks, y = score)) +
   geom_point(alpha = 0.08, size = 0.8, color = "grey50") +
   geom_point(data = pareto_front, color = "#E41A1C", size = 2) +
   geom_line(data = pareto_front, color = "#E41A1C", linewidth = 0.8) +
+  # Selected point
   geom_point(data = best, aes(x = n_tracks, y = score),
              color = "#2166AC", size = 5, shape = 18) +
-  {if (!is.na(score_cutoff))
-    geom_hline(yintercept = score_cutoff, linetype = "dotted",
-               color = "#2166AC", linewidth = 0.5)} +
-  {if (!is.na(score_cutoff))
-    annotate("text", x = min(sweep_scored$n_tracks), y = score_cutoff + 0.005,
-             label = sprintf("within %.0f%% of GT speeds", SCORE_TOLERANCE * 100),
-             hjust = 0, size = 2.5, color = "#2166AC")} +
   annotate("label", x = best$n_tracks, y = best$score + 0.02,
-           label = sprintf("SELECTED\n%s tracks, score=%.3f",
+           label = sprintf("SELECTED (%s)\n%s tracks, score=%.3f",
+                           SELECTION_METHOD,
                            format(best$n_tracks, big.mark = ","), best$score),
            size = 3, color = "#2166AC", fill = "white", label.size = 0.3) +
+  # Alternative point (dashed ring)
+  geom_point(data = alt_pick, aes(x = n_tracks, y = score),
+             color = "#FF7F00", size = 4, shape = 1, stroke = 1.2) +
+  annotate("label", x = alt_pick$n_tracks, y = alt_pick$score - 0.02,
+           label = alt_label,
+           size = 2.5, color = "#FF7F00", fill = "white", label.size = 0.2) +
   scale_x_log10(labels = comma) +
   labs(title = "Pareto Front: GT Similarity vs Data Retention",
-       subtitle = paste0("Red = Pareto front | Blue diamond = selected (",
-                         if (SELECTION_METHOD == "pareto") "knee" else "within GT tolerance", ")"),
+       subtitle = paste0("Red = Pareto front | Blue = selected (", SELECTION_METHOD,
+                         ") | Orange = alternative mode"),
        x = "Tracks retained (log)", y = "Score (lower = closer to GT)") +
   theme_pipe()
 
@@ -970,13 +1016,13 @@ if (file.exists(ts_path)) {
 write_csv(sweep_scored, file.path(OUTPUT_DIR, "sweep_results.csv"))
 write_csv(
   tibble(parameter   = c("min_spots", "max_mean_speed", "max_max_speed",
-                          "max_gaps", "quality_pctile_removed"),
+                          "min_displacement", "quality_pctile_removed"),
          value       = c(best$min_spots, best$max_mean_speed, best$max_max_speed,
-                          best$max_gaps, best$quality_pctile * 100),
+                          best$min_displacement, best$quality_pctile * 100),
          description = c("Min detections per track",
                           "Max per-track mean speed (µm/min)",
                           "Max per-track peak speed (µm/min)",
-                          "Max frame gaps per track",
+                          "Min track displacement (µm)",
                           "Bottom % quality removed")),
   file.path(OUTPUT_DIR, "recommended_params.csv"))
 

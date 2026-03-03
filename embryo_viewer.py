@@ -44,6 +44,7 @@ import argparse
 import os
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 # ── Wayland / DPI fixes for Fedora GNOME ──────────────────────────────────
@@ -235,19 +236,26 @@ def _fit_sphere_nls(pts: np.ndarray, cx0, cy0, cz0, R0) -> dict:
 
     p0 = np.array([cx0, cy0, cz0, R0], dtype=float)
 
-    r1 = minimize(
-        obj,
-        p0,
-        method="Nelder-Mead",
-        options={"maxiter": 80000, "xatol": 1e-6, "fatol": 1e-10},
-    )
-    r2 = minimize(
-        obj,
-        p0,
-        method="L-BFGS-B",
-        bounds=[(None, None)] * 3 + [(1.0, None)],
-        options={"maxiter": 50000},
-    )
+    # Run both optimisers in parallel — scipy releases the GIL during
+    # the C-level core of minimize, so threads give true parallelism.
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        future_nm = pool.submit(
+            minimize,
+            obj,
+            p0,
+            method="Nelder-Mead",
+            options={"maxiter": 80000, "xatol": 1e-6, "fatol": 1e-10},
+        )
+        future_lb = pool.submit(
+            minimize,
+            obj,
+            p0,
+            method="L-BFGS-B",
+            bounds=[(None, None)] * 3 + [(1.0, None)],
+            options={"maxiter": 50000},
+        )
+        r1 = future_nm.result()
+        r2 = future_lb.result()
 
     best = r2 if r2.fun < r1.fun else r1
     cx, cy, cz, R = best.x
@@ -289,13 +297,18 @@ def fit_sphere(
 
     surfs = extract_surface(x, y, z, grid_n=grid_n, quantile=surface_quantile)
 
-    # Fit upper surface
-    g_hi = _cap_initial_guess(surfs["upper"], surfs["thin_axis"], "upper")
-    fit_hi = _fit_sphere_nls(surfs["upper"], *g_hi["center"], g_hi["R"])
+    # Fit upper and lower surfaces in parallel — each fit runs two
+    # scipy.minimize calls internally (also threaded), giving up to 4×
+    # parallelism on the CPU-heavy optimisation stage.
+    def _fit_surface(side):
+        g = _cap_initial_guess(surfs[side], surfs["thin_axis"], side)
+        return _fit_sphere_nls(surfs[side], *g["center"], g["R"]), g
 
-    # Fit lower surface
-    g_lo = _cap_initial_guess(surfs["lower"], surfs["thin_axis"], "lower")
-    fit_lo = _fit_sphere_nls(surfs["lower"], *g_lo["center"], g_lo["R"])
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        fu = pool.submit(_fit_surface, "upper")
+        fl = pool.submit(_fit_surface, "lower")
+        fit_hi, g_hi = fu.result()
+        fit_lo, g_lo = fl.result()
 
     # Pick the better fit
     if fit_hi["rmse"] <= fit_lo["rmse"]:
@@ -654,25 +667,62 @@ def flag_ingressing(
         net_disp[sorted_df.index] = net_per_spot
 
         # Sustained inward: max consecutive frames with V_r < 0 (per track)
-        # This requires run-length logic so we iterate per track
+        # Fully vectorised using run-length grouping via cumsum — avoids
+        # expensive per-track Python iteration on large datasets.
         if "RADIAL_VELOCITY_SMOOTH" in sorted_df.columns:
-            for tid, grp in sorted_df.groupby("TRACK_ID"):
-                idx = grp.index
-                vr = grp["RADIAL_VELOCITY_SMOOTH"].values
-                max_run, cur_run, first_inward = 0, 0, np.nan
-                for j, v in enumerate(vr):
-                    if not np.isnan(v) and v < 0:
-                        cur_run += 1
-                        if cur_run == 1 and np.isnan(first_inward):
-                            first_inward = grp["FRAME"].values[j]
-                        if cur_run > max_run:
-                            max_run = cur_run
-                    else:
-                        if cur_run < 3:  # reset onset if run was too short
-                            first_inward = np.nan
-                        cur_run = 0
-                sustained_inward[idx] = max_run
-                onset_frame[idx] = first_inward
+            vr_arr = sorted_df["RADIAL_VELOCITY_SMOOTH"].values
+            frame_arr = sorted_df["FRAME"].values
+            tid_arr = sorted_df["TRACK_ID"].values
+            idx_arr = sorted_df.index.values
+            n_pts = len(vr_arr)
+
+            is_inward = (~np.isnan(vr_arr)) & (vr_arr < 0)
+            track_start = np.empty(n_pts, dtype=bool)
+            track_start[0] = True
+            track_start[1:] = tid_arr[1:] != tid_arr[:-1]
+
+            # Label each contiguous inward segment with a unique ID.
+            # A new segment starts whenever the cell is not moving inward
+            # or when a new track begins.
+            run_break = (~is_inward) | track_start
+            run_id = np.cumsum(run_break)
+
+            # Length of consecutive inward points per segment
+            run_inward_count = np.bincount(
+                run_id, weights=is_inward.astype(float)
+            )
+            streak_at_pos = run_inward_count[run_id].astype(int)
+            streak_at_pos[~is_inward] = 0
+
+            # Max streak per track (vectorised via pandas transform)
+            max_per_track = (
+                pd.Series(streak_at_pos, index=sorted_df.index)
+                .groupby(tid_arr)
+                .transform("max")
+                .values
+            )
+            sustained_inward[idx_arr] = max_per_track
+
+            # Onset frame: first frame of the first inward run with
+            # length >= 3 in each track.
+            run_start_mask = is_inward.copy()
+            run_start_mask[1:] &= (~is_inward[:-1]) | track_start[1:]
+            long_run_start = run_start_mask & (streak_at_pos >= 3)
+
+            if long_run_start.any():
+                onset_series = (
+                    pd.DataFrame(
+                        {"TRACK_ID": tid_arr, "FRAME": frame_arr},
+                        index=sorted_df.index,
+                    )
+                    .loc[long_run_start]
+                    .groupby("TRACK_ID")["FRAME"]
+                    .first()
+                )
+                onset_mapped = pd.Series(
+                    tid_arr, index=sorted_df.index
+                ).map(onset_series)
+                onset_frame[idx_arr] = onset_mapped.values
 
     df["TRACK_NET_RADIAL_DISP"] = net_disp
     df["TRACK_SUSTAINED_INWARD"] = sustained_inward
@@ -897,6 +947,11 @@ class EmbryoViewer:
         if self.spots is not None:
             self._add_spots_layer()
             self._add_tracks_layer()
+            # Start at frame 0 (napari defaults to midpoint of the range)
+            dims = list(self.viewer.dims.current_step)
+            dims[0] = 0
+            self.viewer.dims.current_step = tuple(dims)
+            self._update_max_tracks_slider()
 
         # ── Landmarks layer (3D so visible at every frame) ──
         self.landmarks_layer = self.viewer.add_points(
@@ -919,16 +974,20 @@ class EmbryoViewer:
         """Add the main nuclei points layer."""
         data, idx = self._build_display_points()
         self._display_idx = idx
-        colors = self._get_display_colors()
+
+        # Create layer with neutral defaults; _apply_spot_colors sets
+        # the actual colormap / face_color afterwards.
         self.spots_layer = self.viewer.add_points(
             data,
             name="Nuclei",
             size=2,
-            face_color=colors,
+            face_color="white",
             border_width=0,
             ndim=4,
             out_of_slice_display=False,
         )
+        self.spots_layer._set_view_slice()
+        self._apply_spot_colors()
 
     def _build_display_points(self):
         """Build display arrays, respecting display %, ROI and ingression filters."""
@@ -976,11 +1035,17 @@ class EmbryoViewer:
         )
         return data, idx
 
-    def _get_display_colors(self) -> np.ndarray:
-        """Compute face colors for the currently displayed subset based on current color mode."""
+    def _get_display_colors(self):
+        """Compute face colors for the currently displayed subset.
+
+        Returns either:
+        - ``(values_1d, colormap_name)`` for continuous modes that should
+          use napari's built-in colormap system (user-adjustable), or
+        - ``(rgba_Nx4, None)`` for categorical / custom-gradient modes.
+        """
         idx = self._display_idx
         if idx is None or self.spots is None:
-            return np.array([[0.5, 0.5, 0.5, 1.0]])
+            return np.array([[0.5, 0.5, 0.5, 1.0]]), None
         df = self.spots
         mode = self._current_color_mode
 
@@ -1011,15 +1076,91 @@ class EmbryoViewer:
                 colors[flags, 3] = 0.65 + 0.35 * t  # A: brighter when diving
             elif flags.any():
                 colors[flags] = [0.9, 0.2, 0.5, 0.85]  # flat magenta fallback
-            return colors
+            return colors, None
 
         if mode == "roi" and "IN_ROI" in df.columns:
             flags = df["IN_ROI"].values[idx].astype(bool)
             hi = np.array([1, 0.9, 0, 1])
             lo = np.array([0.5, 0.5, 0.5, 0.12])
-            return np.where(flags[:, None], hi, lo)
+            return np.where(flags[:, None], hi, lo), None
 
-        # ── Diverging mode ──
+        # ── Pole drift mode: per-track theta slope (robust) ──
+        # Blue = track drifted toward Animal Pole (theta slope < 0)
+        # Red  = track drifted toward Vegetal Pole (theta slope > 0)
+        # Uses linear regression slope of theta vs frame for robustness.
+        if mode == "pole_drift" and "THETA_DEG" in df.columns and "TRACK_ID" in df.columns:
+            slopes = self._compute_track_theta_slopes(df)
+            spot_tids = df["TRACK_ID"].values[idx]
+            drift = np.array([slopes.get(t, 0.0) for t in spot_tids], dtype=float)
+            drift = np.nan_to_num(drift, nan=0.0)
+            # Percentile-based normalisation (5th/95th) so outliers don't crush range
+            p5, p95 = np.percentile(drift[drift != 0], [5, 95]) if (drift != 0).any() else (-1, 1)
+            scale = max(abs(p5), abs(p95), 1e-6)
+            d_norm = np.clip(drift / scale, -1, 1)
+            n_pts = len(idx)
+            colors = np.zeros((n_pts, 4))
+            colors[:, 3] = 0.85
+            # Toward AP (negative slope → theta decreasing): blue
+            ap_mask = d_norm < -0.05
+            t_ap = np.clip(-d_norm[ap_mask], 0, 1)
+            colors[ap_mask, 0] = 0.2 * (1 - t_ap)
+            colors[ap_mask, 1] = 0.3 * (1 - t_ap)
+            colors[ap_mask, 2] = 0.4 + 0.6 * t_ap
+            colors[ap_mask, 3] = 0.5 + 0.5 * t_ap
+            # Toward VP (positive slope → theta increasing): red
+            vp_mask = d_norm > 0.05
+            t_vp = np.clip(d_norm[vp_mask], 0, 1)
+            colors[vp_mask, 0] = 0.4 + 0.6 * t_vp
+            colors[vp_mask, 1] = 0.2 * (1 - t_vp)
+            colors[vp_mask, 2] = 0.1 * (1 - t_vp)
+            colors[vp_mask, 3] = 0.5 + 0.5 * t_vp
+            # Neutral (near-zero slope): faint grey
+            neutral = (~ap_mask) & (~vp_mask)
+            colors[neutral] = [0.5, 0.5, 0.5, 0.12]
+            return colors, None
+
+        # ── Density mode: local nuclei density ──
+        # When sphere is fitted → geodesic (surface) density using
+        # angular coordinates on the sphere, so cells at the same
+        # surface location but different depths don't inflate counts.
+        # Otherwise → 3D Euclidean density.
+        # Uses adaptive radius (median k-NN distance) and caching.
+        if mode == "density":
+            d = self._compute_density(df)[idx]
+            # Percentile normalisation (2nd–98th) so outliers don't wash out
+            p2, p98 = np.percentile(d, [2, 98])
+            d_norm = np.clip((d - p2) / max(p98 - p2, 1e-6), 0, 1)
+            return d_norm, "inferno"
+
+        # ── Thickness mode: local shell thickness at each spot's position ──
+        # For each spot, the thickness is the radial span (P90 - P10) of
+        # neighbouring nuclei at the same angular position on the sphere.
+        # Thick = bright (yellow/white), thin = dark (purple/black).
+        if mode == "thickness" and "RADIAL_DIST" in df.columns:
+            tk = self._compute_local_thickness(df)
+            v = tk[idx]
+            p2, p98 = np.percentile(v[~np.isnan(v)], [2, 98]) if (~np.isnan(v)).any() else (0, 1)
+            v_norm = np.clip((v - p2) / max(p98 - p2, 1e-6), 0, 1)
+            return v_norm, "magma"
+
+        # ── Movement-type mode (downward / upward / concentric) ──
+        # Per-point classification using a local rolling window so that:
+        #  - Circular tracks are correctly green (high local phi, low net theta)
+        #  - Tracks switch color when their movement direction changes
+        # Red   = downward (local theta increasing → VP / vegetal)
+        # Blue  = upward   (local theta decreasing → AP / animal)
+        # Green = concentric / circular (primarily azimuthal / phi movement)
+        if mode == "move_type" and "THETA_DEG" in df.columns and "TRACK_ID" in df.columns:
+            cat = self._compute_per_point_movement_type(df)
+            cat_subset = cat[idx]
+            n_pts = len(idx)
+            colors = np.empty((n_pts, 4))
+            for c, rgba in self._MOVE_TYPE_RGBA.items():
+                mask = cat_subset == c
+                colors[mask] = rgba
+            return colors, None
+
+        # ── Diverging mode: radial velocity ──
         if mode == "radial_vel" and "RADIAL_VELOCITY_SMOOTH" in df.columns:
             v = df["RADIAL_VELOCITY_SMOOTH"].values[idx].copy()
             nan_mask = np.isnan(v)
@@ -1031,28 +1172,19 @@ class EmbryoViewer:
                 else 1.0
             )
             v_clip = np.clip(v / vmax, -1, 1)
-            colors = np.zeros((len(v), 4))
-            colors[:, 3] = 1.0
-            neg = v_clip < 0
-            pos = v_clip >= 0
-            t_neg = 1 + v_clip[neg]
-            colors[neg, 0] = t_neg
-            colors[neg, 1] = t_neg
-            colors[neg, 2] = 1.0
-            t_pos = v_clip[pos]
-            colors[pos, 0] = 1.0
-            colors[pos, 1] = 1.0 - t_pos
-            colors[pos, 2] = 1.0 - t_pos
-            colors[nan_mask] = [0.5, 0.5, 0.5, 0.3]
-            return colors
+            # Map [-1, 1] → [0, 1] for napari colormap
+            v_norm = (v_clip + 1) / 2
+            return v_norm, "PiYG"
 
         # ── Continuous modes ──
+        cmap = "viridis"
         if mode == "depth" and "SPHERICAL_DEPTH" in df.columns:
             v = df["SPHERICAL_DEPTH"].values[idx]
         elif mode == "theta" and "THETA_DEG" in df.columns:
             v = df["THETA_DEG"].values[idx]
         elif mode == "phi" and "PHI_DEG" in df.columns:
             v = df["PHI_DEG"].values[idx]
+            cmap = "twilight"  # cyclic colormap for azimuthal angle
         elif mode == "speed":
             v = self._compute_spot_speed()[idx]
         else:
@@ -1061,7 +1193,34 @@ class EmbryoViewer:
 
         v = v.astype(float)
         v_norm = (v - np.nanmin(v)) / max(np.nanmax(v) - np.nanmin(v), 1e-10)
-        return _viridis_colors(v_norm)
+        return v_norm, cmap
+
+    def _apply_spot_colors(self):
+        """Apply the result of _get_display_colors to the spots layer.
+
+        For continuous modes (return is ``(values_1d, colormap_name)``),
+        sets the values as a layer *property* and assigns the colormap
+        via napari's built-in system — this means the user can
+        interactively change the colormap from the layer controls panel.
+
+        For categorical / custom-RGBA modes (return is ``(rgba, None)``),
+        sets ``face_color`` directly as an RGBA array.
+        """
+        result = self._get_display_colors()
+        values, cmap_name = result
+
+        if cmap_name is not None:
+            # Continuous mode → use napari property-based colormap
+            self.spots_layer.properties = {"color_value": values}
+            self.spots_layer.face_color = "color_value"
+            self.spots_layer.face_colormap = cmap_name
+            self.spots_layer.face_contrast_limits = (
+                float(np.nanmin(values)),
+                float(np.nanmax(values)),
+            )
+        else:
+            # Categorical / custom-gradient mode → direct RGBA
+            self.spots_layer.face_color = values
 
     def _add_tracks_layer(self):
         """Add tracks as a napari Tracks layer."""
@@ -1269,6 +1428,116 @@ class EmbryoViewer:
                     self.tracks_layer = self.viewer.add_tracks(t_ing, **kw_ing)
             return
 
+        # ── Pole-drift tracks mode ──
+        if mode == "pole_drift" and "THETA_DEG" in df_t.columns:
+            slopes = self._compute_track_theta_slopes(df_t)
+            drift = np.array([slopes.get(t, 0.0) for t in df_t["TRACK_ID"].values])
+            drift = np.nan_to_num(drift, nan=0.0)
+            p5, p95 = np.percentile(drift[drift != 0], [5, 95]) if (drift != 0).any() else (-1, 1)
+            scale = max(abs(p5), abs(p95), 1e-6)
+            d_norm = np.clip(drift / scale, -1, 1)
+            color_val = (d_norm + 1) / 2
+            kw = dict(
+                name="Tracks",
+                tail_width=self._track_width,
+                tail_length=40,
+                color_by="color_value",
+                colormap="turbo",
+                properties={"color_value": color_val},
+            )
+            self.tracks_layer = self.viewer.add_tracks(tracks, **kw)
+            return
+
+        # ── Density tracks mode: color by local density ──
+        if mode == "density":
+            # Re-use same density engine as spots, applied to tracks df
+            density_all = self._compute_density(df_t)
+            p2, p98 = np.percentile(density_all, [2, 98])
+            d_norm = np.clip((density_all - p2) / max(p98 - p2, 1e-6), 0, 1)
+            kw = dict(
+                name="Tracks",
+                tail_width=self._track_width,
+                tail_length=40,
+                color_by="color_value",
+                colormap="inferno",
+                properties={"color_value": d_norm},
+            )
+            self.tracks_layer = self.viewer.add_tracks(tracks, **kw)
+            return
+
+        # ── Movement-type tracks: custom discrete colormap ──
+        # Single layer with a custom colormap mapping discrete categories
+        # to the exact intended colours (avoids multi-layer fragility and
+        # turbo mismatches).
+        #   0.00 → grey  (unclassified)
+        #   0.33 → green (circular / concentric)
+        #   0.67 → red   (downward / toward VP)
+        #   1.00 → blue  (upward / toward AP)
+        if mode == "move_type" and "THETA_DEG" in df_t.columns:
+            cat_int = self._compute_per_point_movement_type(df_t)
+
+            # Per-point coloring: each vertex gets the float value
+            # corresponding to its instantaneous movement classification.
+            # This lets a single track change colour over time as the
+            # cell transitions between circular / downward / upward.
+            cat_float_map = {0: 0.125, 1: 0.375, 2: 0.625, 3: 0.875}
+            cat = np.array(
+                [cat_float_map[c] for c in cat_int],
+                dtype=float,
+            )
+
+            # Build a discrete colormap: grey → green → red → blue
+            # napari zero-interpolation needs N+1 controls for N colors
+            # NOTE: Tracks layer requires colormap as a *string* name
+            # registered in AVAILABLE_COLORMAPS (Colormap objects are not
+            # hashable and cannot be used as dict keys).
+            from napari.utils.colormaps import Colormap as NapariColormap
+            from napari.utils.colormaps import AVAILABLE_COLORMAPS
+            move_cmap = NapariColormap(
+                colors=[
+                    [0.5, 0.5, 0.5, 0.3],   # grey   (unclassified)
+                    [0.1, 0.75, 0.3, 1.0],  # green  (circular)
+                    [0.9, 0.15, 0.1, 1.0],  # red    (downward)
+                    [0.15, 0.3, 0.9, 1.0],  # blue   (upward)
+                ],
+                controls=[0.0, 0.25, 0.5, 0.75, 1.0],
+                name="move_type",
+                interpolation="zero",
+            )
+            AVAILABLE_COLORMAPS["move_type"] = move_cmap
+
+            kw = dict(
+                name="Tracks",
+                tail_width=self._track_width,
+                tail_length=40,
+                color_by="color_value",
+                colormap="move_type",
+                properties={"color_value": cat},
+            )
+            self.tracks_layer = self.viewer.add_tracks(tracks, **kw)
+            return
+
+        # ── Thickness tracks mode: color by local shell thickness ──
+        if mode == "thickness" and "RADIAL_DIST" in df_t.columns:
+            thick_all = self._compute_local_thickness(df_t)
+            nan_m = np.isnan(thick_all)
+            if not nan_m.all():
+                thick_all[nan_m] = 0.0
+                p2, p98 = np.percentile(thick_all[~nan_m], [2, 98])
+                t_norm = np.clip(
+                    (thick_all - p2) / max(p98 - p2, 1e-6), 0, 1
+                )
+                kw = dict(
+                    name="Tracks",
+                    tail_width=self._track_width,
+                    tail_length=40,
+                    color_by="color_value",
+                    colormap="magma",
+                    properties={"color_value": t_norm},
+                )
+                self.tracks_layer = self.viewer.add_tracks(tracks, **kw)
+                return
+
         # ── Single-layer mode (all other colour modes) ──
         col_map = {
             "depth": "SPHERICAL_DEPTH",
@@ -1327,6 +1596,353 @@ class EmbryoViewer:
         dist = np.sqrt(dx**2 + dy**2 + dz**2)
         dt = np.maximum(df_v, 1.0)
         return np.where(same & (df_v > 0), dist / dt, np.nan)
+
+    @staticmethod
+    def _compute_track_theta_slopes(df: pd.DataFrame) -> dict:
+        """Linear-regression slope of THETA_DEG vs FRAME per track.
+
+        Returns dict mapping TRACK_ID → slope (deg/frame).
+        Positive slope = moving toward VP, negative = toward AP.
+        """
+        theta = df["THETA_DEG"].values.astype(float)
+        frame = df["FRAME"].values.astype(float)
+        tid = df["TRACK_ID"].values
+        sort_order = np.lexsort((frame, tid))
+        theta_s = theta[sort_order]
+        frame_s = frame[sort_order]
+        tid_s = tid[sort_order]
+        boundaries = np.where(np.diff(tid_s) != 0)[0] + 1
+        starts = np.concatenate([[0], boundaries])
+        ends = np.concatenate([boundaries, [len(tid_s)]])
+        slopes = {}
+        for s, e in zip(starts, ends):
+            if e - s < 3:
+                continue
+            f = frame_s[s:e]
+            t = theta_s[s:e]
+            valid = ~np.isnan(t)
+            if valid.sum() < 3:
+                continue
+            f_v, t_v = f[valid], t[valid]
+            f_mean = f_v.mean()
+            t_mean = t_v.mean()
+            num = ((f_v - f_mean) * (t_v - t_mean)).sum()
+            den = ((f_v - f_mean) ** 2).sum()
+            if den > 0:
+                slopes[tid_s[s]] = num / den
+        return slopes
+
+    @staticmethod
+    def _compute_track_phi_slopes(df: pd.DataFrame) -> dict:
+        """Linear-regression slope of PHI_DEG vs FRAME per track.
+
+        Returns dict mapping TRACK_ID → slope (deg/frame).
+        Handles the ±180° wraparound by using unwrapped angles.
+        """
+        phi = df["PHI_DEG"].values.astype(float)
+        frame = df["FRAME"].values.astype(float)
+        tid = df["TRACK_ID"].values
+        sort_order = np.lexsort((frame, tid))
+        phi_s = phi[sort_order]
+        frame_s = frame[sort_order]
+        tid_s = tid[sort_order]
+        boundaries = np.where(np.diff(tid_s) != 0)[0] + 1
+        starts = np.concatenate([[0], boundaries])
+        ends = np.concatenate([boundaries, [len(tid_s)]])
+        slopes = {}
+        for s, e in zip(starts, ends):
+            if e - s < 3:
+                continue
+            f = frame_s[s:e]
+            p = phi_s[s:e]
+            valid = ~np.isnan(p)
+            if valid.sum() < 3:
+                continue
+            f_v = f[valid]
+            p_v = np.unwrap(np.radians(p[valid]))  # unwrap to handle ±180°
+            p_v = np.degrees(p_v)
+            f_mean = f_v.mean()
+            p_mean = p_v.mean()
+            num = ((f_v - f_mean) * (p_v - p_mean)).sum()
+            den = ((f_v - f_mean) ** 2).sum()
+            if den > 0:
+                slopes[tid_s[s]] = num / den
+        return slopes
+
+    @staticmethod
+    def _compute_per_point_movement_type(
+        df: pd.DataFrame, half_window: int = 20
+    ) -> np.ndarray:
+        """Per-point local movement classification via rolling window.
+
+        For each point in a track, looks at the **net theta displacement**
+        over a symmetric window of ±half_window frames.  A wider window
+        (default 20 = 40-frame span) captures the drift direction while
+        smoothing out the circular/gear-like oscillations that cells
+        exhibit during convergence.
+
+        Classification uses *drift efficiency*: the fraction of the
+        cumulative |d_theta| steps that translates into net displacement.
+        High efficiency = directed movement, low = circular/oscillatory.
+
+        Returns an (N,) integer array:
+          0 = unclassified (grey)
+          1 = concentric / circular (green)
+          2 = downward / toward VP (red)
+          3 = upward / toward AP (blue)
+        """
+        n = len(df)
+        result = np.zeros(n, dtype=np.int8)
+        if "THETA_DEG" not in df.columns or "TRACK_ID" not in df.columns:
+            return result
+
+        theta = df["THETA_DEG"].values.astype(float)
+        frame = df["FRAME"].values.astype(float)
+        tid = df["TRACK_ID"].values
+
+        sort_order = np.lexsort((frame, tid))
+        theta_s = theta[sort_order]
+        tid_s = tid[sort_order]
+
+        boundaries = np.where(np.diff(tid_s) != 0)[0] + 1
+        starts = np.concatenate([[0], boundaries])
+        ends = np.concatenate([boundaries, [len(tid_s)]])
+
+        cat = np.zeros(n, dtype=np.int8)
+
+        # Drift threshold: what fraction of the cumulative |d_theta|
+        # steps must translate into net displacement to count as
+        # directed rather than circular.  30% is generous enough to
+        # pick up the convergence/epiboly straight-line flows while
+        # keeping the gear-like oscillations green.
+        drift_threshold = 0.30
+
+        for s, e in zip(starts, ends):
+            length = e - s
+            if length < 3:
+                continue
+
+            t_seg = theta_s[s:e]
+
+            # Pre-compute step-by-step |d_theta| for efficient windowed sums
+            abs_dt = np.abs(np.diff(t_seg))
+
+            for j in range(length):
+                lo = max(0, j - half_window)
+                hi = min(length, j + half_window + 1)
+                if hi - lo < 2:
+                    continue
+
+                # Net theta displacement over the window
+                net_theta = t_seg[hi - 1] - t_seg[lo]  # degrees
+
+                # Cumulative absolute step-by-step theta changes
+                path_theta = abs_dt[lo : hi - 1].sum()
+
+                if path_theta < 0.5:  # negligible motion → unclassified
+                    continue
+
+                # Drift efficiency: 1.0 = perfectly straight, 0.0 = returns
+                efficiency = abs(net_theta) / path_theta
+
+                if efficiency > drift_threshold:
+                    if net_theta > 0:  # theta increasing → toward VP
+                        cat[s + j] = 2
+                    else:              # theta decreasing → toward AP
+                        cat[s + j] = 3
+                else:
+                    cat[s + j] = 1  # circular / oscillatory
+
+        # Map back from sorted order to original order
+        result[sort_order] = cat
+        return result
+
+    _MOVE_TYPE_RGBA = {
+        0: np.array([0.5, 0.5, 0.5, 0.12]),    # unclassified grey
+        1: np.array([0.1, 0.75, 0.3, 0.85]),   # concentric green
+        2: np.array([0.9, 0.15, 0.1, 0.85]),   # downward red
+        3: np.array([0.15, 0.3, 0.9, 0.85]),   # upward blue
+    }
+
+    def _compute_density(self, df: pd.DataFrame) -> np.ndarray:
+        """Per-spot local nuclei density, computed per frame.
+
+        Strategy adapts to available data:
+
+        **Geodesic (surface) mode** — when the sphere is fitted and
+        THETA_DEG / PHI_DEG exist.  Angular coordinates on the fitted
+        sphere capture *surface* density, which is biologically
+        meaningful for epiblast cells: two cells at the same (θ, φ) but
+        different depths are the same surface neighbour, while cells far
+        apart on the surface but at the same radius are not.  Coordinates
+        are converted to unit-sphere XYZ for fast Euclidean KD-tree
+        queries; an angular radius is used so results are in
+        steradians-equivalent.
+
+        **Euclidean 3D mode** — fallback when no sphere is fitted.
+        Straightforward 3D neighbour counting.
+
+        In both cases:
+        - **Adaptive radius**: median 15-th nearest-neighbour distance on
+          a 5 000-point subsample → captures the natural inter-nuclear
+          spacing without manual tuning.
+        - **count_neighbors** instead of query_ball_point → C-level loop,
+          no Python list allocation per point.
+        - Parallel workers for all KD-tree ops.
+
+        Returns a float array of length ``len(df)`` with the raw
+        neighbour count per spot.
+        """
+        from scipy.spatial import cKDTree
+
+        n = len(df)
+        density = np.zeros(n, dtype=float)
+        frames = df["FRAME"].values
+
+        # Choose coordinate system
+        use_geodesic = (
+            self.sphere_fit_result is not None
+            and "THETA_DEG" in df.columns
+            and "PHI_DEG" in df.columns
+        )
+
+        if use_geodesic:
+            theta_rad = np.radians(df["THETA_DEG"].values.astype(float))
+            phi_rad = np.radians(df["PHI_DEG"].values.astype(float))
+            # Map to unit-sphere Cartesian (Euclidean distance ≈ chord ≈
+            # angular distance for the radii we use)
+            coords = np.column_stack([
+                np.sin(theta_rad) * np.cos(phi_rad),
+                np.sin(theta_rad) * np.sin(phi_rad),
+                np.cos(theta_rad),
+            ])
+        else:
+            coords = np.column_stack([
+                df["POSITION_X"].values.astype(float),
+                df["POSITION_Y"].values.astype(float),
+                df["POSITION_Z"].values.astype(float),
+            ])
+
+        unique_frames = np.unique(frames)
+
+        # ── Determine adaptive radius from a representative frame ──
+        # Pick the frame closest to the median spot count.
+        frame_sizes = {fr: (frames == fr).sum() for fr in unique_frames}
+        median_size = np.median(list(frame_sizes.values()))
+        ref_frame = min(unique_frames, key=lambda f: abs(frame_sizes[f] - median_size))
+        ref_mask = frames == ref_frame
+        ref_pts = coords[ref_mask]
+
+        k_nn = min(16, len(ref_pts) - 1)
+        if k_nn < 2:
+            return density  # too few points
+
+        # Subsample for speed if very large
+        if len(ref_pts) > 5000:
+            rng = np.random.default_rng(42)
+            sub_idx = rng.choice(len(ref_pts), 5000, replace=False)
+            sub_pts = ref_pts[sub_idx]
+        else:
+            sub_pts = ref_pts
+
+        tree_ref = cKDTree(sub_pts)
+        dists, _ = tree_ref.query(sub_pts, k=k_nn + 1, workers=-1)
+        # dists[:, 0] is self (0); column k_nn is the k-th neighbour
+        radius = float(np.median(dists[:, k_nn]))
+        # Ensure a sensible minimum
+        radius = max(radius, 1e-6)
+
+        # ── Count neighbours per frame ──
+        for fr in unique_frames:
+            mask_fr = frames == fr
+            pts_fr = coords[mask_fr]
+            n_fr = len(pts_fr)
+            if n_fr < 2:
+                continue
+            tree = cKDTree(pts_fr)
+            # count_neighbors returns total pairs; per-point count via
+            # count_neighbors with another=self gives scalar, so use
+            # query_ball_point with return_length (scipy ≥ 1.6) or
+            # the fast count_neighbors approach.
+            # query_ball_point is fine — we just need the count.
+            counts = tree.query_ball_point(
+                pts_fr, r=radius, workers=-1, return_length=True
+            )
+            density[mask_fr] = counts - 1  # subtract self
+
+        return density
+
+    def _compute_local_thickness(self, df: pd.DataFrame) -> np.ndarray:
+        """Per-spot local shell thickness (radial span of nearby nuclei).
+
+        For each frame, bins nuclei by angular position (theta, phi) on
+        the sphere surface.  The local thickness at each spot is the
+        radial span (P90 - P10 of RADIAL_DIST) of nuclei sharing the
+        same angular bin.  This captures how thick the cell sheet is at
+        that surface location.
+
+        Falls back to 3D kNN radial span if theta/phi are unavailable.
+        """
+        n = len(df)
+        thickness = np.full(n, np.nan)
+
+        if "RADIAL_DIST" not in df.columns:
+            return thickness
+
+        r = df["RADIAL_DIST"].values.astype(float)
+        frames = df["FRAME"].values
+
+        # Angular binning (5° bins ≈ matching spatial scale)
+        has_angular = "THETA_DEG" in df.columns and "PHI_DEG" in df.columns
+        if has_angular:
+            theta = df["THETA_DEG"].values.astype(float)
+            phi = df["PHI_DEG"].values.astype(float)
+            BIN_DEG = 5.0
+            theta_bin = np.floor(theta / BIN_DEG).astype(int)
+            phi_bin = np.floor(phi / BIN_DEG).astype(int)
+
+            for fr in np.unique(frames):
+                mask_fr = frames == fr
+                idx_fr = np.where(mask_fr)[0]
+                tb = theta_bin[mask_fr]
+                pb = phi_bin[mask_fr]
+                r_fr = r[mask_fr]
+
+                # Group by (theta_bin, phi_bin)
+                keys = tb * 1000 + pb  # unique combined key
+                unique_keys = np.unique(keys)
+                for k in unique_keys:
+                    k_mask = keys == k
+                    r_patch = r_fr[k_mask]
+                    if len(r_patch) >= 3:
+                        span = np.percentile(r_patch, 90) - np.percentile(r_patch, 10)
+                    elif len(r_patch) >= 2:
+                        span = r_patch.max() - r_patch.min()
+                    else:
+                        span = 0.0
+                    thickness[idx_fr[k_mask]] = span
+        else:
+            # Fallback: 3D kNN approach
+            from scipy.spatial import cKDTree
+            k_nn = 20
+            for fr in np.unique(frames):
+                mask_fr = frames == fr
+                idx_fr = np.where(mask_fr)[0]
+                pts = np.column_stack([
+                    df["POSITION_X"].values[mask_fr],
+                    df["POSITION_Y"].values[mask_fr],
+                    df["POSITION_Z"].values[mask_fr],
+                ])
+                r_fr = r[mask_fr]
+                if len(pts) < k_nn + 1:
+                    continue
+                tree = cKDTree(pts)
+                _, nn_idx = tree.query(pts, k=k_nn + 1, workers=-1)
+                for i in range(len(pts)):
+                    nb_r = r_fr[nn_idx[i, 1:]]  # skip self
+                    thickness[idx_fr[i]] = np.percentile(nb_r, 90) - np.percentile(nb_r, 10)
+
+        return thickness
 
     def _remove_layer(self, attr_name: str):
         """Safely remove a napari layer stored as self.<attr_name>."""
@@ -1438,6 +2054,7 @@ class EmbryoViewer:
             msg += " (no TRACK_ID)"
         self.lbl_spots_status.value = msg
         self.viewer.status = msg + " | Use time slider at bottom to scrub frames"
+        self._update_max_tracks_slider()
         self._reset_downstream()
         self.viewer.reset_view()
 
@@ -1512,7 +2129,7 @@ class EmbryoViewer:
         self.display_pct_slider.changed.connect(self._on_display_pct_changed)
 
         self.max_tracks_slider = FloatSlider(
-            value=5000, min=100, max=20000, step=500, label="Max tracks"
+            value=5000, min=100, max=500000, step=1000, label="Max tracks"
         )
         self.max_tracks_slider.changed.connect(self._on_max_tracks_changed)
 
@@ -1617,13 +2234,23 @@ class EmbryoViewer:
         btn_color_ingress.changed.connect(lambda: self._recolor("ingressing"))
         btn_color_roi = PushButton(text="Colour ROI")
         btn_color_roi.changed.connect(lambda: self._recolor("roi"))
+        btn_color_pole = PushButton(text="Colour AP ↔ VP Drift")
+        btn_color_pole.changed.connect(lambda: self._recolor("pole_drift"))
+        btn_color_movetype = PushButton(text="Colour Movement Type")
+        btn_color_movetype.changed.connect(lambda: self._recolor("move_type"))
+        btn_color_density = PushButton(text="Colour by Density")
+        btn_color_density.changed.connect(lambda: self._recolor("density"))
+        btn_color_thickness = PushButton(text="Colour by Thickness")
+        btn_color_thickness.changed.connect(lambda: self._recolor("thickness"))
 
         # ── Export & Video ──
         btn_export = PushButton(text="Export Enriched CSV")
         btn_export.changed.connect(self._export)
         self.lbl_export = Label(value="")
-        btn_record_video = PushButton(text="🎬 Record Time-lapse Video")
+        btn_record_video = PushButton(text="\U0001f3ac Record Time-lapse Video")
         btn_record_video.changed.connect(self._record_video)
+        btn_snapshot = PushButton(text="\U0001f4f8 Snapshot PDF")
+        btn_snapshot.changed.connect(self._snapshot_pdf)
 
         container = Container(
             widgets=[
@@ -1673,9 +2300,14 @@ class EmbryoViewer:
                 btn_color_radvel,
                 btn_color_ingress,
                 btn_color_roi,
+                btn_color_pole,
+                btn_color_movetype,
+                btn_color_density,
+                btn_color_thickness,
                 Label(value="── Export & Video ──"),
                 btn_export,
                 btn_record_video,
+                btn_snapshot,
                 self.lbl_export,
             ]
         )
@@ -1931,6 +2563,9 @@ class EmbryoViewer:
             "radial_vel": "RADIAL_VELOCITY_SMOOTH",
             "ingressing": "INGRESSING",
             "roi": "IN_ROI",
+            "pole_drift": "THETA_DEG",
+            "move_type": "THETA_DEG",
+            "thickness": "RADIAL_DIST",
         }
         if mode in needed and needed[mode] not in df.columns:
             self.viewer.status = (
@@ -1947,8 +2582,11 @@ class EmbryoViewer:
         data, idx = self._build_display_points()
         self._display_idx = idx
         self.spots_layer.data = data
-        colors = self._get_display_colors()
-        self.spots_layer.face_color = colors
+        # Force synchronous recomputation of _indices_view so it matches
+        # the new data size before setting face_color (which triggers a
+        # vispy redraw that reads _view_data via _indices_view).
+        self.spots_layer._set_view_slice()
+        self._apply_spot_colors()
         self._rebuild_tracks()
         self.viewer.status = f"Coloured by {mode}"
 
@@ -1981,16 +2619,53 @@ class EmbryoViewer:
     # ── Ingression analysis ───────────────────────────────────────────
 
     def _compute_radial_velocity(self):
-        """Compute per-spot radial velocity relative to the fitted sphere."""
+        """Compute per-spot radial velocity relative to the fitted sphere.
+
+        Runs in a background thread to keep the GUI responsive.
+        """
         if self.sphere_fit_result is None:
             self.viewer.status = "Fit sphere first!"
             return
         if self.spots is None:
             return
 
-        center = self.sphere_fit_result["center"]
-        self.viewer.status = "Computing smoothed radial velocity..."
-        self.spots = compute_radial_velocity(self.spots, center, smooth_window=5)
+        from qtpy.QtCore import QTimer
+
+        center = self.sphere_fit_result["center"].copy()
+        spots_copy = self.spots.copy()
+
+        self.lbl_ingression.value = "⏳ Computing radial velocity..."
+        self.viewer.status = "Computing smoothed radial velocity in background..."
+
+        self._pending_rv_result = None
+        self._pending_rv_err = None
+
+        def _bg():
+            try:
+                self._pending_rv_result = compute_radial_velocity(
+                    spots_copy, center, smooth_window=5
+                )
+            except Exception as e:
+                self._pending_rv_err = str(e)
+
+        t = threading.Thread(target=_bg, daemon=True)
+        t.start()
+
+        def _poll():
+            if t.is_alive():
+                QTimer.singleShot(200, _poll)
+                return
+            if self._pending_rv_err:
+                self.lbl_ingression.value = f"Error: {self._pending_rv_err}"
+                self.viewer.status = "Radial velocity computation failed"
+                return
+            self._finish_radial_velocity(self._pending_rv_result)
+
+        QTimer.singleShot(200, _poll)
+
+    def _finish_radial_velocity(self, result_df):
+        """Finalise radial velocity computation on the main thread."""
+        self.spots = result_df
 
         rv = self.spots["RADIAL_VELOCITY_SMOOTH"].values
         valid = ~np.isnan(rv)
@@ -2025,52 +2700,100 @@ class EmbryoViewer:
         self.viewer.status = f"Auto-threshold: {desc}"
 
     def _flag_ingression(self):
-        """Flag ingressing cells based on multi-criteria detection."""
+        """Flag ingressing cells based on multi-criteria detection.
+
+        Runs in a background thread to keep the GUI responsive.
+        """
         if "RADIAL_VELOCITY" not in self.spots.columns:
             self.viewer.status = "Compute radial velocity first!"
             return
 
+        from qtpy.QtCore import QTimer
+
+        # Read UI values on the main thread before spawning worker
         thresh = self.ingression_threshold.value
         min_f = int(self.ingression_min_frames.value)
         inward_frac = self.ingression_inward_frac.value
-        self.spots = flag_ingressing(
-            self.spots,
-            threshold=thresh,
-            min_track_frames=min_f,
-            min_inward_fraction=inward_frac,
-        )
+        roi_only = self.ingression_roi_only.value
+        roi_bounds = dict(self._roi_bounds) if self._roi_bounds is not None else None
+        spots_copy = self.spots.copy()
 
-        # If "Flag only within ROI" is checked, apply two spatial filters:
-        #
-        #  (1) ROI PRESENCE — the track must have ≥1 spot inside the ROI
-        #      box.  This removes false positives near the animal pole
-        #      (entirely above the box) while preserving tracks that start
-        #      outside the ROI and later migrate down into the marginal
-        #      zone during ingression.
-        #
-        #  (2) VEGETAL BREACH — any track where ANY spot crosses past the
-        #      vegetal boundary (y_max, after orientation +Y = vegetal) is
-        #      epiboly / spreading, not ingression, so it is excluded.
-        #
-        if self.ingression_roi_only.value and self._roi_bounds is not None:
-            b = self._roi_bounds
-            df = self.spots
+        self.lbl_ingression.value = "⏳ Flagging ingressing cells..."
+        self.viewer.status = "Running ingression detection in background..."
 
-            # (1) Track must touch the ROI at least once
-            in_box = (
-                (df["POSITION_X"] >= b["x_min"])
-                & (df["POSITION_X"] <= b["x_max"])
-                & (df["POSITION_Y"] >= b["y_min"])
-                & (df["POSITION_Y"] <= b["y_max"])
+        self._pending_ing_result = None
+        self._pending_ing_err = None
+
+        def _bg():
+            try:
+                result = flag_ingressing(
+                    spots_copy,
+                    threshold=thresh,
+                    min_track_frames=min_f,
+                    min_inward_fraction=inward_frac,
+                )
+
+                # Apply ROI spatial filtering (no Qt access needed)
+                if roi_only and roi_bounds is not None:
+                    b = roi_bounds
+                    in_box = (
+                        (result["POSITION_X"] >= b["x_min"])
+                        & (result["POSITION_X"] <= b["x_max"])
+                        & (result["POSITION_Y"] >= b["y_min"])
+                        & (result["POSITION_Y"] <= b["y_max"])
+                    )
+                    track_ever_in_box = in_box.groupby(
+                        result["TRACK_ID"]
+                    ).transform("any")
+                    result.loc[~track_ever_in_box, "INGRESSING"] = False
+
+                    vegetal_breach = (
+                        result.groupby("TRACK_ID")["POSITION_Y"].transform("max")
+                        > b["y_max"]
+                    )
+                    result.loc[vegetal_breach, "INGRESSING"] = False
+
+                self._pending_ing_result = result
+            except Exception as e:
+                self._pending_ing_err = str(e)
+
+        t = threading.Thread(target=_bg, daemon=True)
+        t.start()
+
+        def _poll():
+            if t.is_alive():
+                QTimer.singleShot(200, _poll)
+                return
+            if self._pending_ing_err:
+                self.lbl_ingression.value = f"Error: {self._pending_ing_err}"
+                self.viewer.status = (
+                    f"Ingression detection failed: {self._pending_ing_err}"
+                )
+                return
+            self._finish_flag_ingression(thresh, inward_frac, min_f, roi_only)
+
+        QTimer.singleShot(200, _poll)
+
+    def _finish_flag_ingression(self, thresh, inward_frac, min_f, roi_only):
+        """Finalise ingression flagging on the main thread."""
+        self.spots = self._pending_ing_result
+
+        # ── TRACK_IN_ROI: flag tracks that overlap with the ROI box ──
+        if (
+            "IN_ROI" in self.spots.columns
+            and "TRACK_ID" in self.spots.columns
+        ):
+            roi_track_ids = set(
+                self.spots.loc[
+                    self.spots["IN_ROI"].astype(bool), "TRACK_ID"
+                ].dropna().unique()
             )
-            track_ever_in_box = in_box.groupby(df["TRACK_ID"]).transform("any")
-            self.spots.loc[~track_ever_in_box, "INGRESSING"] = False
-
-            # (2) Exclude tracks breaching the vegetal boundary
-            vegetal_breach = (
-                df.groupby("TRACK_ID")["POSITION_Y"].transform("max") > b["y_max"]
+            self.spots["TRACK_IN_ROI"] = (
+                self.spots["TRACK_ID"].isin(roi_track_ids)
             )
-            self.spots.loc[vegetal_breach, "INGRESSING"] = False
+            n_roi_tracks = len(roi_track_ids)
+        else:
+            n_roi_tracks = None
 
         n_ing = int(self.spots["INGRESSING"].sum())
         n_total = len(self.spots)
@@ -2080,10 +2803,13 @@ class EmbryoViewer:
                 self.spots.loc[self.spots["INGRESSING"], "TRACK_ID"].nunique()
             )
         pct = n_ing / max(n_total, 1) * 100
-        roi_tag = " [ROI-only]" if self.ingression_roi_only.value else ""
+        roi_tag = " [ROI-only]" if roi_only else ""
+        roi_info = (
+            f" | {n_roi_tracks} tracks in ROI" if n_roi_tracks is not None else ""
+        )
         self.lbl_ingression.value = (
             f"Ingressing: {n_ing:,} spots ({n_tracks} tracks, {pct:.1f}%){roi_tag}\n"
-            f"V_r≤{thresh:.3f}, inward≥{inward_frac:.0%}, ≥{min_f}f, net-in+sustained"
+            f"V_r≤{thresh:.3f}, inward≥{inward_frac:.0%}, ≥{min_f}f, net-in+sustained{roi_info}"
         )
         self.viewer.status = (
             f"Flagged {n_ing:,} ingressing spots ({n_tracks} tracks){roi_tag}. "
@@ -2109,9 +2835,12 @@ class EmbryoViewer:
             return
         data, idx = self._build_display_points()
         self._display_idx = idx
-        colors = self._get_display_colors()
         self.spots_layer.data = data
-        self.spots_layer.face_color = colors
+        # Force synchronous recomputation of _indices_view so it matches
+        # the new data size before setting face_color (which triggers a
+        # vispy redraw that reads _view_data via _indices_view).
+        self.spots_layer._set_view_slice()
+        self._apply_spot_colors()
 
     def _refresh_tracks(self):
         """Update the tracks layer after orientation or slider change."""
@@ -2127,6 +2856,23 @@ class EmbryoViewer:
         """Handle max tracks slider change (debounced)."""
         self._max_tracks = int(self.max_tracks_slider.value)
         self._schedule_track_rebuild()
+
+    def _update_max_tracks_slider(self):
+        """Adapt the max-tracks slider range to the loaded dataset."""
+        n_tracks = 0
+        if self.spots is not None and "TRACK_ID" in self.spots.columns:
+            n_tracks = int(self.spots["TRACK_ID"].nunique())
+        if n_tracks < 100:
+            return
+        # Round up to nearest 1000 for a clean slider max
+        slider_max = int(np.ceil(n_tracks / 1000) * 1000)
+        # Sensible step: ~200 steps across the range
+        step = max(100, int(np.ceil(slider_max / 200 / 100) * 100))
+        self.max_tracks_slider.max = slider_max
+        self.max_tracks_slider.step = step
+        # If current value exceeds new max, clamp it
+        if self.max_tracks_slider.value > slider_max:
+            self.max_tracks_slider.value = slider_max
 
     def _on_track_width_changed(self):
         """Handle track width slider change (debounced)."""
@@ -2523,6 +3269,10 @@ class EmbryoViewer:
                                 track_summary[f"mean_{sc}"] = grp[sc].mean()
                         if "IN_ROI" in spots_df.columns:
                             track_summary["IN_ROI"] = grp["IN_ROI"].any()
+                        if "TRACK_IN_ROI" in spots_df.columns:
+                            track_summary["TRACK_IN_ROI"] = grp[
+                                "TRACK_IN_ROI"
+                            ].first()
                         track_summary.to_csv(out_dir / "track_summary.csv")
                         files_written.append("track_summary.csv")
 
@@ -2583,6 +3333,119 @@ class EmbryoViewer:
             self.viewer.status = f"Exported: {', '.join(files)}"
 
         QTimer.singleShot(500, _poll)
+
+    def _snapshot_pdf(self):
+        """Capture the current view as a high-quality PDF for presentations.
+
+        Saves a 4× resolution screenshot embedded in a tight PDF figure
+        with no axes, margins, or borders.  Also saves a companion PNG.
+        """
+        from qtpy.QtWidgets import QFileDialog
+
+        path, _ = QFileDialog.getSaveFileName(
+            None,
+            "Save Snapshot as PDF",
+            str(Path("analysis_output") / "snapshot.pdf"),
+            "PDF Files (*.pdf);;All Files (*)",
+        )
+        if not path:
+            return
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        self.viewer.status = "Capturing high-resolution snapshot\u2026"
+        self.lbl_export.value = "Saving snapshot\u2026"
+
+        # Capture at 4\u00d7 native resolution for crisp output
+        try:
+            img = self.viewer.screenshot(canvas_only=True, scale=4)
+        except TypeError:
+            # Older napari without scale kwarg
+            img = self.viewer.screenshot(canvas_only=True)
+
+        # Drop alpha channel for PDF compatibility
+        if img.ndim == 3 and img.shape[2] == 4:
+            img = img[:, :, :3]
+
+        # ── Auto-crop: trim black borders so the embryo fills the frame ──
+        # A pixel is considered "content" if any channel exceeds a low
+        # threshold (accounts for faint tracks / translucent points).
+        brightness = img.max(axis=2)  # per-pixel max across RGB
+        content_mask = brightness > 12  # threshold out near-black
+        if content_mask.any():
+            rows = np.any(content_mask, axis=1)
+            cols = np.any(content_mask, axis=0)
+            r_min, r_max = np.where(rows)[0][[0, -1]]
+            c_min, c_max = np.where(cols)[0][[0, -1]]
+            # Add ~5% padding so the embryo doesn't touch the edge
+            pad_r = max(int((r_max - r_min) * 0.05), 10)
+            pad_c = max(int((c_max - c_min) * 0.05), 10)
+            r_min = max(r_min - pad_r, 0)
+            r_max = min(r_max + pad_r, img.shape[0] - 1)
+            c_min = max(c_min - pad_c, 0)
+            c_max = min(c_max + pad_c, img.shape[1] - 1)
+            img = img[r_min : r_max + 1, c_min : c_max + 1]
+
+        try:
+            import matplotlib
+            matplotlib.use("Agg")  # non-interactive backend
+            import matplotlib.pyplot as plt
+
+            h, w = img.shape[:2]
+            dpi = 300
+            fig_w = w / dpi
+            fig_h = h / dpi
+
+            fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=dpi)
+            ax.imshow(img)
+            ax.set_axis_off()
+            fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
+
+            fig.savefig(
+                str(path),
+                format="pdf",
+                dpi=dpi,
+                bbox_inches="tight",
+                pad_inches=0,
+                facecolor="black",
+            )
+            plt.close(fig)
+
+            # Also save a high-res PNG companion
+            png_path = path.with_suffix(".png")
+            fig2, ax2 = plt.subplots(figsize=(fig_w, fig_h), dpi=dpi)
+            ax2.imshow(img)
+            ax2.set_axis_off()
+            fig2.subplots_adjust(left=0, right=1, top=1, bottom=0)
+            fig2.savefig(
+                str(png_path),
+                format="png",
+                dpi=dpi,
+                bbox_inches="tight",
+                pad_inches=0,
+                facecolor="black",
+            )
+            plt.close(fig2)
+
+            self.lbl_export.value = f"Snapshot: {path.name}"
+            self.viewer.status = (
+                f"Snapshot saved: {path}  +  {png_path.name}  "
+                f"({w}\u00d7{h} px @ {dpi} DPI)"
+            )
+        except ImportError:
+            # matplotlib not available \u2014 fall back to imageio PNG only
+            try:
+                import imageio
+                png_path = path.with_suffix(".png")
+                imageio.imwrite(str(png_path), img)
+                self.lbl_export.value = f"PNG: {png_path.name} (no matplotlib for PDF)"
+                self.viewer.status = f"Saved PNG (install matplotlib for PDF): {png_path}"
+            except ImportError:
+                from PIL import Image
+                png_path = path.with_suffix(".png")
+                Image.fromarray(img).save(str(png_path))
+                self.lbl_export.value = f"PNG: {png_path.name}"
+                self.viewer.status = f"Saved PNG: {png_path}"
 
     def _record_video(self):
         """Record a time-lapse video iterating through the time window."""

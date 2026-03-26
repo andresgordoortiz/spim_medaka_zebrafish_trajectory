@@ -1,0 +1,93 @@
+Bootstrap: docker
+From: royerlab/ultrack:0.6.1-cpu
+
+%post
+    # Pin numpy<2.0 for numba compatibility, then install CUDA 12 stack
+    pip install --no-cache-dir \
+        "numpy>=1.23.5,<2.0" \
+        "cupy-cuda12x>=13,<14" \
+        nvidia-cuda-nvrtc-cu12 \
+        nvidia-cuda-runtime-cu12 \
+        nvidia-cuda-cccl-cu12 \
+        nvidia-cublas-cu12 \
+        nvidia-cusparse-cu12 \
+        nvidia-cusolver-cu12 \
+        nvidia-cufft-cu12 \
+        nvidia-curand-cu12 \
+        nvidia-nvjitlink-cu12
+
+    # Create a unified CUDA lib directory with symlinks
+    mkdir -p /usr/local/cuda/lib64 /usr/local/cuda/include
+    find /opt/conda/lib/python3.11/site-packages/nvidia -name "*.so*" -exec ln -sf {} /usr/local/cuda/lib64/ \;
+    find /opt/conda/lib/python3.11/site-packages/nvidia -name "*.h" -path "*/include/*" \
+        | head -1 | xargs -I{} dirname {} | xargs -I{} ln -sf {}/* /usr/local/cuda/include/
+
+    # ── Gurobi ILP solver ──────────────────────────────────────────────
+    #
+    # Problem: The conda gurobi package (base image) ships a STUB
+    # libgurobi*.so with 0 GRB symbols. python-mip needs the real C
+    # library (with GRBloadenv etc.) which only comes from the PyPI
+    # gurobipy wheel.
+    #
+    # Without GUROBI_HOME, python-mip falls back to globbing *.so inside
+    # the gurobipy package dir. Alphabetically _attrutil.cpython-311*.so
+    # comes before libgurobi*.so, so it loads the wrong file → crash:
+    #   AttributeError: function/symbol 'GRBloadenv' not found
+    #
+    # Fix (verified working 2026-03-26):
+    #   1. Remove conda's stub gurobipy
+    #   2. Install gurobipy from PyPI (ships the real libgurobi*.so)
+    #   3. Symlink the real library into /opt/gurobi/lib/
+    #   4. Set GUROBI_HOME=/opt/gurobi in %environment
+
+    # Remove conda's broken stub (pip uninstall doesn't see conda pkgs,
+    # so we must physically delete the directory), then install from PyPI
+    rm -rf /opt/conda/lib/python3.11/site-packages/gurobipy*
+    pip install --no-cache-dir gurobipy
+
+    # Collect the real libgurobi*.so into /opt/gurobi/lib/
+    mkdir -p /opt/gurobi/lib
+    find /opt/conda/lib/python3.11/site-packages/gurobipy \
+        -name "libgurobi*.so*" \
+        -exec ln -sf {} /opt/gurobi/lib/ \;
+    ldconfig
+
+    # Build-time verification — fail the build if Gurobi C lib is broken
+    echo "=== Gurobi library check ==="
+    ls -la /opt/gurobi/lib/libgurobi* 2>/dev/null || { echo "FATAL: no libgurobi*.so found"; exit 1; }
+    # The real library from PyPI is ~15MB+; the conda stub is tiny (<1MB)
+    # Use -L to dereference symlinks for the real file size
+    LIBSIZE=$(stat -L -c%s /opt/gurobi/lib/libgurobi*.so 2>/dev/null | head -1)
+    echo "libgurobi size: $LIBSIZE bytes"
+    if [ "$LIBSIZE" -lt 1000000 ]; then
+        echo "FATAL: libgurobi*.so is too small ($LIBSIZE bytes) — likely a stub!"
+        exit 1
+    fi
+    # Definitive test: python-mip must be able to load the Gurobi backend
+    LC_ALL=C GUROBI_HOME=/opt/gurobi python -c "
+import mip.gurobi
+print('python-mip Gurobi: OK')
+"
+
+%environment
+    export LD_LIBRARY_PATH=/usr/local/cuda/lib64:/opt/gurobi/lib:/usr/local/lib:$LD_LIBRARY_PATH
+    export CUDA_PATH=/usr/local/cuda
+    export PYTHONNOUSERSITE=1
+    export GUROBI_HOME=/opt/gurobi
+    # Gurobi needs a valid locale, otherwise:
+    #   "Error: invalid user locale; possible fix is to set LC_ALL"
+    export LC_ALL=C
+
+    # Gurobi license — bind-mount your .lic file or set GRB_LICENSE_FILE.
+    # Example:
+    #   apptainer exec --env GRB_LICENSE_FILE=$GRB_LICENSE_FILE ultrack.sif ...
+    if [ -f /opt/gurobi/gurobi.lic ]; then
+        export GRB_LICENSE_FILE=/opt/gurobi/gurobi.lic
+    fi
+
+%runscript
+    exec python "$@"
+
+%labels
+    Author andres.gordo
+    Description ultrack 0.6.1 with CUDA 12 + Gurobi for HPC/Apptainer

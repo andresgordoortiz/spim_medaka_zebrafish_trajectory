@@ -25,7 +25,7 @@ library(RANN)
 # PARAMETERS
 # =============================================================================
 
-IO_DIR  <- "analysis_output_medaka_28052025"
+IO_DIR  <- "analysis_output_medaka_25082025"
 
 FRAME_INTERVAL_SEC <- 30
 FRAME_INTERVAL_MIN <- FRAME_INTERVAL_SEC / 60
@@ -398,14 +398,93 @@ roi_bounds <- fread(file.path(IO_DIR, "roi_bounds.csv"))
 margin_y <- roi_bounds[parameter == "y_min", as.numeric(value)]
 
 # ---------------------------------------------------------------------------
-# Geodesic density (replicates embryo_viewer._compute_density)
+# Surface nuclei density  (nuclei / 1000 um^2)
+# — standard binned approach, identical to embryo_viewer._compute_density
 #
-# 1. Map (THETA_DEG, PHI_DEG) -> unit-sphere Cartesian
-# 2. Pick a representative frame (closest to median spot count)
-# 3. Subsample up to 5000 pts, find median 16th-NN distance -> adaptive radius
-# 4. Per frame: KD-tree neighbour count within that radius
+# 1. Bin (THETA_DEG, PHI_DEG) into ~5-degree tiles.
+# 2. Tile area = R^2 * sin(theta_mid) * d_theta * d_phi  (um^2).
+# 3. Count nuclei per tile per frame.
+# 4. Density = count / area * 1000.
+# 5. Each spot inherits the density of its tile.
 # ---------------------------------------------------------------------------
-compute_geodesic_density <- function(dt, k_nn = 16L, max_sub = 5000L) {
+sph <- fread(file.path(IO_DIR, "sphere_params.csv"))
+SPH_R <- as.numeric(sph[parameter == "radius", value])
+cat(sprintf("  Sphere radius: %.1f um\n", SPH_R))
+
+compute_surface_density <- function(dt, R = SPH_R, bin_deg = 5) {
+  theta <- dt$THETA_DEG
+  phi   <- dt$PHI_DEG
+  frames <- dt$FRAME
+
+  # Bin edges
+  theta_range <- quantile(theta, c(0.01, 0.99), na.rm = TRUE)
+  phi_range   <- quantile(phi,   c(0.01, 0.99), na.rm = TRUE)
+  n_tb <- max(round((theta_range[2] - theta_range[1]) / bin_deg), 5L)
+  n_pb <- max(round((phi_range[2]   - phi_range[1])   / bin_deg), 5L)
+  theta_edges <- seq(theta_range[1], theta_range[2], length.out = n_tb + 1L)
+  phi_edges   <- seq(phi_range[1],   phi_range[2],   length.out = n_pb + 1L)
+
+  cat(sprintf("    Surface density: %d x %d bins (%.1f deg), R = %.1f um\n",
+              n_tb, n_pb, bin_deg, R))
+
+  # Bin area matrix  (um^2)
+  d_theta_rad <- diff(theta_edges) * pi / 180
+  d_phi_rad   <- diff(phi_edges)   * pi / 180
+  theta_mid_rad <- ((theta_edges[-length(theta_edges)] + theta_edges[-1]) / 2) * pi / 180
+  bin_area <- outer(R^2 * sin(theta_mid_rad) * d_theta_rad, d_phi_rad)  # n_tb x n_pb
+  bin_area <- pmax(bin_area, 1.0)  # floor near poles
+
+  # Digitize each spot
+  t_idx <- pmin(pmax(findInterval(theta, theta_edges), 1L), n_tb)
+  p_idx <- pmin(pmax(findInterval(phi,   phi_edges),   1L), n_pb)
+
+  density <- numeric(nrow(dt))
+  unique_frames <- sort(unique(frames))
+
+  for (fr in unique_frames) {
+    mask <- which(frames == fr)
+    ti <- t_idx[mask]
+    pi_ <- p_idx[mask]
+
+    # Count nuclei per bin
+    counts <- matrix(0, nrow = n_tb, ncol = n_pb)
+    for (ii in seq_along(mask)) {
+      counts[ti[ii], pi_[ii]] <- counts[ti[ii], pi_[ii]] + 1
+    }
+
+    # Density = count / area * 1000  (nuclei per 1000 um^2)
+    dens <- counts / bin_area * 1000
+
+    # Assign to spots
+    for (ii in seq_along(mask)) {
+      density[mask[ii]] <- dens[ti[ii], pi_[ii]]
+    }
+  }
+  density
+}
+
+# ---------------------------------------------------------------------------
+# Volumetric nuclei density  (nuclei / 10^6 um^3)
+# — 3D Cartesian voxel binning (no sphere assumption)
+#
+# 1. Bin (X, Y, Z) into cubic voxels.
+# 2. Voxel volume = voxel_um^3  (um^3).
+# 3. Count nuclei per voxel per frame.
+# 4. Density = count / volume * 1e6  (nuclei per 10^6 um^3).
+# 5. Each spot inherits the density of its voxel.
+# ---------------------------------------------------------------------------
+VOXEL_UM <- 30  # 30 um voxel side length
+
+# ---------------------------------------------------------------------------
+# Geodesic neighbour-count density  (unit-sphere kNN)
+# — Replicates embryo_viewer._compute_density geodesic mode
+#
+# 1. Map (THETA_DEG, PHI_DEG) -> unit-sphere Cartesian.
+# 2. Pick representative frame (closest to median spot count).
+# 3. Subsample up to 5000 pts, find median k-th NN distance -> adaptive radius.
+# 4. Per frame: KD-tree neighbour count within that radius on unit sphere.
+# ---------------------------------------------------------------------------
+compute_neighbor_density <- function(dt, k_nn = K_NN, max_sub = SUBSAMPLE_N) {
   theta_rad <- dt$THETA_DEG * pi / 180
   phi_rad   <- dt$PHI_DEG   * pi / 180
   coords <- cbind(
@@ -438,7 +517,7 @@ compute_geodesic_density <- function(dt, k_nn = 16L, max_sub = 5000L) {
   nn_ref <- nn2(sub_pts, sub_pts, k = k + 1L)
   radius <- median(nn_ref$nn.dists[, k + 1L])
   radius <- max(radius, 1e-6)
-  cat(sprintf("    Geodesic density: ref frame = %d, adaptive radius = %.5f\n",
+  cat(sprintf("    Geodesic neighbour density: ref frame = %d, adaptive radius = %.5f\n",
               ref_frame, radius))
 
   # Count neighbours per frame within radius
@@ -456,6 +535,42 @@ compute_geodesic_density <- function(dt, k_nn = 16L, max_sub = 5000L) {
   density
 }
 
+compute_volumetric_density <- function(dt, voxel_um = VOXEL_UM) {
+  x <- dt$POSITION_X
+  y <- dt$POSITION_Y
+  z <- dt$POSITION_Z
+  frames <- dt$FRAME
+
+  # Bin edges
+  x_edges <- seq(min(x, na.rm = TRUE), max(x, na.rm = TRUE) + voxel_um, by = voxel_um)
+  y_edges <- seq(min(y, na.rm = TRUE), max(y, na.rm = TRUE) + voxel_um, by = voxel_um)
+  z_edges <- seq(min(z, na.rm = TRUE), max(z, na.rm = TRUE) + voxel_um, by = voxel_um)
+  nx <- length(x_edges) - 1L
+  ny <- length(y_edges) - 1L
+  nz <- length(z_edges) - 1L
+  voxel_vol <- voxel_um^3
+
+  cat(sprintf("    Volumetric density: %d x %d x %d voxels (%.0f um), vol = %.0f um^3\n",
+              nx, ny, nz, voxel_um, voxel_vol))
+
+  xi <- pmin(pmax(findInterval(x, x_edges), 1L), nx)
+  yi <- pmin(pmax(findInterval(y, y_edges), 1L), ny)
+  zi <- pmin(pmax(findInterval(z, z_edges), 1L), nz)
+
+  density <- numeric(nrow(dt))
+  unique_frames <- sort(unique(frames))
+
+  for (fr in unique_frames) {
+    mask <- which(frames == fr)
+    xf <- xi[mask]; yf <- yi[mask]; zf <- zi[mask]
+    flat <- (xf - 1L) * ny * nz + (yf - 1L) * nz + zf
+    tab <- tabulate(flat, nbins = nx * ny * nz)
+    dens <- tab / voxel_vol * 1e6  # nuclei per 10^6 um^3
+    density[mask] <- dens[flat]
+  }
+  density
+}
+
 # Baseline (frame 0) and endpoint windows
 baseline <- spots[FRAME >= 0      & FRAME <= WINDOW]
 endpoint <- spots[FRAME >= (MAX_FRAME - WINDOW) & FRAME <= MAX_FRAME]
@@ -468,10 +583,10 @@ cat(sprintf("  Frame 0:   IN_ROI = %d,  Outside = %d\n", n_roi_t0, n_out_t0))
 cat(sprintf("  Frame %d: IN_ROI = %d,  Outside = %d\n", MAX_FRAME, n_roi_end, n_out_end))
 
 # Compute geodesic density for baseline and endpoint
-cat("  Computing geodesic density (baseline)...\n")
-baseline[, geo_density := compute_geodesic_density(baseline)]
-cat("  Computing geodesic density (endpoint)...\n")
-endpoint[, geo_density := compute_geodesic_density(endpoint)]
+cat("  Computing surface density (baseline)...\n")
+baseline[, geo_density := compute_surface_density(baseline)]
+cat("  Computing surface density (endpoint)...\n")
+endpoint[, geo_density := compute_surface_density(endpoint)]
 
 mean_d_roi_t0  <- mean(baseline[IN_ROI == TRUE,  geo_density])
 mean_d_out_t0  <- mean(baseline[IN_ROI == FALSE, geo_density])
@@ -481,6 +596,46 @@ cat(sprintf("  Mean density  ROI: %.1f -> %.1f (FC = %.2fx)\n",
             mean_d_roi_t0, mean_d_roi_end, mean_d_roi_end / mean_d_roi_t0))
 cat(sprintf("  Mean density  Out: %.1f -> %.1f (FC = %.2fx)\n",
             mean_d_out_t0, mean_d_out_end, mean_d_out_end / mean_d_out_t0))
+
+# Compute volumetric density for baseline and endpoint
+cat("  Computing volumetric density (baseline)...\n")
+baseline[, vol_density := compute_volumetric_density(baseline)]
+cat("  Computing volumetric density (endpoint)...\n")
+endpoint[, vol_density := compute_volumetric_density(endpoint)]
+
+mean_vd_roi_t0  <- mean(baseline[IN_ROI == TRUE,  vol_density])
+mean_vd_out_t0  <- mean(baseline[IN_ROI == FALSE, vol_density])
+mean_vd_roi_end <- mean(endpoint[IN_ROI == TRUE,  vol_density])
+mean_vd_out_end <- mean(endpoint[IN_ROI == FALSE, vol_density])
+cat(sprintf("  Mean vol density  ROI: %.1f -> %.1f (FC = %.2fx)\n",
+            mean_vd_roi_t0, mean_vd_roi_end, mean_vd_roi_end / mean_vd_roi_t0))
+cat(sprintf("  Mean vol density  Out: %.1f -> %.1f (FC = %.2fx)\n",
+            mean_vd_out_t0, mean_vd_out_end, mean_vd_out_end / mean_vd_out_t0))
+
+# Compute neighbour-count density for baseline and endpoint
+cat("  Computing neighbour density (baseline)...\n")
+baseline[, nn_density := compute_neighbor_density(baseline)]
+cat("  Computing neighbour density (endpoint)...\n")
+endpoint[, nn_density := compute_neighbor_density(endpoint)]
+
+mean_nn_roi_t0  <- mean(baseline[IN_ROI == TRUE,  nn_density])
+mean_nn_out_t0  <- mean(baseline[IN_ROI == FALSE, nn_density])
+mean_nn_roi_end <- mean(endpoint[IN_ROI == TRUE,  nn_density])
+mean_nn_out_end <- mean(endpoint[IN_ROI == FALSE, nn_density])
+cat(sprintf("  Mean neighbour count  ROI: %.1f -> %.1f (FC = %.2fx)\n",
+            mean_nn_roi_t0, mean_nn_roi_end, mean_nn_roi_end / mean_nn_roi_t0))
+cat(sprintf("  Mean neighbour count  Out: %.1f -> %.1f (FC = %.2fx)\n",
+            mean_nn_out_t0, mean_nn_out_end, mean_nn_out_end / mean_nn_out_t0))
+
+# Save neighbour density summary for cross-species y-axis alignment
+nn_summary <- data.table(
+  species = "medaka",
+  region  = c("ROI", "ROI", "Outside", "Outside"),
+  epoch   = c("start", "end", "start", "end"),
+  mean_nn = c(mean_nn_roi_t0, mean_nn_roi_end, mean_nn_out_t0, mean_nn_out_end)
+)
+fwrite(nn_summary, file.path(IO_DIR, "neighbor_density_summary.csv"))
+cat(sprintf("  Saved %s/neighbor_density_summary.csv\n", IO_DIR))
 
 # --- Panel A: ZY cross-section, IN_ROI highlighted, t0 vs t400 ---
 X_CENTRE <- median(spots$POSITION_X)
@@ -526,8 +681,61 @@ p3b <- ggplot(dens_dt, aes(x = region, y = density, fill = epoch)) +
   scale_fill_manual(values = c("Frame 0" = "grey55",
                                 setNames("#B2182B", sprintf("Frame %d", MAX_FRAME))),
                      name = "") +
+  labs(title = expression("Mean Surface Density (nuclei / 1000" ~ mu * "m" ^ 2 * ")"),
+       subtitle = expression("Binned " * theta * "-" * phi * " tiles, area-normalised"),
+       x = NULL, y = expression("nuclei / 1000 " * mu * "m" ^ 2)) +
+  theme_pub(base_size = 12) +
+  theme(legend.position = "top")
+
+# --- Panel B-vol: Mean volumetric density (ROI vs Outside) ---
+vdens_dt <- data.table(
+  region = rep(c("ROI", "Outside"), each = 2),
+  epoch  = rep(c("Frame 0", sprintf("Frame %d", MAX_FRAME)), 2),
+  density = c(mean_vd_roi_t0, mean_vd_roi_end, mean_vd_out_t0, mean_vd_out_end)
+)
+vdens_dt[, epoch := factor(epoch, levels = c("Frame 0", sprintf("Frame %d", MAX_FRAME)))]
+
+p3b_vol <- ggplot(vdens_dt, aes(x = region, y = density, fill = epoch)) +
+  geom_col(position = "dodge", width = 0.6) +
+  geom_text(aes(label = sprintf("%.1f", density)),
+            position = position_dodge(width = 0.6), vjust = -0.3, size = 3.5) +
+  scale_fill_manual(values = c("Frame 0" = "grey55",
+                                setNames("#B2182B", sprintf("Frame %d", MAX_FRAME))),
+                     name = "") +
+  labs(title = expression("Mean Volumetric Density (nuclei / 10"^6 ~ mu * "m"^3 * ")"),
+       subtitle = paste0(VOXEL_UM, " \u00b5m cubic voxels"),
+       x = NULL, y = expression("nuclei / 10"^6 ~ mu * "m"^3)) +
+  theme_pub(base_size = 12) +
+  theme(legend.position = "top")
+
+# --- Panel B-nn: Mean neighbour-count density (ROI vs Outside) ---
+nn_dt <- data.table(
+  region = rep(c("ROI", "Outside"), each = 2),
+  epoch  = rep(c("Frame 0", sprintf("Frame %d", MAX_FRAME)), 2),
+  density = c(mean_nn_roi_t0, mean_nn_roi_end, mean_nn_out_t0, mean_nn_out_end)
+)
+nn_dt[, epoch := factor(epoch, levels = c("Frame 0", sprintf("Frame %d", MAX_FRAME)))]
+
+# Determine shared y-axis limits (load zebrafish summary if available)
+zf_nn_path <- file.path("analysis_output_zebrafish_05112025", "neighbor_density_summary.csv")
+if (file.exists(zf_nn_path)) {
+  zf_nn_summary <- fread(zf_nn_path)
+  all_nn_vals <- c(nn_dt$density, zf_nn_summary$mean_nn)
+} else {
+  all_nn_vals <- nn_dt$density
+}
+nn_ymax <- max(all_nn_vals, na.rm = TRUE) * 1.15
+
+p3b_nn <- ggplot(nn_dt, aes(x = region, y = density, fill = epoch)) +
+  geom_col(position = "dodge", width = 0.6) +
+  geom_text(aes(label = sprintf("%.1f", density)),
+            position = position_dodge(width = 0.6), vjust = -0.3, size = 3.5) +
+  scale_fill_manual(values = c("Frame 0" = "grey55",
+                                setNames("#B2182B", sprintf("Frame %d", MAX_FRAME))),
+                     name = "") +
+  coord_cartesian(ylim = c(0, nn_ymax)) +
   labs(title = "Mean Geodesic Density",
-       subtitle = "Neighbours within adaptive radius (unit-sphere KNN)",
+       subtitle = "Neighbours within adaptive radius (unit-sphere kNN)",
        x = NULL, y = "Mean neighbour count") +
   theme_pub(base_size = 12) +
   theme(legend.position = "top")
@@ -568,21 +776,87 @@ p3c <- ggplot(fc_all, aes(x = y_bin, y = log2_fc, colour = region)) +
   geom_point(size = 2.5) +
   scale_colour_manual(values = c("ROI" = "#D95F02", "Outside" = "grey30"), name = "") +
   labs(title = sprintf("Density Fold Change (frame 0 vs %d)", MAX_FRAME),
-       subtitle = "Mean geodesic density per Y-bin, log2 FC",
+       subtitle = expression("Mean surface density per Y-bin, " * log[2] * " FC"),
        x = expression("Y (" * mu * "m)"),
        y = "log2(fold change)") +
   theme_pub(base_size = 12) +
   theme(legend.position = "top")
 
-p3 <- (p3a) / (p3b | p3c) +
-  plot_layout(heights = c(1, 0.8)) +
+# --- Panel C-vol: Volumetric density fold-change along Y ---
+roi_vt0  <- baseline[IN_ROI == TRUE,  .(mean_dens = mean(vol_density), n = .N), by = y_bin]
+roi_vend <- endpoint[IN_ROI == TRUE,  .(mean_dens = mean(vol_density), n = .N), by = y_bin]
+fc_vroi <- merge(roi_vt0[n >= MIN_BIN_COUNT, .(y_bin, dens_t0  = mean_dens)],
+                 roi_vend[n >= MIN_BIN_COUNT, .(y_bin, dens_end = mean_dens)],
+                 by = "y_bin", all = FALSE)
+fc_vroi[, log2_fc := log2(dens_end / pmax(dens_t0, 1e-6))]
+fc_vroi[, region := "ROI"]
+
+out_vt0  <- baseline[IN_ROI == FALSE, .(mean_dens = mean(vol_density), n = .N), by = y_bin]
+out_vend <- endpoint[IN_ROI == FALSE, .(mean_dens = mean(vol_density), n = .N), by = y_bin]
+fc_vout <- merge(out_vt0[n >= MIN_BIN_COUNT, .(y_bin, dens_t0  = mean_dens)],
+                 out_vend[n >= MIN_BIN_COUNT, .(y_bin, dens_end = mean_dens)],
+                 by = "y_bin", all = FALSE)
+fc_vout[, log2_fc := log2(dens_end / pmax(dens_t0, 1e-6))]
+fc_vout[, region := "Outside"]
+
+fc_vol <- rbindlist(list(fc_vroi, fc_vout), fill = TRUE)
+fc_vol[log2_fc >  5, log2_fc :=  5]
+fc_vol[log2_fc < -5, log2_fc := -5]
+
+p3c_vol <- ggplot(fc_vol, aes(x = y_bin, y = log2_fc, colour = region)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50", linewidth = 0.4) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2.5) +
+  scale_colour_manual(values = c("ROI" = "#D95F02", "Outside" = "grey30"), name = "") +
+  labs(title = sprintf("Vol. Density Fold Change (frame 0 vs %d)", MAX_FRAME),
+       subtitle = expression("Mean volumetric density per Y-bin, " * log[2] * " FC"),
+       x = expression("Y (" * mu * "m)"),
+       y = "log2(fold change)") +
+  theme_pub(base_size = 12) +
+  theme(legend.position = "top")
+
+# --- Panel C-nn: Neighbour-count fold-change along Y ---
+roi_nnt0  <- baseline[IN_ROI == TRUE,  .(mean_dens = mean(nn_density), n = .N), by = y_bin]
+roi_nnend <- endpoint[IN_ROI == TRUE,  .(mean_dens = mean(nn_density), n = .N), by = y_bin]
+fc_nnroi <- merge(roi_nnt0[n >= MIN_BIN_COUNT, .(y_bin, dens_t0  = mean_dens)],
+                  roi_nnend[n >= MIN_BIN_COUNT, .(y_bin, dens_end = mean_dens)],
+                  by = "y_bin", all = FALSE)
+fc_nnroi[, log2_fc := log2(dens_end / pmax(dens_t0, 1e-6))]
+fc_nnroi[, region := "ROI"]
+
+out_nnt0  <- baseline[IN_ROI == FALSE, .(mean_dens = mean(nn_density), n = .N), by = y_bin]
+out_nnend <- endpoint[IN_ROI == FALSE, .(mean_dens = mean(nn_density), n = .N), by = y_bin]
+fc_nnout <- merge(out_nnt0[n >= MIN_BIN_COUNT, .(y_bin, dens_t0  = mean_dens)],
+                  out_nnend[n >= MIN_BIN_COUNT, .(y_bin, dens_end = mean_dens)],
+                  by = "y_bin", all = FALSE)
+fc_nnout[, log2_fc := log2(dens_end / pmax(dens_t0, 1e-6))]
+fc_nnout[, region := "Outside"]
+
+fc_nn <- rbindlist(list(fc_nnroi, fc_nnout), fill = TRUE)
+fc_nn[log2_fc >  5, log2_fc :=  5]
+fc_nn[log2_fc < -5, log2_fc := -5]
+
+p3c_nn <- ggplot(fc_nn, aes(x = y_bin, y = log2_fc, colour = region)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50", linewidth = 0.4) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2.5) +
+  scale_colour_manual(values = c("ROI" = "#D95F02", "Outside" = "grey30"), name = "") +
+  labs(title = sprintf("Geodesic Density Fold Change (frame 0 vs %d)", MAX_FRAME),
+       subtitle = "Mean geodesic neighbour count per Y-bin, log2 FC",
+       x = expression("Y (" * mu * "m)"),
+       y = "log2(fold change)") +
+  theme_pub(base_size = 12) +
+  theme(legend.position = "top")
+
+p3 <- (p3a) / (p3b | p3b_vol | p3b_nn) / (p3c | p3c_vol | p3c_nn) +
+  plot_layout(heights = c(1, 0.7, 0.7)) +
   plot_annotation(
     title = sprintf("Medaka -- ROI vs Outside: Density Redistribution (frame 0 vs %d)", MAX_FRAME),
-    subtitle = "Orange = ROI cells | Grey = outside ROI | Density = geodesic neighbour count (viewer method)",
+    subtitle = "Orange = ROI | Grey = outside | Left = surface | Centre = volumetric | Right = neighbour count",
     theme = theme(plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
                   plot.subtitle = element_text(size = 11, hjust = 0.5, colour = "grey40")))
 
-save_pdf(p3, "mk_density_03_density_fold_change.pdf", width = 16, height = 12)
+save_pdf(p3, "mk_density_03_density_fold_change.pdf", width = 22, height = 16)
 
 
 # =============================================================================
@@ -599,9 +873,7 @@ spots_thick <- fread(file.path(IO_DIR, "oriented_spots.csv"),
 spots_thick <- spots_thick[FRAME <= MAX_FRAME]
 spots_thick[, time_min := FRAME * FRAME_INTERVAL_MIN]
 
-# Sphere params for context
-sph <- fread(file.path(IO_DIR, "sphere_params.csv"))
-SPH_R <- as.numeric(sph[parameter == "radius", value])
+# Sphere params already loaded in section 3
 cat(sprintf("  Sphere radius: %.1f um\n", SPH_R))
 
 # ---- Panel A: XZ cross-section at 4 epochs --------------------------------

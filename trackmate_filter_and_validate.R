@@ -76,7 +76,7 @@ find_input <- function(candidates) {
 
 SPOTS_FILE <- find_input(c(
 
-  "medaka_25082025_combined_spots.csv"
+  "medaka_20250825_t450_hyperstack_crop_spots.csv"
 
 ))
 
@@ -84,7 +84,7 @@ SPOTS_FILE <- find_input(c(
 # NOTE: oriented_tracks.csv from napari = per-spot data (same as spots),
 #       so for track-level stats we need the raw TrackMate tracks export.
 TRACKS_FILE <- find_input(c(
-  "medaka_25082025_combined_tracks.csv"
+  "medaka_20250825_t450_hyperstack_crop_tracks.csv"
 ))
 
 # --- Selection method  ────────────────────────────────────────────────────

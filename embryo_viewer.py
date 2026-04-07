@@ -1132,6 +1132,13 @@ class EmbryoViewer:
             d_norm = np.clip((d - p2) / max(p98 - p2, 1e-6), 0, 1)
             return d_norm, "inferno"
 
+        # ── Volumetric Density mode: 3D voxel density ──
+        if mode == "vol_density":
+            d = self._compute_volumetric_density(df)[idx]
+            p2, p98 = np.percentile(d, [2, 98])
+            d_norm = np.clip((d - p2) / max(p98 - p2, 1e-6), 0, 1)
+            return d_norm, "inferno"
+
         # ── Thickness mode: local shell thickness at each spot's position ──
         # For each spot, the thickness is the radial span (P90 - P10) of
         # neighbouring nuclei at the same angular position on the sphere.
@@ -1239,6 +1246,7 @@ class EmbryoViewer:
                 tail_length=40,
                 color_by="track_id",
             )
+            self._patch_tracks_layer(self.tracks_layer)
         else:
             self.tracks_layer = None
 
@@ -1299,6 +1307,26 @@ class EmbryoViewer:
             ]
         )
         return tracks, df
+
+    @staticmethod
+    def _patch_tracks_layer(layer):
+        """Monkey-patch Tracks layer to work around napari bug.
+
+        napari's StatusChecker thread crashes with
+        ``TypeError: 'NoneType' object is not subscriptable``
+        when computing cursor hover status for a Tracks layer in 3D,
+        because ``face_normal`` can be ``None``.  We override
+        ``get_value`` to silently return ``None`` on error.
+        """
+        _orig = layer.get_value
+
+        def _safe_get_value(*a, **kw):
+            try:
+                return _orig(*a, **kw)
+            except TypeError:
+                return None
+
+        layer.get_value = _safe_get_value
 
     def _rebuild_tracks(self):
         """Rebuild the tracks layer(s) with all active filters + current colour.
@@ -1362,6 +1390,7 @@ class EmbryoViewer:
                             colormap="gray",
                             opacity=0.10,
                         )
+                        self._patch_tracks_layer(self._tracks_layer_secondary)
 
             # ── Foreground: ingressing tracks (onset-coloured) ──
             if ing_mask.any():
@@ -1426,6 +1455,7 @@ class EmbryoViewer:
                         kw_ing["colormap"] = "magenta"
 
                     self.tracks_layer = self.viewer.add_tracks(t_ing, **kw_ing)
+                    self._patch_tracks_layer(self.tracks_layer)
             return
 
         # ── Pole-drift tracks mode ──
@@ -1446,6 +1476,7 @@ class EmbryoViewer:
                 properties={"color_value": color_val},
             )
             self.tracks_layer = self.viewer.add_tracks(tracks, **kw)
+            self._patch_tracks_layer(self.tracks_layer)
             return
 
         # ── Density tracks mode: color by local density ──
@@ -1463,6 +1494,24 @@ class EmbryoViewer:
                 properties={"color_value": d_norm},
             )
             self.tracks_layer = self.viewer.add_tracks(tracks, **kw)
+            self._patch_tracks_layer(self.tracks_layer)
+            return
+
+        # ── Volumetric Density tracks mode ──
+        if mode == "vol_density":
+            density_all = self._compute_volumetric_density(df_t)
+            p2, p98 = np.percentile(density_all, [2, 98])
+            d_norm = np.clip((density_all - p2) / max(p98 - p2, 1e-6), 0, 1)
+            kw = dict(
+                name="Tracks",
+                tail_width=self._track_width,
+                tail_length=40,
+                color_by="color_value",
+                colormap="inferno",
+                properties={"color_value": d_norm},
+            )
+            self.tracks_layer = self.viewer.add_tracks(tracks, **kw)
+            self._patch_tracks_layer(self.tracks_layer)
             return
 
         # ── Movement-type tracks: custom discrete colormap ──
@@ -1515,6 +1564,7 @@ class EmbryoViewer:
                 properties={"color_value": cat},
             )
             self.tracks_layer = self.viewer.add_tracks(tracks, **kw)
+            self._patch_tracks_layer(self.tracks_layer)
             return
 
         # ── Thickness tracks mode: color by local shell thickness ──
@@ -1536,6 +1586,7 @@ class EmbryoViewer:
                     properties={"color_value": t_norm},
                 )
                 self.tracks_layer = self.viewer.add_tracks(tracks, **kw)
+                self._patch_tracks_layer(self.tracks_layer)
                 return
 
         # ── Single-layer mode (all other colour modes) ──
@@ -1577,6 +1628,7 @@ class EmbryoViewer:
         if props:
             kw["properties"] = props
         self.tracks_layer = self.viewer.add_tracks(tracks, **kw)
+        self._patch_tracks_layer(self.tracks_layer)
 
     @staticmethod
     def _compute_track_speed(df_t: pd.DataFrame) -> np.ndarray:
@@ -1765,33 +1817,27 @@ class EmbryoViewer:
     }
 
     def _compute_density(self, df: pd.DataFrame) -> np.ndarray:
-        """Per-spot local nuclei density, computed per frame.
+        """Per-spot surface nuclei density (nuclei / 1000 µm²).
 
-        Strategy adapts to available data:
+        Standard approach for epithelial / blastoderm studies:
+          1. Bin the sphere surface into (θ, φ) tiles.
+          2. Area of each tile = R² sin(θ) Δθ Δφ.
+          3. Count nuclei per tile per frame.
+          4. Density = count / area  (nuclei / 1000 µm²).
+          5. Each spot inherits the density of its tile.
 
-        **Geodesic (surface) mode** — when the sphere is fitted and
-        THETA_DEG / PHI_DEG exist.  Angular coordinates on the fitted
-        sphere capture *surface* density, which is biologically
-        meaningful for epiblast cells: two cells at the same (θ, φ) but
-        different depths are the same surface neighbour, while cells far
-        apart on the surface but at the same radius are not.  Coordinates
-        are converted to unit-sphere XYZ for fast Euclidean KD-tree
-        queries; an angular radius is used so results are in
-        steradians-equivalent.
+        When no sphere is fitted, falls back to 3D Euclidean kNN
+        neighbour counting (adaptive radius, unitless count).
 
-        **Euclidean 3D mode** — fallback when no sphere is fitted.
-        Straightforward 3D neighbour counting.
+        Parameters
+        ----------
+        df : DataFrame with FRAME column, and THETA_DEG/PHI_DEG when
+             sphere is fitted, or POSITION_X/Y/Z otherwise.
 
-        In both cases:
-        - **Adaptive radius**: median 15-th nearest-neighbour distance on
-          a 5 000-point subsample → captures the natural inter-nuclear
-          spacing without manual tuning.
-        - **count_neighbors** instead of query_ball_point → C-level loop,
-          no Python list allocation per point.
-        - Parallel workers for all KD-tree ops.
-
-        Returns a float array of length ``len(df)`` with the raw
-        neighbour count per spot.
+        Returns
+        -------
+        float array of length len(df) — density per spot (nuclei/1000 µm²
+        in geodesic mode, raw neighbour count in Euclidean fallback).
         """
         from scipy.spatial import cKDTree
 
@@ -1799,7 +1845,6 @@ class EmbryoViewer:
         density = np.zeros(n, dtype=float)
         frames = df["FRAME"].values
 
-        # Choose coordinate system
         use_geodesic = (
             self.sphere_fit_result is not None
             and "THETA_DEG" in df.columns
@@ -1807,26 +1852,71 @@ class EmbryoViewer:
         )
 
         if use_geodesic:
-            theta_rad = np.radians(df["THETA_DEG"].values.astype(float))
-            phi_rad = np.radians(df["PHI_DEG"].values.astype(float))
-            # Map to unit-sphere Cartesian (Euclidean distance ≈ chord ≈
-            # angular distance for the radii we use)
-            coords = np.column_stack([
-                np.sin(theta_rad) * np.cos(phi_rad),
-                np.sin(theta_rad) * np.sin(phi_rad),
-                np.cos(theta_rad),
-            ])
-        else:
-            coords = np.column_stack([
-                df["POSITION_X"].values.astype(float),
-                df["POSITION_Y"].values.astype(float),
-                df["POSITION_Z"].values.astype(float),
-            ])
+            # ── Binned surface density (standard method) ──
+            R = self.sphere_fit_result["radius"]
+            theta_deg = df["THETA_DEG"].values.astype(float)
+            phi_deg = df["PHI_DEG"].values.astype(float)
 
+            # Determine bin size from data coverage
+            # Aim for ~20 bins along each angular axis
+            theta_min, theta_max = np.nanpercentile(theta_deg, [1, 99])
+            phi_min, phi_max = np.nanpercentile(phi_deg, [1, 99])
+            n_theta_bins = max(int(np.round((theta_max - theta_min) / 5.0)), 5)
+            n_phi_bins = max(int(np.round((phi_max - phi_min) / 5.0)), 5)
+
+            theta_edges = np.linspace(theta_min, theta_max, n_theta_bins + 1)
+            phi_edges = np.linspace(phi_min, phi_max, n_phi_bins + 1)
+
+            # Precompute bin areas (µm²)
+            # Area of tile [θ_i, θ_{i+1}] × [φ_j, φ_{j+1}] on sphere:
+            #   A = R² |cos(θ_i) - cos(θ_{i+1})| × |Δφ|  (in radians)
+            d_theta_rad = np.radians(np.diff(theta_edges))
+            d_phi_rad = np.radians(np.diff(phi_edges))
+            theta_mid_rad = np.radians(
+                (theta_edges[:-1] + theta_edges[1:]) / 2.0
+            )
+            # area[i] = R² * sin(theta_mid) * d_theta * d_phi
+            bin_areas = np.outer(
+                R**2 * np.sin(theta_mid_rad) * d_theta_rad, d_phi_rad
+            )  # shape (n_theta_bins, n_phi_bins)
+            # Floor to avoid division by tiny areas near poles
+            bin_areas = np.maximum(bin_areas, 1.0)
+
+            # Digitize each spot into (theta_bin, phi_bin)
+            t_idx = np.clip(
+                np.digitize(theta_deg, theta_edges) - 1, 0, n_theta_bins - 1
+            )
+            p_idx = np.clip(
+                np.digitize(phi_deg, phi_edges) - 1, 0, n_phi_bins - 1
+            )
+
+            unique_frames = np.unique(frames)
+            for fr in unique_frames:
+                mask_fr = frames == fr
+                t_fr = t_idx[mask_fr]
+                p_fr = p_idx[mask_fr]
+
+                # Count nuclei per bin
+                counts_2d = np.zeros((n_theta_bins, n_phi_bins), dtype=float)
+                np.add.at(counts_2d, (t_fr, p_fr), 1.0)
+
+                # Density = count / area × 1000 (nuclei per 1000 µm²)
+                dens_2d = counts_2d / bin_areas * 1000.0
+
+                # Assign to each spot
+                density[mask_fr] = dens_2d[t_fr, p_fr]
+
+            return density
+
+        # ── Euclidean 3D fallback (no sphere fitted) ──
+        coords = np.column_stack([
+            df["POSITION_X"].values.astype(float),
+            df["POSITION_Y"].values.astype(float),
+            df["POSITION_Z"].values.astype(float),
+        ])
         unique_frames = np.unique(frames)
 
-        # ── Determine adaptive radius from a representative frame ──
-        # Pick the frame closest to the median spot count.
+        # Adaptive radius from representative frame
         frame_sizes = {fr: (frames == fr).sum() for fr in unique_frames}
         median_size = np.median(list(frame_sizes.values()))
         ref_frame = min(unique_frames, key=lambda f: abs(frame_sizes[f] - median_size))
@@ -1835,9 +1925,8 @@ class EmbryoViewer:
 
         k_nn = min(16, len(ref_pts) - 1)
         if k_nn < 2:
-            return density  # too few points
+            return density
 
-        # Subsample for speed if very large
         if len(ref_pts) > 5000:
             rng = np.random.default_rng(42)
             sub_idx = rng.choice(len(ref_pts), 5000, replace=False)
@@ -1847,28 +1936,73 @@ class EmbryoViewer:
 
         tree_ref = cKDTree(sub_pts)
         dists, _ = tree_ref.query(sub_pts, k=k_nn + 1, workers=-1)
-        # dists[:, 0] is self (0); column k_nn is the k-th neighbour
         radius = float(np.median(dists[:, k_nn]))
-        # Ensure a sensible minimum
         radius = max(radius, 1e-6)
 
-        # ── Count neighbours per frame ──
         for fr in unique_frames:
             mask_fr = frames == fr
             pts_fr = coords[mask_fr]
-            n_fr = len(pts_fr)
-            if n_fr < 2:
+            if len(pts_fr) < 2:
                 continue
             tree = cKDTree(pts_fr)
-            # count_neighbors returns total pairs; per-point count via
-            # count_neighbors with another=self gives scalar, so use
-            # query_ball_point with return_length (scipy ≥ 1.6) or
-            # the fast count_neighbors approach.
-            # query_ball_point is fine — we just need the count.
             counts = tree.query_ball_point(
                 pts_fr, r=radius, workers=-1, return_length=True
             )
             density[mask_fr] = counts - 1  # subtract self
+
+        return density
+
+    def _compute_volumetric_density(
+        self, df: pd.DataFrame, voxel_um: float = 30.0
+    ) -> np.ndarray:
+        """Per-spot 3D volumetric density (nuclei / 10⁶ µm³).
+
+        Standard Cartesian voxel binning — no sphere assumption.
+
+        Parameters
+        ----------
+        df : DataFrame with FRAME, POSITION_X, POSITION_Y, POSITION_Z.
+        voxel_um : side length of each cubic voxel in µm.
+
+        Returns
+        -------
+        float array of length len(df) — density per spot
+        (nuclei per 10⁶ µm³).
+        """
+        n = len(df)
+        density = np.zeros(n, dtype=float)
+        frames = df["FRAME"].values
+        coords = np.column_stack([
+            df["POSITION_X"].values.astype(float),
+            df["POSITION_Y"].values.astype(float),
+            df["POSITION_Z"].values.astype(float),
+        ])
+
+        mins = coords.min(axis=0)
+        maxs = coords.max(axis=0)
+        edges = [
+            np.arange(mn, mx + voxel_um, voxel_um)
+            for mn, mx in zip(mins, maxs)
+        ]
+        nx = len(edges[0]) - 1
+        ny = len(edges[1]) - 1
+        nz = len(edges[2]) - 1
+        if nx < 1 or ny < 1 or nz < 1:
+            return density
+
+        voxel_vol = voxel_um ** 3
+
+        xi = np.clip(np.digitize(coords[:, 0], edges[0]) - 1, 0, nx - 1)
+        yi = np.clip(np.digitize(coords[:, 1], edges[1]) - 1, 0, ny - 1)
+        zi = np.clip(np.digitize(coords[:, 2], edges[2]) - 1, 0, nz - 1)
+
+        for fr in np.unique(frames):
+            mask = frames == fr
+            xf, yf, zf = xi[mask], yi[mask], zi[mask]
+            flat = xf * (ny * nz) + yf * nz + zf
+            counts = np.bincount(flat, minlength=nx * ny * nz)
+            dens = counts / voxel_vol * 1e6  # nuclei per 10⁶ µm³
+            density[mask] = dens[flat]
 
         return density
 
@@ -2238,8 +2372,10 @@ class EmbryoViewer:
         btn_color_pole.changed.connect(lambda: self._recolor("pole_drift"))
         btn_color_movetype = PushButton(text="Colour Movement Type")
         btn_color_movetype.changed.connect(lambda: self._recolor("move_type"))
-        btn_color_density = PushButton(text="Colour by Density")
+        btn_color_density = PushButton(text="Colour by Surface Density")
         btn_color_density.changed.connect(lambda: self._recolor("density"))
+        btn_color_vol_density = PushButton(text="Colour by Vol. Density")
+        btn_color_vol_density.changed.connect(lambda: self._recolor("vol_density"))
         btn_color_thickness = PushButton(text="Colour by Thickness")
         btn_color_thickness.changed.connect(lambda: self._recolor("thickness"))
 
@@ -2303,6 +2439,7 @@ class EmbryoViewer:
                 btn_color_pole,
                 btn_color_movetype,
                 btn_color_density,
+                btn_color_vol_density,
                 btn_color_thickness,
                 Label(value="── Export & Video ──"),
                 btn_export,
@@ -3151,14 +3288,85 @@ class EmbryoViewer:
                 spots_df.to_csv(out_dir / "oriented_spots.csv", index=False)
                 files_written.append("oriented_spots.csv")
 
-                # 2. Enriched tracks CSV — spots filtered to tracked nuclei
-                #    only, sorted by TRACK_ID + FRAME for easy downstream use
+                # 2. Track-level summary CSV — one row per TRACK_ID with
+                #    aggregated statistics computed from the oriented spots.
                 if "TRACK_ID" in spots_df.columns:
                     tracked = spots_df.dropna(subset=["TRACK_ID"]).sort_values(
                         ["TRACK_ID", "FRAME"]
                     )
                     if len(tracked) > 0:
-                        tracked.to_csv(out_dir / "oriented_tracks.csv", index=False)
+                        # --- per-track aggregation ---
+                        grp = tracked.groupby("TRACK_ID", sort=True)
+                        summary = grp.agg(
+                            NUMBER_SPOTS=("FRAME", "count"),
+                            TRACK_START=("FRAME", "min"),
+                            TRACK_STOP=("FRAME", "max"),
+                            TRACK_X_LOCATION=("POSITION_X", "mean"),
+                            TRACK_Y_LOCATION=("POSITION_Y", "mean"),
+                            TRACK_Z_LOCATION=("POSITION_Z", "mean"),
+                        ).reset_index()
+                        summary["TRACK_DURATION"] = (
+                            summary["TRACK_STOP"] - summary["TRACK_START"]
+                        )
+
+                        # start / end positions
+                        first = grp.first()[["POSITION_X", "POSITION_Y", "POSITION_Z"]]
+                        first.columns = ["START_X", "START_Y", "START_Z"]
+                        last = grp.last()[["POSITION_X", "POSITION_Y", "POSITION_Z"]]
+                        last.columns = ["END_X", "END_Y", "END_Z"]
+                        summary = summary.merge(first, on="TRACK_ID")
+                        summary = summary.merge(last, on="TRACK_ID")
+
+                        summary["TRACK_DISPLACEMENT"] = np.sqrt(
+                            (summary["END_X"] - summary["START_X"]) ** 2
+                            + (summary["END_Y"] - summary["START_Y"]) ** 2
+                            + (summary["END_Z"] - summary["START_Z"]) ** 2
+                        )
+
+                        # total distance & speeds from per-step displacements
+                        def _track_stats(g):
+                            dx = g["POSITION_X"].diff()
+                            dy = g["POSITION_Y"].diff()
+                            dz = g["POSITION_Z"].diff()
+                            step = np.sqrt(dx**2 + dy**2 + dz**2).iloc[1:]
+                            total = step.sum()
+                            n_steps = len(step)
+                            dur = g["FRAME"].iloc[-1] - g["FRAME"].iloc[0]
+                            mean_sp = total / dur if dur > 0 else 0.0
+                            return pd.Series({
+                                "TOTAL_DISTANCE_TRAVELED": total,
+                                "TRACK_MEAN_SPEED": mean_sp,
+                                "TRACK_MAX_SPEED": (step / g["FRAME"].diff().iloc[1:].values).max() if n_steps > 0 else 0.0,
+                            })
+
+                        stats = grp.apply(_track_stats, include_groups=False).reset_index()
+                        summary = summary.merge(stats, on="TRACK_ID")
+
+                        # confinement ratio
+                        summary["CONFINEMENT_RATIO"] = np.where(
+                            summary["TOTAL_DISTANCE_TRAVELED"] > 0,
+                            summary["TRACK_DISPLACEMENT"]
+                            / summary["TOTAL_DISTANCE_TRAVELED"],
+                            0.0,
+                        )
+
+                        # spherical coords of mean position
+                        for col in ["THETA_DEG", "PHI_DEG"]:
+                            if col in tracked.columns:
+                                mean_col = grp[col].mean().reset_index()
+                                mean_col.columns = ["TRACK_ID", f"MEAN_{col}"]
+                                summary = summary.merge(mean_col, on="TRACK_ID")
+
+                        # IN_ROI flag — True if majority of spots are in ROI
+                        if "IN_ROI" in tracked.columns:
+                            roi_frac = grp["IN_ROI"].mean().reset_index()
+                            roi_frac.columns = ["TRACK_ID", "IN_ROI_FRAC"]
+                            summary = summary.merge(roi_frac, on="TRACK_ID")
+                            summary["IN_ROI"] = summary["IN_ROI_FRAC"] >= 0.5
+
+                        summary.to_csv(
+                            out_dir / "oriented_tracks.csv", index=False
+                        )
                         files_written.append("oriented_tracks.csv")
 
                 # 3. Sphere parameters

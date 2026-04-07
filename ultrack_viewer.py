@@ -1051,6 +1051,8 @@ class CrossSectionViewer:
         btn_color_frame.changed.connect(lambda: self._set_color("frame"))
         btn_color_depth = PushButton(text="Colour by Depth")
         btn_color_depth.changed.connect(lambda: self._set_color("depth"))
+        btn_color_depth_travel = PushButton(text="Colour by Depth Travel")
+        btn_color_depth_travel.changed.connect(lambda: self._set_color("depth_travel"))
         btn_color_theta = PushButton(text="Colour by Latitude")
         btn_color_theta.changed.connect(lambda: self._set_color("theta"))
         btn_color_phi = PushButton(text="Colour by Longitude")
@@ -1115,6 +1117,7 @@ class CrossSectionViewer:
                 Label(value="── Colour ──"),
                 btn_color_frame,
                 btn_color_depth,
+                btn_color_depth_travel,
                 btn_color_theta,
                 btn_color_phi,
                 btn_color_speed,
@@ -1221,6 +1224,7 @@ class CrossSectionViewer:
     def _set_color(self, mode: str):
         needed = {
             "depth": "SPHERICAL_DEPTH",
+            "depth_travel": "SPHERICAL_DEPTH",
             "theta": "THETA_DEG",
             "phi": "PHI_DEG",
             "radial_vel": "RADIAL_VELOCITY_SMOOTH",
@@ -1491,7 +1495,21 @@ class CrossSectionViewer:
             "frame": "FRAME",
         }
         mode = self._color_mode
-        if mode in col_map and col_map[mode] in df_t.columns:
+        if mode == "depth_travel" and "SPHERICAL_DEPTH" in df_t.columns:
+            depth_range = df_t.groupby("TRACK_ID")["SPHERICAL_DEPTH"].transform(
+                lambda s: s.max() - s.min()
+            ).values.astype(float)
+            nan_m = np.isnan(depth_range)
+            if not nan_m.all():
+                depth_range[nan_m] = 0.0
+                valid = depth_range[~nan_m]
+                if len(valid) > 0:
+                    vmax = max(np.percentile(valid, 98), 1e-6)
+                    depth_range = np.clip(depth_range / vmax, 0, 1)
+                props["color_value"] = depth_range
+                color_by = "color_value"
+                cmap = "plasma"
+        elif mode in col_map and col_map[mode] in df_t.columns:
             vals = df_t[col_map[mode]].values.astype(float)
             nan_m = np.isnan(vals)
             if not nan_m.all():
@@ -1675,6 +1693,22 @@ class CrossSectionViewer:
             v = speed.astype(float)
         elif mode == "depth" and "SPHERICAL_DEPTH" in df.columns:
             v = df["SPHERICAL_DEPTH"].values[idx]
+        elif mode == "depth_travel" and "SPHERICAL_DEPTH" in df.columns and "TRACK_ID" in df.columns:
+            depth_range = df.groupby("TRACK_ID")["SPHERICAL_DEPTH"].transform(
+                lambda s: s.max() - s.min()
+            )
+            v = depth_range.values[idx].astype(float)
+            nan_mask = np.isnan(v)
+            v[nan_mask] = 0.0
+            valid = v[~nan_mask]
+            if len(valid) > 0:
+                vmax = max(np.percentile(valid, 98), 1e-6)
+                v_norm = np.clip(v / vmax, 0, 1)
+            else:
+                v_norm = np.zeros_like(v)
+            colors = _viridis_colors(v_norm)
+            colors[nan_mask] = [0.4, 0.4, 0.4, 0.15]
+            return colors
         elif mode == "theta" and "THETA_DEG" in df.columns:
             v = df["THETA_DEG"].values[idx]
         elif mode == "phi" and "PHI_DEG" in df.columns:
@@ -2154,6 +2188,25 @@ class EmbryoViewer:
         # ── Continuous modes ──
         if mode == "depth" and "SPHERICAL_DEPTH" in df.columns:
             v = df["SPHERICAL_DEPTH"].values[idx]
+        elif mode == "depth_travel" and "SPHERICAL_DEPTH" in df.columns and "TRACK_ID" in df.columns:
+            # Per-track total depth range: max - min SPHERICAL_DEPTH
+            depth_range = df.groupby("TRACK_ID")["SPHERICAL_DEPTH"].transform(
+                lambda s: s.max() - s.min()
+            )
+            v = depth_range.values[idx].astype(float)
+            # Spots without a track get NaN; give them grey
+            nan_mask = np.isnan(v)
+            v[nan_mask] = 0.0
+            # Percentile clipping for better contrast
+            valid = v[~nan_mask]
+            if len(valid) > 0:
+                vmax = max(np.percentile(valid, 98), 1e-6)
+                v_norm = np.clip(v / vmax, 0, 1)
+            else:
+                v_norm = np.zeros_like(v)
+            colors = _viridis_colors(v_norm)
+            colors[nan_mask] = [0.4, 0.4, 0.4, 0.15]
+            return colors
         elif mode == "theta" and "THETA_DEG" in df.columns:
             v = df["THETA_DEG"].values[idx]
         elif mode == "phi" and "PHI_DEG" in df.columns:
@@ -2394,6 +2447,23 @@ class EmbryoViewer:
                 props["color_value"] = sp
                 color_by = "color_value"
                 cmap = "viridis"
+        elif mode == "depth_travel" and "SPHERICAL_DEPTH" in df_t.columns:
+            # Per-track total depth range: colour each track by how far
+            # it travels radially through the blastoderm
+            depth_range = df_t.groupby("TRACK_ID")["SPHERICAL_DEPTH"].transform(
+                lambda s: s.max() - s.min()
+            ).values.astype(float)
+            nan_m = np.isnan(depth_range)
+            if not nan_m.all():
+                depth_range[nan_m] = 0.0
+                # Percentile clipping for better contrast across all tracks
+                valid = depth_range[~nan_m]
+                if len(valid) > 0:
+                    vmax = max(np.percentile(valid, 98), 1e-6)
+                    depth_range = np.clip(depth_range / vmax, 0, 1)
+                props["color_value"] = depth_range
+                color_by = "color_value"
+                cmap = "plasma"
         elif mode in col_map and col_map[mode] in df_t.columns:
             vals = df_t[col_map[mode]].values.astype(float)
             nan_m = np.isnan(vals)
@@ -2733,6 +2803,8 @@ class EmbryoViewer:
         btn_color_frame.changed.connect(lambda: self._recolor("frame"))
         btn_color_depth = PushButton(text="Colour by Depth")
         btn_color_depth.changed.connect(lambda: self._recolor("depth"))
+        btn_color_depth_travel = PushButton(text="Colour by Depth Travel")
+        btn_color_depth_travel.changed.connect(lambda: self._recolor("depth_travel"))
         btn_color_theta = PushButton(text="Colour by Latitude")
         btn_color_theta.changed.connect(lambda: self._recolor("theta"))
         btn_color_phi = PushButton(text="Colour by Longitude")
@@ -2800,6 +2872,7 @@ class EmbryoViewer:
                 Label(value="── Colouring ──"),
                 btn_color_frame,
                 btn_color_depth,
+                btn_color_depth_travel,
                 btn_color_theta,
                 btn_color_phi,
                 btn_color_speed,
@@ -3089,6 +3162,7 @@ class EmbryoViewer:
         df = self.spots
         needed = {
             "depth": "SPHERICAL_DEPTH",
+            "depth_travel": "SPHERICAL_DEPTH",
             "theta": "THETA_DEG",
             "phi": "PHI_DEG",
             "radial_vel": "RADIAL_VELOCITY_SMOOTH",

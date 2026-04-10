@@ -18,7 +18,19 @@ __pycache__/
 
 # ── Data (too large for git) ──
 *.csv
-analysis_output/
+*.tsv
+analysis_output*/
+archive/
+
+# ── Generated outputs ──
+*.pdf
+
+# ── LaTeX build artifacts ──
+*.aux
+*.log
+*.out
+*.toc
+*.synctex.gz
 
 # ── OS ──
 .DS_Store

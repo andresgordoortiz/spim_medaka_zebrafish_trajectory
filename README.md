@@ -7,9 +7,13 @@ Comparative 4D lightsheet whole-embryo nuclei tracking analysis — **medaka** v
 | Step | Script | Language | Purpose |
 |------|--------|----------|---------|
 | 1 | `embryo_viewer.py` | Python (napari) | Interactive 4D viewer: orientation, sphere fit, margin selection, export |
-| 1′ | `orientation_interactive.R` | R (Shiny) | Alternative Step 1 (lighter weight, no GPU needed) |
-| 2 | `trackmate_filter_and_validate.R` | R | Parameter-sweep QC filtering against manual ground truth |
-| 3 | `trackmate_analysis.R` | R | Full biological analysis (speed, displacement, ingression, radial velocity, …) |
+| 1′ | `ultrack_viewer.py` | Python (napari) | Variant of viewer for ultrack-format data |
+| 2 | `nuclear_stats.py` | Python | Per-timepoint nuclear density, size, and internuclear distance from segmented labels |
+| 3 | `gastrulation_dynamics_medaka.R` | R | Medaka-specific dynamics analysis (10 figures) |
+| 3′ | `gastrulation_dynamics_zebrafish.R` | R | Zebrafish-specific dynamics analysis (10 figures) |
+| 4 | `gastrulation_dynamics_comparison.R` | R | Cross-species comparison (7 figures) |
+| S1 | `medaka_density_analysis.R` | R | Supplementary: density & flow figures (medaka) |
+| S2 | `zebrafish_density_analysis.R` | R | Supplementary: density & flow figures (zebrafish) |
 
 ## Quick start
 
@@ -25,18 +29,12 @@ Comparative 4D lightsheet whole-embryo nuclei tracking analysis — **medaka** v
 ```bash
 git clone <repo-url>
 cd spim_medaka_zebrafish_trajectory
-
-# Creates .venv/ and installs all pinned dependencies (napari, scipy, pandas, …)
 uv sync
 ```
-
-> `uv sync` reads `pyproject.toml` + `uv.lock` and reproduces the exact same
-> environment on any machine. No conda, no Docker needed.
 
 ### 2. Set up R environment
 
 ```r
-# In R, from the project directory:
 renv::restore()
 ```
 
@@ -47,8 +45,6 @@ Put TrackMate CSV exports in the project root:
 ```
 medaka_25082025_combined_spots.csv
 medaka_25082025_combined_tracks.csv
-spots_zebrafish.csv
-tracks_zebrafish.csv
 ```
 
 *(CSVs are git-ignored because they are too large.)*
@@ -56,84 +52,65 @@ tracks_zebrafish.csv
 ## Running the napari 4D viewer (Step 1)
 
 ```bash
-# Full dataset
-uv run python embryo_viewer.py medaka_25082025_combined_spots.csv
-
-# With tracks overlay (progressive formation as time advances)
 uv run python embryo_viewer.py medaka_25082025_combined_spots.csv \
     -t medaka_25082025_combined_tracks.csv
-
-# Subsample for faster exploration on a laptop
-uv run python embryo_viewer.py medaka_25082025_combined_spots.csv --max-spots 500000
 ```
 
 **Inside the viewer:**
 
-1. Use the **time slider** (bottom) to scrub through frames — tracks form progressively
+1. Use the **time slider** to scrub through frames — tracks form progressively
 2. **Pick Animal Pole** → click a nucleus → **Pick Dorsal** → click a nucleus
 3. **Orient Embryo** → standardises axes (AP → +Y, Dorsal → +X)
 4. **Fit Sphere** → cap-aware sphere fit for SPIM thin-slab data
 5. **Apply Margin** → flag spots within a latitude band (adjustable sliders)
 6. **Colour buttons** → depth / latitude / frame / margin overlay
-7. **Export** → writes `analysis_output/oriented_spots.csv` + `sphere_params.csv`
+7. **Export** → writes oriented CSVs + `sphere_params.csv` to `oriented_*_ultrack/`
 
-### Running the R Shiny alternative (Step 1′)
-
-```r
-# In RStudio or R console
-shiny::runApp("orientation_interactive.R")
-```
-
-### Running Steps 2 & 3
+## Running the R analysis (Steps 3–4)
 
 ```r
-source("trackmate_filter_and_validate.R")
-source("trackmate_analysis.R")
+source("gastrulation_dynamics_medaka.R")     # → analysis_output_medaka/
+source("gastrulation_dynamics_zebrafish.R")   # → analysis_output_zebrafish/
+source("gastrulation_dynamics_comparison.R")  # → analysis_output_comparison/
 ```
 
 ## Project structure
 
 ```
-├── embryo_viewer.py               # napari 4D viewer (Python)
-├── orientation_interactive.R      # Shiny orientation app (R, alternative)
-├── trackmate_filter_and_validate.R
-├── trackmate_analysis.R
-├── pyproject.toml                 # Python dependencies (source of truth)
-├── uv.lock                        # Pinned Python lockfile (commit this!)
-├── requirements.txt               # Pip fallback
-├── renv.lock                      # Pinned R lockfile
-├── renv/activate.R
+├── embryo_viewer.py                     # napari 4D viewer (Step 1)
+├── ultrack_viewer.py                    # ultrack-format variant
+├── nuclear_stats.py                     # nuclear segmentation stats (Step 2)
+├── gastrulation_dynamics_medaka.R       # medaka analysis (Step 3)
+├── gastrulation_dynamics_zebrafish.R    # zebrafish analysis (Step 3′)
+├── gastrulation_dynamics_comparison.R   # cross-species comparison (Step 4)
+├── medaka_density_analysis.R            # supplementary density figures
+├── zebrafish_density_analysis.R         # supplementary density figures
+├── gastrulation_dynamics_methods.tex    # methods write-up (LaTeX)
+│
+├── oriented_medaka_ultrack/             # oriented input data (medaka)
+├── oriented_zebrafish_ultrack/          # oriented input data (zebrafish)
+├── nuclei_stats_medaka/                 # nuclear stats TSVs (medaka)
+├── nuclei_stats_zebrafish/              # nuclear stats TSVs (zebrafish)
+├── medaka_25082025_combined_*.csv       # raw TrackMate exports (git-ignored)
+│
+├── analysis_output_medaka/              # medaka output (10 PDFs + CSVs)
+├── analysis_output_zebrafish/           # zebrafish output (10 PDFs + CSVs)
+├── analysis_output_comparison/          # comparison output (7 PDFs + CSV)
+├── analysis_output_medaka_25082025/     # density analysis input (medaka)
+├── analysis_output_zebrafish_05112025/  # density analysis input (zebrafish)
+│
+├── pyproject.toml                       # Python dependencies
+├── uv.lock                             # pinned Python lockfile
+├── requirements.txt                     # pip fallback
+├── renv.lock                            # pinned R lockfile
+├── renv/                                # R environment
 ├── .gitignore
-└── archive/                       # Previous script versions
-```
-
-## Key files to commit
-
-```
-# Code
-embryo_viewer.py
-orientation_interactive.R
-trackmate_filter_and_validate.R
-trackmate_analysis.R
-
-# Environment lockfiles (reproducibility)
-pyproject.toml
-uv.lock
-requirements.txt
-renv.lock
-renv/activate.R
-renv/settings.json
-
-# Project config
-.gitignore
-spim_medaka_zebrafish_trajectory.Rproj
-README.md
+├── README.md
+└── archive/                             # superseded scripts & data
 ```
 
 ## Reproducibility notes
 
-- **Python**: `uv.lock` pins every transitive dependency to an exact version + hash.
-  Anyone running `uv sync` gets the identical environment.
-- **R**: `renv.lock` does the same for R packages. `renv::restore()` reproduces it.
-- **Data**: CSVs are git-ignored. Store them on a shared drive / Zenodo / figshare
-  and document the path in your lab notebook.
+- **Python**: `uv sync` reproduces the exact environment from `pyproject.toml` + `uv.lock`.
+- **R**: `renv::restore()` reproduces the R environment from `renv.lock`.
+- **Data**: CSVs are git-ignored. Store them on a shared drive / Zenodo / figshare.

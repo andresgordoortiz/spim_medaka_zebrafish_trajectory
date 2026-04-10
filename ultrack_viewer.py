@@ -2007,6 +2007,8 @@ class EmbryoViewer:
         # State
         self.animal_pole: np.ndarray | None = None
         self.dorsal_mark: np.ndarray | None = None
+        self.margin_landmark: np.ndarray | None = None       # margin Y cut
+        self.ingression_landmark: np.ndarray | None = None   # ingression centre
         self.oriented = False
         self.sphere_fit_result: dict | None = None
         self.transform_params: dict | None = None
@@ -2734,8 +2736,16 @@ class EmbryoViewer:
         btn_dorsal = PushButton(text="Pick Dorsal")
         btn_dorsal.changed.connect(lambda: self._set_pick_mode("dorsal"))
 
+        btn_margin = PushButton(text="Pick Margin")
+        btn_margin.changed.connect(lambda: self._set_pick_mode("margin"))
+
+        btn_ingression = PushButton(text="Pick Ingression Center")
+        btn_ingression.changed.connect(lambda: self._set_pick_mode("ingression"))
+
         self.lbl_ap = Label(value="AP: not set")
         self.lbl_dorsal = Label(value="Dorsal: not set")
+        self.lbl_margin = Label(value="Margin: not set")
+        self.lbl_ingression = Label(value="Ingression: not set")
 
         # ── Orient ──
         btn_orient = PushButton(text="Orient Embryo")
@@ -2848,6 +2858,10 @@ class EmbryoViewer:
                 self.lbl_ap,
                 btn_dorsal,
                 self.lbl_dorsal,
+                btn_margin,
+                self.lbl_margin,
+                btn_ingression,
+                self.lbl_ingression,
                 Label(value="── Orientation ──"),
                 btn_orient,
                 Label(value="── Sphere Fit ──"),
@@ -2912,6 +2926,8 @@ class EmbryoViewer:
                 "ap": "ANIMAL POLE",
                 "dorsal": "DORSAL",
                 "sphere_center": "SPHERE CENTER",
+                "margin": "MARGIN (click a cell at the margin boundary)",
+                "ingression": "INGRESSION CENTER (click where ingression is strongest)",
             }
             label = labels.get(mode, mode.upper())
             self.viewer.status = (
@@ -2971,6 +2987,44 @@ class EmbryoViewer:
         elif self._pick_mode == "sphere_center":
             self._pick_mode = "none"
             self._apply_manual_sphere_center(pos_xyz)
+        elif self._pick_mode == "margin":
+            self.margin_landmark = pos_xyz
+            # Compute θ if sphere is fitted
+            theta_str = ""
+            if self.sphere_fit_result is not None:
+                c = self.sphere_fit_result["center"]
+                d = pos_xyz - c
+                r = np.linalg.norm(d)
+                theta = np.degrees(np.arccos(np.clip(-d[1] / max(r, 1e-10), -1, 1)))
+                theta_str = f" | θ={theta:.1f}°"
+            self.lbl_margin.value = (
+                f"Margin: Y={pos_xyz[1]:.1f}{theta_str}"
+            )
+            self._pick_mode = "none"
+            self.viewer.status = (
+                f"Margin set at Y={pos_xyz[1]:.1f}{theta_str} "
+                f"(snapped {snap_d:.1f}µm to nearest spot)"
+            )
+        elif self._pick_mode == "ingression":
+            self.ingression_landmark = pos_xyz
+            theta_str, phi_str = "", ""
+            if self.sphere_fit_result is not None:
+                c = self.sphere_fit_result["center"]
+                d = pos_xyz - c
+                r = np.linalg.norm(d)
+                theta = np.degrees(np.arccos(np.clip(-d[1] / max(r, 1e-10), -1, 1)))
+                phi = np.degrees(np.arctan2(d[2], d[0]))
+                theta_str = f" | θ={theta:.1f}°"
+                phi_str = f", φ={phi:.1f}°"
+            self.lbl_ingression.value = (
+                f"Ingression: ({pos_xyz[0]:.1f}, {pos_xyz[1]:.1f}, {pos_xyz[2]:.1f})"
+                f"{theta_str}{phi_str}"
+            )
+            self._pick_mode = "none"
+            self.viewer.status = (
+                f"Ingression center set{theta_str}{phi_str} "
+                f"(snapped {snap_d:.1f}µm to nearest spot)"
+            )
         self._update_landmarks()
 
     def _update_landmarks(self):
@@ -2984,6 +3038,12 @@ class EmbryoViewer:
         if self.dorsal_mark is not None:
             pts.append([self.dorsal_mark[2], self.dorsal_mark[1], self.dorsal_mark[0]])
             colors.append("cyan")
+        if self.margin_landmark is not None:
+            pts.append([self.margin_landmark[2], self.margin_landmark[1], self.margin_landmark[0]])
+            colors.append("yellow")
+        if self.ingression_landmark is not None:
+            pts.append([self.ingression_landmark[2], self.ingression_landmark[1], self.ingression_landmark[0]])
+            colors.append("magenta")
 
         if pts:
             self.landmarks_layer.data = np.array(pts)
@@ -3634,6 +3694,11 @@ class EmbryoViewer:
         max_tracks = self._max_tracks
         color_mode = self._current_color_mode
 
+        # Snapshot gastrulation landmarks (margin + ingression)
+        margin_lm = self.margin_landmark.copy() if self.margin_landmark is not None else None
+        ingression_lm = self.ingression_landmark.copy() if self.ingression_landmark is not None else None
+        sphere_for_lm = sphere  # already snapshot
+
         self._pending_export_err = None
         self._pending_export_files = None
 
@@ -3731,6 +3796,33 @@ class EmbryoViewer:
                     )
                     ing_df.to_csv(out_dir / "ingression_params.csv", index=False)
                     files_written.append("ingression_params.csv")
+
+                # 5b. Gastrulation landmarks (margin + ingression center)
+                lm_rows = []
+                if margin_lm is not None:
+                    lm_rows.append({"landmark": "margin", "x": margin_lm[0],
+                                    "y": margin_lm[1], "z": margin_lm[2]})
+                    if sphere_for_lm is not None:
+                        c = sphere_for_lm["center"]
+                        d = margin_lm - c
+                        r = np.linalg.norm(d)
+                        theta = float(np.degrees(np.arccos(np.clip(-d[1] / max(r, 1e-10), -1, 1))))
+                        phi = float(np.degrees(np.arctan2(d[2], d[0])))
+                        lm_rows[-1].update({"theta": theta, "phi": phi})
+                if ingression_lm is not None:
+                    lm_rows.append({"landmark": "ingression_center", "x": ingression_lm[0],
+                                    "y": ingression_lm[1], "z": ingression_lm[2]})
+                    if sphere_for_lm is not None:
+                        c = sphere_for_lm["center"]
+                        d = ingression_lm - c
+                        r = np.linalg.norm(d)
+                        theta = float(np.degrees(np.arccos(np.clip(-d[1] / max(r, 1e-10), -1, 1))))
+                        phi = float(np.degrees(np.arctan2(d[2], d[0])))
+                        lm_rows[-1].update({"theta": theta, "phi": phi})
+                if lm_rows:
+                    lm_df = pd.DataFrame(lm_rows)
+                    lm_df.to_csv(out_dir / "gastrulation_landmarks.csv", index=False)
+                    files_written.append("gastrulation_landmarks.csv")
 
                 # 6. Per-track summary CSV
                 if "TRACK_ID" in spots_df.columns:

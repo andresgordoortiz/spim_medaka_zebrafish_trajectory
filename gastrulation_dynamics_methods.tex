@@ -1,0 +1,1272 @@
+\documentclass[11pt,a4paper]{article}
+
+% ── Packages ──
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb}
+\usepackage{geometry}
+\geometry{margin=2.2cm}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true, linkcolor=blue!60!black, citecolor=blue!50!black, urlcolor=blue!40!black}
+\usepackage{xcolor}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+\usepackage{caption}
+\usepackage{array}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small Gastrulation Dynamics --- Methods \& Metrics}
+\fancyhead[R]{\small\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+
+\titleformat{\section}{\Large\bfseries}{Figure~\thesection:}{0.5em}{}
+\titleformat{\subsection}{\large\bfseries}{\thesubsection}{0.5em}{}
+
+\newcommand{\um}{\,\mu\text{m}}
+\newcommand{\ummin}{\,\mu\text{m}/\text{min}}
+\newcommand{\ummin2}{\,\mu\text{m}/\text{min}^2}
+\newcommand{\umsq}{\,\mu\text{m}^2}
+\newcommand{\param}[1]{\texttt{#1}}
+
+% ══════════════════════════════════════════════════════════════════════
+\begin{document}
+
+\begin{center}
+  {\LARGE\bfseries Gastrulation Dynamics Pipeline\\[4pt]
+   Methods, Metrics \& Figure Descriptions}\\[12pt]
+  {\large Medaka In-Vivo Lightsheet Tracking --- Unified Analysis}\\[8pt]
+  {\normalsize Generated from \texttt{gastrulation\_dynamics.R},\\
+   \texttt{gastrulation\_dynamics\_comparison.R}, and
+   \texttt{nuclear\_stats.py}}
+\end{center}
+
+\vspace{1em}
+
+\tableofcontents
+\newpage
+
+% ══════════════════════════════════════════════════════════════════════
+\section*{Pipeline Overview}
+\addcontentsline{toc}{section}{Pipeline Overview}
+
+The unified script \texttt{gastrulation\_dynamics.R} analyses 4-D cell
+tracking data from medaka gastrulation (ultrack output, sphere-fitted,
+oriented via \texttt{embryo\_viewer.py}).  Each cell detection (``spot'')
+carries Cartesian coordinates $(x,y,z)$ already calibrated in microns, a
+frame number, a track ID, and pre-computed spherical coordinates:
+\begin{itemize}[nosep]
+  \item $\theta$ --- polar angle from the animal pole ($0^\circ =$ animal
+        pole, $90^\circ =$ equator, $180^\circ =$ vegetal pole).
+  \item $\phi$ --- azimuthal angle from the orientation reference.  The
+        biological dorsal midline lies at the ingression centre
+        ($\phi \approx -95^\circ$), not at $\phi=0$.
+  \item $r$ --- radial distance from the fitted sphere centre.
+  \item $d = R_\mathrm{sphere} - r$ --- spherical depth below the surface.
+        Positive values = inside the sphere; cells ingressing go deeper.
+\end{itemize}
+
+\noindent\textbf{No voxel calibration is needed}---positions in
+\texttt{oriented\_spots.csv} are already in microns.
+
+The pipeline proceeds in two phases:
+\begin{enumerate}[nosep]
+  \item \textbf{Phase~1 --- Computation} (Steps 1--8): data loading,
+        ingression cluster detection, velocity \& acceleration, dynamic
+        margin detection, static zone assignment, per-track metrics,
+        MSD, neighbor coordination.
+  \item \textbf{Phase~2 --- Plotting} (Figures 01--10 + 05b): eleven
+        multi-panel PDFs in biological narrative order.
+\end{enumerate}
+
+\noindent Three concurrent biological processes are analysed:
+\begin{description}[nosep,leftmargin=2cm]
+  \item[Epiboly] Dominant movement.  Cells spread vegetal-ward (increasing
+    $\theta$), driven by deep cell intercalation and yolk-cell contraction.
+  \item[Convergence] Movement toward the dorsal midline (ingression centre),
+    strongest near the dorsal lip.  Coupled with A-P extension.
+  \item[Ingression] Spatially restricted to a dorsal cluster near the margin.
+    Cells move radially inward (increasing spherical depth).
+    Time-dependent: onset detected from data.
+\end{description}
+
+
+% ── Parameters ──
+\subsection*{Parameters}
+\label{tab:params}
+
+\begin{longtable}{l c p{7cm}}
+\toprule
+\textbf{Parameter} & \textbf{Value} & \textbf{Meaning} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Parameter} & \textbf{Value} & \textbf{Meaning} \\
+\midrule
+\endhead
+\param{FRAME\_INTERVAL\_SEC} & 30 & Seconds between consecutive frames (0.5\,min) \\
+\param{SMOOTH\_K} & 3 & Rolling-mean smoothing window (frames) via \texttt{zoo::rollmean} \\
+\param{MSD\_MAX\_LAG} & 50 & Maximum lag in frames ($\approx$25\,min) for MSD \\
+\param{MSD\_N\_TRACKS} & 10\,000 & Max.\ tracks sampled for global MSD (3\,000 per zone/type) \\
+\param{MIN\_TRACK\_LENGTH} & 5 & Minimum frames for per-track metrics \\
+\param{ZONE\_MARGIN\_WIDTH} & 5 & Width of margin zone in $\theta$ (deg) above landmark \\
+\param{ZONE\_PREMARG\_WIDTH} & 10 & Width of pre-marginal zone (deg) above margin zone \\
+\param{INGRESSION\_DEPTH\_PCTILE} & 0.95 & Percentile of max-depth for ingression threshold \\
+\param{INGRESSION\_ONSET\_GAP\_WINDOW} & 5 & Half-window for slope estimation in onset detection \\
+\param{DEPTH\_EPOCH\_SIZE} & 20 & Frames per epoch for depth-reference computation \\
+\param{NEIGHBOR\_MAX\_DIST} & 100 & Maximum inter-cell distance ($\um$) for coordination \\
+\param{NEIGHBOR\_DIST\_BIN} & 10 & Distance bin width ($\um$) for coordination function \\
+\param{THETA\_BIN} & 3 & Latitude bin width (deg) for spatial flow maps \\
+\param{PHI\_BIN} & 5 & Longitude bin width (deg) for spatial flow maps \\
+\param{TILE\_DTHETA} / \param{TILE\_DPHI} & 1.5 / 2.5 & Spatial tile sizes (deg) for fine-grained heatmaps \\
+\param{FLOW\_MIN\_N} & 10 & Minimum cell count per tile for flow maps \\
+\param{MARGIN\_DENSITY\_FRAC} & 0.20 & Margin = most vegetal bin with density $\ge 20\%$ of peak \\
+\param{WIN} & 20 & Frames per time window for margin detection \\
+\bottomrule
+\caption{Analysis parameters.  Velocity is computed on consecutive frames
+($\Delta t = 1\text{ frame} = 0.5\text{ min}$).}
+\label{tab:params_table}
+\end{longtable}
+
+
+% ══════════════════════════════════════════════════════════════════════
+\newpage
+\section*{Preliminary Steps (Steps 1--8)}
+\addcontentsline{toc}{section}{Preliminary Steps (Steps 1--8)}
+
+% ── Step 1 ──
+\subsection*{Step 1: Data Loading}
+
+Three input files are loaded from \texttt{analysis\_output/}:
+\begin{itemize}[nosep]
+  \item \texttt{oriented\_spots.csv} --- all spot detections with Cartesian
+        and spherical coordinates (already in $\um$).
+  \item \texttt{sphere\_params.csv} --- fitted sphere centre and radius.
+  \item \texttt{gastrulation\_landmarks.csv} --- user-annotated margin
+        $\theta$-latitude and ingression centre $(\theta,\phi)$.
+\end{itemize}
+
+Angular coordinates $\theta$, $\phi$ are in degrees.  No voxel-to-micron
+conversion is required.
+
+% ── Step 2 ──
+\subsection*{Step 2: Ingression Cluster Detection}
+
+Identifies the spatial centre, radius, and temporal onset of the
+ingression (shield/organiser) region.
+
+\paragraph{Phase A --- Spatial cluster.}
+\begin{enumerate}[nosep]
+  \item For each track with $\ge 3$ frames, compute
+        $\mathrm{max\_depth} = \max_t d(t)$.
+  \item The depth threshold is the \param{INGRESSION\_DEPTH\_PCTILE}
+        (95th) percentile of max-depth across all tracks.
+  \item Tracks exceeding this threshold are ingression candidates.  Their
+        mean $(\theta,\phi)$ gives the cluster centre.
+  \item Angular distance of each candidate from the centre:
+        \[
+          d_\mathrm{ang} = \sqrt{(\theta_i - \bar\theta)^2
+                                +(\phi_i - \bar\phi)^2}
+        \]
+  \item Cluster radius:
+        $R_\mathrm{ingr} = \min\!\bigl(2\,\sigma(d_\mathrm{ang})+2,\;15\bigr)$
+        degrees.
+\end{enumerate}
+
+\paragraph{Phase B --- Onset detection.}
+The ``depth gap'' between the ingression cluster and the rest of the embryo
+is monitored over 10-frame epochs:
+\[
+  \mathrm{gap}(e) = \overline{d}\bigl|_\mathrm{inside\;cluster}
+                    -\overline{d}\bigl|_\mathrm{outside\;cluster}
+\]
+A local linear regression slope is computed in a sliding window of
+half-width $w = $ \param{INGRESSION\_ONSET\_GAP\_WINDOW}:
+\[
+  s_i = \beta_1 \;\;\text{from}\;\;
+  \mathrm{gap}_{i-w:i+w} = \beta_0 + \beta_1\,j + \varepsilon
+\]
+The onset epoch is the first index of \textbf{three consecutive positive
+slopes}.  Fallback: first epoch where $\mathrm{gap} > \bar g_0 + 2\sigma_0$
+(baseline mean $\pm$ 2\,SD from the first 5--10 epochs).
+
+% ── Step 3 ──
+\subsection*{Step 3: Velocity \& Acceleration}
+\label{sec:velocity}
+
+\subsubsection*{Position Smoothing}
+
+A centred rolling mean of width $k=3$ (\param{SMOOTH\_K}) is applied
+independently to each coordinate $(x,y,z,r,\theta,\phi)$ within each
+track, using \texttt{zoo::rollmean(k=3, align="center")}.  Edge frames
+where the window is incomplete retain the original unsmoothed value.
+\[
+  x_\mathrm{SM}(t) = \frac{1}{3}\bigl[x(t-1)+x(t)+x(t+1)\bigr]
+\]
+
+\subsubsection*{Displacement \& Speed}
+
+Displacements are computed between \textbf{consecutive frames} (lag = 1):
+\begin{align}
+  \Delta x &= x_\mathrm{SM}(t) - x_\mathrm{SM}(t-1) \\
+  d_{3\text{D}} &= \sqrt{\Delta x^2 + \Delta y^2 + \Delta z^2}
+\end{align}
+Only steps where $\Delta t_f = 1$ (no tracking gaps) are retained:
+\texttt{filter(!is.na(dt\_frames) \& dt\_frames == 1)}.
+
+Instantaneous speed:
+\[
+  v_\mathrm{inst} = \frac{d_{3\text{D}}}{\Delta t_f \cdot \Delta t_\mathrm{frame}}
+  \qquad [\ummin]
+\]
+where $\Delta t_\mathrm{frame} = 0.5$\,min.
+
+\subsubsection*{Spherical Velocity Components}
+
+\begin{align}
+  v_\mathrm{radial} &= \frac{\Delta r}{\Delta t_f \cdot \Delta t_\mathrm{frame}}
+    \quad (+\text{ = outward}) \\[3pt]
+  v_\mathrm{depth}  &= \frac{\Delta d}{\Delta t_f \cdot \Delta t_\mathrm{frame}}
+    \quad (+\text{ = deepening/ingressing})
+\end{align}
+where $\Delta d$ uses \emph{unsmoothed} depth (actual position relative to
+the sphere surface).
+
+Angular rates and tangential velocities on the sphere surface (radius $r$):
+\begin{align}
+  v_\theta &= \frac{\Delta\theta}{\Delta t_f \cdot \Delta t_\mathrm{frame}}
+              \quad [\text{deg/min}] \\[3pt]
+  v_\phi   &= \frac{\Delta\phi}{\Delta t_f \cdot \Delta t_\mathrm{frame}}
+              \quad [\text{deg/min}]
+\end{align}
+where $\Delta\phi$ is wrapped to $(-180,180]$ to handle the $\pm 180^\circ$
+discontinuity.
+
+\textbf{Tangential speed} on the sphere surface:
+\[
+  v_\mathrm{tan} = \frac{r \cdot \sqrt{\Delta\theta_\mathrm{rad}^2
+    + (\sin\theta \cdot \Delta\phi_\mathrm{rad})^2}}
+    {\Delta t_f \cdot \Delta t_\mathrm{frame}}
+  \qquad [\ummin]
+\]
+
+Decomposed into two biologically meaningful components:
+\begin{align}
+  v_\mathrm{epiboly} &= \frac{r \cdot \Delta\theta_\mathrm{rad}}
+    {\Delta t_f \cdot \Delta t_\mathrm{frame}}
+  \quad (+\text{ = vegetalward}) \\[4pt]
+  v_\mathrm{convergence} &= \frac{r \cdot \sin\theta \cdot \Delta\phi_\mathrm{rad}}
+    {\Delta t_f \cdot \Delta t_\mathrm{frame}}
+  \quad \text{(azimuthal)}
+\end{align}
+
+A derived quantity for convergence analysis:
+\[
+  v_\mathrm{conv.dorsal} = -\,v_\mathrm{convergence} \cdot
+  \operatorname{sign}(\phi - \phi_\mathrm{ingression})
+\]
+Positive values indicate movement \emph{toward} the dorsal/ingression
+midline.
+
+\subsubsection*{Acceleration}
+\[
+  a = \frac{2\,(v_\mathrm{inst}(t) - v_\mathrm{inst}(t-1))}
+           {(\Delta t_f(t) + \Delta t_f(t-1))\cdot\Delta t_\mathrm{frame}}
+  \qquad [\ummin2]
+\]
+
+\subsubsection*{Turning Angle}
+\[
+  \alpha = \arccos\!\left(
+    \frac{\vec{d}(t) \cdot \vec{d}(t-1)}
+         {|\vec{d}(t)|\;|\vec{d}(t-1)|}
+  \right) \cdot \frac{180}{\pi}
+  \qquad [^\circ]
+\]
+Clamped to $[0,180]$.  $0^\circ$ = persistent, $90^\circ$ = random,
+$180^\circ$ = reversal.
+
+% ── Step 4 ──
+\subsection*{Step 4: Dynamic Margin Detection}
+\label{sec:margin}
+
+The advancing epiboly front is tracked over time (used for epiboly
+figures, \emph{not} for zone assignment):
+
+\begin{enumerate}[nosep]
+  \item Time is divided into windows of \param{WIN}${}=20$ frames.
+  \item Within each window, $\theta$ is binned at $1^\circ$ resolution;
+        counts are smoothed with a 5-point rolling mean.
+  \item The \emph{density margin} is the maximum $\theta_\mathrm{bin}$ where
+        the smoothed count $\ge 20\%$ (\param{MARGIN\_DENSITY\_FRAC}) of the
+        peak count.
+  \item A \emph{velocity crossover} margin is detected where mean
+        $v_\mathrm{epiboly}$ transitions from positive to negative
+        (2-deg~$\theta$ bins, $n \ge 20$).
+  \item The combined margin is
+        $\theta_\mathrm{margin} = \max(\theta_\mathrm{density},
+        \theta_\mathrm{velocity})$ if they agree within $5^\circ$;
+        otherwise the density estimate alone is used.
+  \item A LOESS smoother (\texttt{span=0.75}) is fitted to the raw margin
+        series, then made monotonically non-decreasing via isotonic
+        regression (\texttt{isoreg}).  The result is clamped to be $\ge$
+        the user landmark.
+  \item The smooth margin is linearly interpolated to every frame.
+  \item Margin advance rate:
+        \[
+          \frac{d\theta_\mathrm{margin}}{dt}
+          = \frac{\theta_\mathrm{margin}(t+1)-\theta_\mathrm{margin}(t)}
+                 {\Delta t_\mathrm{frame}}
+        \]
+  \item Coverage fraction:
+        $\mathrm{coverage} = (\theta_\mathrm{margin} - 90^\circ) / 90^\circ$;
+        0\% at equator, 100\% at vegetal pole.
+\end{enumerate}
+
+\paragraph{Leading edge cells.}
+Cells within $\pm 5^\circ$ of the dynamic margin and with spherical depth
+$< 20\um$ are classified as leading-edge cells.  Their mean
+$v_\mathrm{epiboly}$ is computed per frame.
+
+% ── Step 5 ──
+\subsection*{Step 5: Static Zone Assignment}
+\label{sec:zones}
+
+Five spatial zones are defined relative to the \textbf{static user-annotated
+margin landmark} ($\theta_\mathrm{LM}$), \emph{not} the dynamically detected
+margin.  This ensures zone boundaries do not drift with time.
+
+\begin{itemize}[nosep]
+  \item \textbf{Ingression zone} (priority):
+    $d_\mathrm{ang} < R_\mathrm{ingr}$ \textbf{and}
+    $d_\mathrm{spherical} \ge d_\mathrm{floor}(\text{epoch})$
+  \item \textbf{Sub-marginal}: $\theta > \theta_\mathrm{LM}$
+  \item \textbf{Margin layer}: $\theta_\mathrm{LM} - W_\mathrm{margin}
+        \le \theta \le \theta_\mathrm{LM}$
+  \item \textbf{Pre-marginal}: $\theta_\mathrm{LM} - W_\mathrm{margin}
+        - W_\mathrm{premarg} \le \theta < \theta_\mathrm{LM} - W_\mathrm{margin}$
+  \item \textbf{Animal cap}: $\theta < \theta_\mathrm{LM}
+        - W_\mathrm{margin} - W_\mathrm{premarg}$
+\end{itemize}
+
+The ingression zone requires \emph{both} spatial proximity (within cluster
+radius) \emph{and} depth above the local baseline.  The depth floor
+$d_\mathrm{floor}$ is the epoch-wise median depth of cells at the same
+latitude band ($\theta \in [\bar\theta_\mathrm{ingr} \pm R_\mathrm{ingr}]$)
+but \emph{outside} the cluster.  This prevents shallow surface cells from
+being labelled as ingressors.
+
+\paragraph{Directional step classification (tangential only).}
+Each velocity step is classified into one of four categories based on
+$v_\mathrm{epiboly}$ and $v_\mathrm{conv.dorsal}$:
+\begin{itemize}[nosep]
+  \item \textbf{Epiboly (vegetal)}: $|v_\mathrm{epi}| \ge |v_\mathrm{conv}|$
+        and $v_\mathrm{epi} > 0$
+  \item \textbf{Animalward}: $|v_\mathrm{epi}| \ge |v_\mathrm{conv}|$
+        and $v_\mathrm{epi} \le 0$
+  \item \textbf{Convergence (toward dorsal)}:
+        $|v_\mathrm{conv}| > |v_\mathrm{epi}|$ and
+        $v_\mathrm{conv.dorsal} > 0$
+  \item \textbf{Divergence (away dorsal)}: otherwise
+\end{itemize}
+
+% ── Step 6 ──
+\subsection*{Step 6: Per-Track Metrics \& Movement Classification}
+
+Only tracks with $\ge$~\param{MIN\_TRACK\_LENGTH} (= 5) frames are included.
+
+\subsubsection*{Metrics}
+
+\begin{description}[style=nextline,leftmargin=2cm]
+  \item[Net displacement]
+    $D_\mathrm{net} = \sqrt{(x_\mathrm{last}-x_\mathrm{first})^2
+    + (y_\mathrm{last}-y_\mathrm{first})^2
+    + (z_\mathrm{last}-z_\mathrm{first})^2}$
+
+  \item[Total path length]
+    $L_\mathrm{path} = \sum_{t=1}^{N-1}
+    \sqrt{(x_{t+1}-x_t)^2 + (y_{t+1}-y_t)^2 + (z_{t+1}-z_t)^2}$
+
+  \item[Straightness (directionality ratio)]
+    $S = D_\mathrm{net} / L_\mathrm{path}$;\quad
+    $S=1$ for straight, $S\to 0$ for tortuous.
+
+  \item[Maximum displacement from start]
+    $D_\mathrm{max} = \max_t\sqrt{(x_t-x_0)^2+(y_t-y_0)^2+(z_t-z_0)^2}$
+
+  \item[Confinement ratio]
+    $C = D_\mathrm{max} / L_\mathrm{path}$;\quad
+    $C=1$ if the track never retreats.
+
+  \item[Persistence]
+    $P \equiv S$ (synonymous with straightness).
+
+  \item[Mean velocity components]
+    $\bar v_\mathrm{epi}$, $\bar v_\mathrm{conv}$, $\bar v_\mathrm{depth}$,
+    mean speed, mean turning angle --- averaged over all velocity steps in
+    the track.
+
+  \item[Net angular displacements]
+    $\Delta\theta_\mathrm{net}$, $\Delta\phi_\mathrm{net}$, and
+    $\Delta\phi_\mathrm{dorsal}$ (net dorsalward shift, sign-adjusted).
+\end{description}
+
+\subsubsection*{Movement Type Classification}
+
+Each track is classified into one of four categories using a hierarchical
+decision tree:
+
+\begin{enumerate}[nosep]
+  \item \textbf{Ingression} --- all of:
+    \begin{itemize}[nosep]
+      \item Within $R_\mathrm{ingr}$ of the cluster centre;
+      \item Track ends at or after the ingression onset frame;
+      \item Post-onset depth change $> 0$ (net deepening).
+    \end{itemize}
+  \item \textbf{Epiboly} --- if $\bar v_\mathrm{epiboly} > 0$ and the
+    epiboly fraction $> 0.3$:
+    \[
+      f_\mathrm{epi} = \frac{|\bar v_\mathrm{epi}|}
+        {|\bar v_\mathrm{epi}| + |\bar v_\mathrm{conv}| + 10^{-6}} > 0.3
+    \]
+  \item \textbf{Convergence} --- if net dorsalward displacement $> 0$,
+    convergence fraction $> 0.3$, and convergence fraction $>$ epiboly fraction.
+  \item \textbf{Mixed} --- all other tracks.
+\end{enumerate}
+
+Tiebreaker: if neither Epiboly nor Convergence criteria are met, net
+$\Delta\theta > 0$ is classified as Epiboly, net dorsalward $> 0$ as
+Convergence.
+
+% ── Step 7 ──
+\subsection*{Step 7: Mean Square Displacement}
+\label{sec:msd}
+
+\paragraph{MSD at lag $\tau$.}
+For each of up to \param{MSD\_N\_TRACKS} randomly sampled tracks (seed = 42):
+\begin{enumerate}[nosep]
+  \item For each pair of positions $(t, t+\tau)$ within a track where
+    $\mathrm{FRAME}(t+\tau)-\mathrm{FRAME}(t) = \tau$ (no gaps):
+    \[
+      \Delta r^2(t,\tau) = (x_{t+\tau}-x_t)^2+(y_{t+\tau}-y_t)^2+(z_{t+\tau}-z_t)^2
+    \]
+  \item Per track: mean of all valid $\Delta r^2$ at that lag.
+  \item Global MSD: weighted mean across tracks (weighted by pair count):
+    \[
+      \mathrm{MSD}(\tau) = \frac{\sum_k n_k\,\overline{\Delta r^2_k}}
+                                {\sum_k n_k}
+    \]
+\end{enumerate}
+
+\paragraph{MSD exponent $\alpha$.}
+Fitted by OLS on the first 10 lags in log-log space
+(\texttt{filter(lag\_frames <= 10 \& mean\_msd > 0)}, requires $\ge 3$
+points):
+\[
+  \log_{10}\!\bigl(\mathrm{MSD}\bigr) = \alpha\cdot\log_{10}(\tau_\mathrm{min})
+  + \text{const}
+\]
+$\alpha = 1$: diffusive;\quad $\alpha < 1$: subdiffusive;\quad
+$\alpha > 1$: superdiffusive;\quad $\alpha = 2$: ballistic.
+
+\paragraph{MSD by zone.}  Same algorithm applied to spots filtered by
+zone (up to 3\,000 tracks per zone).
+
+\paragraph{MSD by movement type.}  Same algorithm applied to spots whose
+track is classified as Epiboly, Convergence, Ingression, or Mixed
+(up to 3\,000 tracks per type).
+
+\paragraph{MSD $\alpha$ over time.}  Sliding windows of 30 frames
+($= 15$\,min), stepped by 30 frames.  Within each window:
+max-lag~$= 15$, up to 2\,000 tracks.  Windows with $< 100$ unique tracks
+are skipped.
+
+% ── Step 8 ──
+\subsection*{Step 8: Neighbor Velocity Coordination}
+\label{sec:neighbors}
+
+The analysis quantifies how aligned cell velocities are as a function of
+inter-cell distance.  Computed on $\le 30$ randomly sampled frames (seed = 42).
+Within each frame:
+
+\begin{enumerate}[nosep]
+  \item Up to 3\,000 cells are sampled (if the frame has more).
+  \item For each cell $i$, the displacement vector $\vec{v}_i = (\Delta x,
+    \Delta y, \Delta z)$ is normalised: $\hat v_i = \vec{v}_i / (|\vec{v}_i|
+    + 10^{-10})$.
+  \item Up to 50\,000 random cell pairs $(i,j)$ with $i\ne j$ are sampled.
+    For each pair with distance $\le$ \param{NEIGHBOR\_MAX\_DIST} (100\,$\um$):
+    \[
+      c_{ij} = \hat v_i \cdot \hat v_j
+      \qquad \text{(cosine similarity)}
+    \]
+\end{enumerate}
+
+\paragraph{Binning.}  Pairs are binned by distance at
+\param{NEIGHBOR\_DIST\_BIN} $= 10\um$ intervals.  Per bin:
+\[
+  \overline{c}(d) = \frac{1}{n}\sum_{\|r_{ij}\|\in\mathrm{bin}} c_{ij},
+  \qquad
+  \mathrm{SE}(d) = \frac{\sigma(c)}{\sqrt{n}}
+\]
+
+\paragraph{Near vs.\ far alignment over time.}
+Pairs are split into ``Near'' ($< 30\um$) and ``Far'' ($30$--$100\um$),
+with mean cosine computed per frame per group.
+
+\paragraph{Frame-level filters.}
+\begin{itemize}[nosep]
+  \item Frames with $< 20$ cells (insufficient velocity vectors) are skipped.
+  \item Within a frame, if $> 3{,}000$ cells, a random subsample of 3\,000
+        is drawn.
+  \item Up to 50\,000 random cell pairs per frame.
+\end{itemize}
+
+
+% ══════════════════════════════════════════════════════════════════════
+% FIGURES — Biological Narrative Order
+% ══════════════════════════════════════════════════════════════════════
+\newpage
+
+\section{Spatial Context --- Zone Definition \& Epiboly Front}
+\label{fig:spatial_context}
+
+\noindent\textbf{Output:} \texttt{dynamics\_01\_spatial\_context.pdf}
+(4 panels, 2$\times$2 layout)
+
+This figure introduces the spatial framework: where is the margin? How are
+zones defined? How does the epiboly front advance?
+
+\subsection*{Panel Descriptions}
+
+\begin{description}[style=nextline,leftmargin=1.5cm]
+  \item[01a] \textbf{Epiboly front position over time.}
+    Red line: smoothed + monotonically increasing margin trajectory.
+    Coloured points: raw detection coloured by method
+    (\texttt{density+velocity}, \texttt{density}, or \texttt{interpolated}).
+    Gold dotted line: user margin landmark.
+    \textbf{Filter:} raw margin points shown only where
+    \texttt{!is.na(margin\_raw)}.
+
+  \item[01b] \textbf{Epiboly rate (front advance speed).}
+    $d\theta_\mathrm{margin}/dt$ vs.\ time.
+    Raw line with LOESS smooth (\texttt{span=0.5}).
+    Horizontal dashed line at 0.
+    \textbf{Filter:} \texttt{filter(!is.na(dmargin\_dt))}.
+
+  \item[01c] \textbf{Static zones at four time points.}
+    Scatter plots of all cells in $(\phi,\theta)$ space, coloured by zone
+    (5 colours).  Four snapshots: pre-onset, onset, early post-onset, late.
+    Gold solid line = user landmark ($\theta_\mathrm{LM}$), gold dashed =
+    margin-zone top, gold dotted = pre-marginal top.
+    White dashed = detected epiboly front (dynamic margin).
+    Magenta circle = auto-detected ingression cluster.
+    Point size 0.2, alpha 0.4.
+
+  \item[01d] \textbf{Zone composition over time} (excl.\ ingression).
+    Stacked area chart of cell fractions per latitudinal zone in 5-min bins.
+    Ingression zone excluded and fractions recomputed without it (ingression
+    is spatial, not latitudinal, and distorts fractions).
+\end{description}
+
+
+% ══════════════════════════════════════════════════════════════════════
+\section{Cell Kinematics --- Speed \& Velocity Components}
+\label{fig:kinematics}
+
+\noindent\textbf{Output:} \texttt{dynamics\_02\_kinematics.pdf}
+(4 panels, 2$\times$2 layout)
+
+\subsection*{Panel Descriptions}
+
+\begin{description}[style=nextline,leftmargin=1.5cm]
+  \item[02a] \textbf{Instantaneous speed distribution.}
+    Histogram (100 bins) of $v_\mathrm{inst}$ across all velocity steps.
+    Dashed vertical line at the median. $x$-axis truncated at the 99th
+    percentile.
+
+  \item[02b] \textbf{Speed by zone.}
+    Violin + box-plot (inner width 0.15) of $v_\mathrm{inst}$ for each of
+    the five zones.  $y$-axis truncated at the 95th percentile.
+    \textbf{Filter:} \texttt{filter(!is.na(zone))}.
+
+  \item[02c] \textbf{Mean speed over time by zone.}
+    10-minute bins.  Mean speed $\pm$ SE ribbon, coloured by zone.
+    \textbf{Filter:} \texttt{filter(n\_cells >= 50)} per (time-bin, zone).
+
+  \item[02d] \textbf{Velocity components over time by zone.}
+    Same 10-min bins.  Three components ($v_\mathrm{epiboly}$,
+    $v_\mathrm{convergence}$, $v_\mathrm{depth}$) as separate coloured lines.
+    Faceted by zone with free $y$-scales.  Horizontal dotted line at 0.
+    \textbf{Filter:} \texttt{filter(n\_cells >= 50)}.
+\end{description}
+
+
+% ══════════════════════════════════════════════════════════════════════
+\section{Epiboly Dynamics}
+\label{fig:epiboly}
+
+\noindent\textbf{Output:} \texttt{dynamics\_03\_epiboly.pdf}
+(4 panel groups, 3 rows)
+
+\subsection*{Panel Descriptions}
+
+\begin{description}[style=nextline,leftmargin=1.5cm]
+  \item[03a] \textbf{Embryo coverage by blastoderm.}
+    $\mathrm{coverage}\% = (\theta_\mathrm{margin} - 90^\circ) / 90^\circ
+    \times 100$.  $0\%$ = equator, $100\%$ = vegetal pole.
+    \textbf{Filter:} \texttt{filter(!is.na(coverage\_frac))}.
+
+  \item[03b] \textbf{Leading edge velocity.}
+    Mean $v_\mathrm{epiboly}$ of cells within $5^\circ$ of the margin and
+    with depth $< 20\um$, per frame.  Raw line plus LOESS smooth
+    (\texttt{span=0.3}).  Horizontal dashed line at 0.
+
+  \item[03c] \textbf{Epiboly velocity profile by latitude.}
+    At 6 evenly spaced time points (5\% to 95\% of the movie), a
+    $\pm$15-frame window ($\pm 7.5$\,min) is used for stable averages.
+    $\theta$ binned at $2^\circ$.  Mean $v_\mathrm{epiboly}$ per bin.
+    Faceted by time; red dashed vertical line = margin position.
+    \textbf{Filter:} \texttt{filter(n >= 10)} per $\theta$-bin.
+
+  \item[03d] \textbf{Epiboly velocity tile field.}
+    At 4 time points (same as Fig~01c), $\pm$20-frame windows.
+    Tiles of $1.5^\circ \times 2.5^\circ$.  Diverging colour scale:
+    orange = vegetalward, blue = animalward, centred at 0, limits
+    $\pm 3\ummin$.  Spatial landmarks overlaid (gold margin, magenta
+    ingression circle).
+\end{description}
+
+
+% ══════════════════════════════════════════════════════════════════════
+\section{Convergence-Extension}
+\label{fig:convergence}
+
+\noindent\textbf{Output:} \texttt{dynamics\_04\_convergence.pdf}
+(6 panels, 3 rows $\times$ 2)
+
+\subsection*{Panel Descriptions}
+
+\begin{description}[style=nextline,leftmargin=1.5cm]
+  \item[04a] \textbf{Convergence vs.\ distance from dorsal midline.}
+    Mean $v_\mathrm{conv.dorsal}$ binned by absolute azimuthal distance from
+    the ingression centre ($3^\circ$ bins).  Ribbon = $\pm$SE.
+    Positive = toward dorsal.
+    \textbf{Filter:} \texttt{filter(n >= FLOW\_MIN\_N)}.
+
+  \item[04b] \textbf{Global convergence over time.}
+    Mean $v_\mathrm{conv.dorsal}$ in 5-min bins, all cells.
+    Ribbon = $\pm$SE.
+
+  \item[04c] \textbf{Convergence by zone over time.}
+    Same 5-min bins, separated by zone. Horizontal dashed at 0.
+
+  \item[04d] \textbf{Velocity vs.\ distance from margin.}
+    Mean $v_\mathrm{convergence}$ and $v_\mathrm{epiboly}$ binned by
+    $\mathrm{dist\_from\_margin} = \theta_\mathrm{margin} - \theta$
+    ($5^\circ$ bins, range $-20$ to $+60$).  Red dotted line at margin
+    (distance 0).
+    \textbf{Filter:} \texttt{filter(n >= FLOW\_MIN\_N)}.
+
+  \item[04e] \textbf{Convergence-extension coupling near dorsal.}
+    Cells within $15^\circ$ of the ingression centre ($\phi$-axis).  10-min
+    bins: mean $v_\mathrm{conv.dorsal}$ vs.\ mean $v_\mathrm{epiboly}$,
+    connected as a time-trajectory path coloured by time (viridis).
+    Pearson correlation $r$ annotated.
+    \textbf{Filter:} \texttt{filter(n >= FLOW\_MIN\_N)}.
+
+  \item[04f] \textbf{Convergence spatial map + mean flow vectors.}
+    Tile heatmap ($1.5^\circ \times 2.5^\circ$) of mean
+    $v_\mathrm{conv.dorsal}$.  Diverging scale: green = toward dorsal,
+    red = away.  White arrows: mean flow vectors on a coarser grid
+    ($3^\circ \times 5^\circ$), scaled to 0.8 tile widths at the maximum
+    magnitude.
+    \textbf{Filter:} \texttt{filter(n >= FLOW\_MIN\_N)} for both tiles
+    and arrows.
+\end{description}
+
+
+% ══════════════════════════════════════════════════════════════════════
+\section{Ingression Analysis}
+\label{fig:ingression}
+
+\noindent\textbf{Output:} \texttt{dynamics\_05\_ingression.pdf}
+(6 panels, 4 rows)
+
+Ingression $=$ cells deepening below the embryo surface at the dorsal
+cluster.  The ingression zone requires both spatial proximity \emph{and}
+depth $\ge$ the same-latitude median (see \S\ref{sec:zones}).
+
+\subsection*{Panel Descriptions}
+
+\begin{description}[style=nextline,leftmargin=1.5cm]
+  \item[05a] \textbf{Spherical depth map (ingression marker).}
+    Tile heatmap ($1.5^\circ \times 2.5^\circ$) at 4 time points ($\pm$20-frame
+    windows).  Colour: inferno scale, limits $[0, 60]\um$.  Deeper = more
+    ingressed.  Magenta circle + gold margin overlaid.
+
+  \item[05b] \textbf{Depth anomaly.}
+    Same tiles as 05a.  Each tile's depth minus its latitude-row mean depth:
+    \[
+      \delta d(\theta,\phi) = \bar{d}(\theta,\phi)
+        - \overline{\bar{d}}(\theta)
+    \]
+    Diverging scale: red = deeper than latitude average (ingressing),
+    blue = shallower.  99th-percentile symmetric limits.
+
+  \item[05c] \textbf{Median depth over time: ingression zone vs.\
+    same-latitude control.}
+    10-frame epochs.  Ribbon = IQR.  Red = ingression zone, blue =
+    same-latitude non-ingression cells.  Vertical dotted red line = onset.
+
+  \item[05d] \textbf{Depth gap over time.}
+    $\mathrm{gap} = \mathrm{median}(d|_\mathrm{zone}) -
+    \mathrm{median}(d|_\mathrm{control})$.  Increasing gap = cells in zone
+    deepen relative to neighbours.  Vertical dotted red line = onset.
+
+  \item[05e] \textbf{Blastoderm thickness over time} (depth IQR).
+    $\mathrm{thickness} = Q_3(d) - Q_1(d)$ per 10-frame epoch, separately
+    for ingression zone and same-latitude control.  Shows how
+    same-latitude control thins steadily while the ingression zone resists
+    thinning.
+
+  \item[05f] \textbf{Depth distribution post-onset.}
+    Kernel density of spherical depth for ingression zone vs.\
+    same-latitude control, using all spots after the onset frame.
+    \textbf{Filter:} \texttt{filter(FRAME >= INGRESSION\_ONSET\_FRAME)}.
+\end{description}
+
+
+% ══════════════════════════════════════════════════════════════════════
+\section*{Figure 5b: Ingression Zone --- Comparative Kinematics}
+\addcontentsline{toc}{section}{Figure 5b: Ingression Zone Comparative Kinematics}
+\label{fig:ingression_kin}
+
+\noindent\textbf{Output:} \texttt{dynamics\_05b\_ingression\_kinematics.pdf}
+(4 panels, 2$\times$2 layout)
+
+Compares ingression zone cells with same-latitude non-ingression cells to
+test whether kinematic differences are spatially controlled.
+
+\subsection*{Panel Descriptions}
+
+\begin{description}[style=nextline,leftmargin=1.5cm]
+  \item[05b-a] \textbf{Speed: ingression zone vs.\ same-latitude control
+    vs.\ rest.}
+    Mean speed in 10-min bins, $\pm$\,SE ribbon.  Three groups:
+    ``Ingression zone'' (within cluster radius), ``Same-lat non-ingression''
+    (same $\theta$ range but outside cluster), ``Other'' (rest of embryo).
+    Vertical dotted red line = onset.
+
+  \item[05b-b] \textbf{Blastoderm depth over time (thinning vs.\
+    ingression).}
+    Mean depth in 10-min bins, $\pm$\,SE ribbon, same three groups.
+    Demonstrates that epiboly thins the blastoderm except where cells
+    ingress.
+
+  \item[05b-c] \textbf{MSD by zone (ingression highlighted).}
+    Log-log MSD from Step~7, all zones overlaid.  Ingression zone line
+    thickened (linewidth 1.5 vs.\ 0.5) for emphasis.
+
+  \item[05b-d] \textbf{Track straightness: zone vs.\ same-lat control.}
+    Violin + box-plot of straightness for ``Ingression zone'' vs.\
+    ``Same-lat control'' subset of tracks.
+    \textbf{Filter:} excludes ``Other'' tracks.
+\end{description}
+
+
+% ══════════════════════════════════════════════════════════════════════
+\setcounter{section}{5}
+\section{Directional Decomposition \& Movement Classification}
+\label{fig:direction}
+
+\noindent\textbf{Output:} \texttt{dynamics\_06\_directional.pdf}
+(6 panels, 3 rows $\times$ 2)
+
+\subsection*{Step Classification}
+
+Each velocity step is classified into one of four tangential directions
+(see \S\ref{sec:zones}).  Radial (depth) changes are analysed separately
+in the ingression section.
+
+\subsection*{Direction Angle}
+\[
+  \alpha_\mathrm{dir} = \arctan2(v_\mathrm{convergence},\;v_\mathrm{epiboly})
+  \cdot \frac{180}{\pi}
+  \qquad \in (-180,180]
+\]
+$0^\circ$ = pure epiboly, $\pm 90^\circ$ = pure convergence/divergence,
+$\pm 180^\circ$ = pure animalward.
+
+\subsection*{Panel Descriptions}
+
+\begin{description}[style=nextline,leftmargin=1.5cm]
+  \item[06a] \textbf{Direction of tangential movement.}
+    Histogram (72 bins) of $\alpha_\mathrm{dir}$.  Custom axis labels:
+    Div.\ / Anti-epi.\ / Epi.\ / Conv.\ / Div.
+    \textbf{Filter:} \texttt{filter(!is.na(angle))}.
+
+  \item[06b] \textbf{Speed by movement direction.}
+    Violin + box-plot of $v_\mathrm{inst}$ by step type (4 categories).
+    $y$-axis truncated at 95th percentile.
+
+  \item[06c] \textbf{Movement direction composition over time.}
+    Stacked area chart of step-type percentages in 10-min bins.
+
+  \item[06d] \textbf{Movement directions by zone.}
+    Stacked bar of step-type percentages per zone.
+
+  \item[06e] \textbf{Velocity components by latitude.}
+    $\theta$ binned at \param{THETA\_BIN}$^\circ$.  Per bin: mean speed,
+    $v_\mathrm{epiboly}$, $v_\mathrm{convergence}$, $v_\mathrm{depth}$.
+    Horizontal dotted at 0.
+    \textbf{Filter:} \texttt{filter(n >= FLOW\_MIN\_N)}.
+
+  \item[06f] \textbf{Track movement type by zone.}
+    Stacked bar of track-level classification (Epiboly / Convergence /
+    Ingression / Mixed) per zone.
+    \textbf{Filter:} \texttt{filter(!is.na(zone))}.
+\end{description}
+
+
+% ══════════════════════════════════════════════════════════════════════
+\section{Track Properties --- Straightness, Persistence \& Confinement}
+\label{fig:track_props}
+
+\noindent\textbf{Output:} \texttt{dynamics\_07\_track\_properties.pdf}
+(4 panels, 2$\times$2 layout)
+
+\subsection*{Panel Descriptions}
+
+\begin{description}[style=nextline,leftmargin=1.5cm]
+  \item[07a] \textbf{Track straightness by zone.}
+    Violin + box-plot of $S$ (net/total path) for each zone.
+    \textbf{Filter:} \texttt{filter(!is.na(zone))}.
+
+  \item[07b] \textbf{Mean turning angle by zone.}
+    Violin + box-plot of $\bar\alpha$ for each zone.
+    \textbf{Filter:} \texttt{filter(!is.na(mean\_turning), !is.na(zone))}.
+
+  \item[07c] \textbf{Confinement ratio by movement type.}
+    Violin + box-plot of $C = D_\mathrm{max}/L_\mathrm{path}$ for each
+    of the four movement types.  $y$-axis $[0,1]$.
+
+  \item[07d] \textbf{Straightness vs.\ mean speed.}
+    Scatter plot coloured by movement type.  Points at $\alpha=0.15$,
+    size 0.5.  $x$-axis truncated at 99th percentile.
+\end{description}
+
+
+% ══════════════════════════════════════════════════════════════════════
+\section{Neighbor Velocity Coordination}
+\label{fig:neighbors}
+
+\noindent\textbf{Output:} \texttt{dynamics\_08\_neighbors.pdf}
+(4 panels, 2$\times$2 layout)
+
+\subsection*{Panel Descriptions}
+
+\begin{description}[style=nextline,leftmargin=1.5cm]
+  \item[08a] \textbf{Velocity alignment vs.\ neighbor distance.}
+    Mean cosine similarity $\pm$\,SE ribbon, binned at $10\um$.
+    Horizontal dashed at 0 (uncorrelated).
+    $1 =$ same direction, $0 =$ uncorrelated, $-1 =$ opposing.
+
+  \item[08b] \textbf{Alignment over time (near vs.\ far).}
+    Mean cosine per frame for ``Near $(<30\um)$'' and ``Far $(30$--$100\um)$''
+    pairs.
+
+  \item[08c] \textbf{Space-time alignment heatmap.}
+    $10\um$-distance bins $\times$ 10-min time bins.  Diverging scale:
+    red = coordinated, blue = anti-correlated, white = random.
+    \textbf{Filter:} \texttt{filter(n >= 20)} per (distance, time) bin.
+
+  \item[08d] \textbf{Local alignment spatial map.}
+    Mean cosine similarity of near-neighbor ($< 30\um$) pairs, binned
+    spatially at $\theta_\mathrm{bin} \times \phi_\mathrm{bin}$ resolution,
+    using a subset of 5 sampled frames.  Diverging scale.
+    \textbf{Filter:} \texttt{filter(n >= 3)} per spatial bin.
+\end{description}
+
+
+% ══════════════════════════════════════════════════════════════════════
+\section{Mean Square Displacement --- Diffusion vs.\ Directed Motion}
+\label{fig:msd}
+
+\noindent\textbf{Output:} \texttt{dynamics\_09\_msd.pdf}
+(4 panels, 2$\times$2 layout)
+
+\subsection*{Panel Descriptions}
+
+\begin{description}[style=nextline,leftmargin=1.5cm]
+  \item[09a] \textbf{Global MSD (log-log).}
+    MSD vs.\ time lag.  Reference lines:
+    dashed = $\alpha=1$ (diffusive), dotted = $\alpha=2$ (ballistic),
+    anchored at the first MSD point.  Subtitle reports fitted $\alpha$.
+
+  \item[09b] \textbf{MSD by zone.}
+    Log-log MSD for each zone, coloured by zone colours.
+
+  \item[09c] \textbf{MSD by movement type.}
+    Log-log MSD for each track-level movement type (Epiboly, Convergence,
+    Ingression, Mixed).
+
+  \item[09d] \textbf{MSD exponent $\alpha$ over time.}
+    30-frame sliding windows.  Horizontal references at $\alpha=1$ (dashed)
+    and $\alpha=2$ (dotted).
+    \textbf{Filter:} windows with $< 100$ unique tracks are skipped.
+\end{description}
+
+
+% ══════════════════════════════════════════════════════════════════════
+\section{Spatial Flow Summary}
+\label{fig:spatial_flow}
+
+\noindent\textbf{Output:} \texttt{dynamics\_10\_spatial\_summary.pdf}
+(8 panels, 4 rows $\times$ 2)
+
+Velocity data are spatially binned at
+$\param{THETA\_BIN}\times\param{PHI\_BIN}$ ($3^\circ \times 5^\circ$)
+resolution (time-averaged over the entire movie).
+\textbf{Filter:} \texttt{filter(n >= FLOW\_MIN\_N)} ($\ge 10$ cells per bin).
+
+\subsection*{Panel Descriptions}
+
+\begin{description}[style=nextline,leftmargin=1.5cm]
+  \item[10a] \textbf{Velocity vector field.}
+    Arrows: tail at tile centre, tip displaced by $3\times$ the mean
+    tangential velocity ($\Delta\phi \propto v_\mathrm{convergence}$,
+    $\Delta\theta \propto v_\mathrm{epiboly}$).
+    Colour = mean speed (viridis-B scale).  Spatial landmarks overlaid.
+
+  \item[10b] \textbf{Speed map.}
+    Tile heatmap of mean $v_\mathrm{inst}$ (viridis-B scale).
+
+  \item[10c] \textbf{Depth change rate (ingression signal).}
+    Tile heatmap of mean $v_\mathrm{depth}$.  Diverging scale:
+    red = deepening (ingressing), blue = surfacing.  Limits
+    $\pm 0.1\ummin$.
+
+  \item[10d] \textbf{Convergence toward dorsal midline.}
+    Tile heatmap of mean $v_\mathrm{conv.dorsal}$.  Diverging scale:
+    green = toward dorsal, red = away.
+
+  \item[10e] \textbf{Epiboly velocity.}
+    Tile heatmap of mean $v_\mathrm{epiboly}$.  Orange = vegetalward,
+    blue = animalward.
+
+  \item[10f] \textbf{Dominant movement type per bin.}
+    Each tile coloured by the majority track-level classification.
+    Ingression declared dominant if $> 15\%$ of cells in a tile are
+    classified as Ingression; otherwise the plurality type wins.
+    \textbf{Filter:} \texttt{filter(n\_total >= FLOW\_MIN\_N)}.
+
+  \item[10g] \textbf{Flow fields at three stages.}
+    Vector fields at 10\%, 50\%, and 90\% of the time series.
+    $\pm$5-frame windows, coarser bins ($6^\circ \times 10^\circ$).
+    \textbf{Filter:} \texttt{filter(n >= 5)} per bin.
+
+  \item[10h] \textbf{Movement type fraction over time.}
+    Stacked area chart of track-level movement-type proportions projected
+    onto spot-frames, in 5-min bins.
+\end{description}
+
+
+% ══════════════════════════════════════════════════════════════════════
+\section*{Summary of Output Files}
+\addcontentsline{toc}{section}{Summary of Output Files}
+
+\begin{longtable}{l l l}
+\toprule
+\textbf{Figure \#} & \textbf{Filename} & \textbf{Content} \\
+\midrule
+01  & \texttt{dynamics\_01\_spatial\_context.pdf}       & Zones, margin, epiboly front \\
+02  & \texttt{dynamics\_02\_kinematics.pdf}              & Speed \& velocity components \\
+03  & \texttt{dynamics\_03\_epiboly.pdf}                 & Margin advance, coverage, velocity profiles \\
+04  & \texttt{dynamics\_04\_convergence.pdf}              & Dorsal convergence, CE coupling \\
+05  & \texttt{dynamics\_05\_ingression.pdf}               & Depth maps, depth gap, thickness \\
+05b & \texttt{dynamics\_05b\_ingression\_kinematics.pdf}  & Ingression zone vs.\ rest kinematics \\
+06  & \texttt{dynamics\_06\_directional.pdf}              & Step classification, direction histograms \\
+07  & \texttt{dynamics\_07\_track\_properties.pdf}        & Straightness, persistence, confinement \\
+08  & \texttt{dynamics\_08\_neighbors.pdf}                & Velocity coordination \\
+09  & \texttt{dynamics\_09\_msd.pdf}                      & Mean square displacement \\
+10  & \texttt{dynamics\_10\_spatial\_summary.pdf}          & Vector fields, integrated maps \\
+\bottomrule
+\end{longtable}
+
+\noindent\textbf{CSV outputs:}
+\begin{itemize}[nosep]
+  \item \texttt{dynamics\_track\_metrics.csv}: per-track metrics for all
+    tracks with $\ge 5$ frames.
+  \item \texttt{dynamics\_data\_summary.csv}: scalar summary statistics
+    (speeds, MSD $\alpha$, straightness, margin advance, etc.).
+  \item \texttt{dynamics\_margin\_detected.csv}: per-frame margin position
+    and detection metadata.
+\end{itemize}
+
+
+% ══════════════════════════════════════════════════════════════════════
+\newpage
+\section*{Nuclear Statistics Pipeline (\texttt{nuclear\_stats.py})}
+\addcontentsline{toc}{section}{Nuclear Statistics Pipeline (nuclear\_stats.py)}
+\label{sec:nuclear_stats_py}
+
+The Python script \texttt{nuclear\_stats.py} processes per-timepoint
+segmented label images (3D TIF stacks, $Z \times Y \times X$) and produces
+three TSV files per species:
+
+\begin{itemize}[nosep]
+  \item \texttt{nuclear\_stats\_per\_slice.tsv} --- per (timepoint, z-slice)
+        statistics.
+  \item \texttt{nuclear\_stats\_per\_time.tsv} --- per timepoint (3D) summary.
+  \item \texttt{nuclear\_stats\_global.tsv} --- global summary across all
+        timepoints.
+\end{itemize}
+
+\subsection*{Voxel Calibration}
+
+Voxel size $(dz, dy, dx)$ in $\um$ is auto-read from TIFF metadata
+(\texttt{ImageJ spacing} for $dz$; \texttt{XResolution}/\texttt{YResolution}
+tags for $dy$, $dx$, with unit conversion from inches or centimetres).
+Override via \texttt{--voxel-size DZ DY DX}.
+
+\subsection*{Per-Slice 2D Statistics}
+
+For each z-slice of each timepoint:
+
+\begin{description}[style=nextline,leftmargin=2cm]
+  \item[Nuclear count] Number of unique non-zero labels in the slice.
+  \item[Density] $\rho_{2\text{D}} = N / A_\mathrm{slice}$ where
+    $A_\mathrm{slice} = H \cdot W \cdot dy \cdot dx$ \;$[\um^{-2}]$.
+  \item[Nuclear area] Per-nucleus area from \texttt{regionprops(area)}
+    $\times\; dy \cdot dx$ \;$[\um^2]$.  Mean, median, std reported.
+  \item[Equivalent-circle diameter]
+    $d_\mathrm{eq} = 2\sqrt{A/\pi}$ for each nucleus.
+  \item[Nearest-neighbor distance]  2D Euclidean distance between centroids,
+    scaled to $\um$, using a KD-tree (\texttt{scipy.spatial.KDTree}, $k=2$,
+    skip-self).  Requires $\ge 2$ nuclei; otherwise NaN.
+\end{description}
+
+\subsection*{Per-Timepoint 3D Statistics}
+
+For the full 3D label stack:
+
+\begin{description}[style=nextline,leftmargin=2cm]
+  \item[Nuclear count] $N_\mathrm{3D}$: number of 3D connected components.
+  \item[Volume] Per-nucleus voxel count $\times\; dz \cdot dy \cdot dx$
+    \;$[\um^3]$.
+  \item[Equivalent-sphere diameter]
+    $d_\mathrm{eq} = 2\left(\dfrac{3V}{4\pi}\right)^{1/3}$.
+  \item[Bounding-box extents] The major (longest) and minor (shortest)
+    dimensions of each nucleus's 3D bounding box, in $\um$.
+  \item[3D NN distance] Centroid-based KD-tree query (3 dimensions scaled
+    to $\um$).
+\end{description}
+
+\subsection*{Core Z-Range Filtering}
+\label{sec:core_z}
+
+\paragraph{Rationale.}  At the embryo cap (extreme z-slices), the imaging
+plane clips nuclei tangentially, producing under-segmented merged blobs with
+artifactually large cross-sections.
+
+\paragraph{Algorithm.}
+\begin{enumerate}[nosep]
+  \item Per timepoint, count nuclei per z-slice.
+  \item The \emph{core z-range} spans all z-slices where nuclei count
+    $\ge 25\%$ of the peak count (\texttt{CORE\_Z\_FRAC = 0.25}).
+  \item \textbf{3D core stats}: only nuclei whose centroid $z$-coordinate
+    falls within the core range are included.
+  \item \textbf{2D weighted summary}: per-slice 2D metrics are averaged
+    using per-slice nuclei counts as weights.
+\end{enumerate}
+
+\subsection*{Parallelisation}
+
+Processing uses \texttt{concurrent.futures.ProcessPoolExecutor} with
+configurable worker count (\texttt{-j/--workers}, default = all CPUs).
+Each timepoint TIF is processed independently.
+
+
+% ══════════════════════════════════════════════════════════════════════
+\newpage
+\section*{Cross-Species Comparison Figures}
+\addcontentsline{toc}{section}{Cross-Species Comparison Figures}
+\label{sec:comparison}
+
+The comparison script (\texttt{gastrulation\_dynamics\_comparison.R}) loads
+the computed metrics from both species' output directories and produces 7
+side-by-side figures in \texttt{analysis\_output\_comparison/}.
+
+\subsection*{Comparison Parameters}
+
+\begin{itemize}[nosep]
+  \item \param{MSD\_MAX\_LAG} = 20, \param{MSD\_N\_TRACKS} = 8\,000,
+        \param{MIN\_TRACK\_LENGTH} = 5
+  \item \texttt{TIME\_BIN\_MIN = 10} (10-minute bins for temporal panels)
+  \item Voxel calibration applied to raw oriented spots for the old
+        per-species scripts.
+\end{itemize}
+
+
+% ── Comparison Figure 1 ──
+\subsection*{Comparison Figure 1: Velocity \& Epiboly}
+
+\noindent\textbf{Output:} \texttt{comparison\_01\_speed.pdf}
+(8 panels, 4 rows)
+
+\begin{description}[style=nextline,leftmargin=1.5cm]
+  \item[1a] Mean speed over time (10-min bins) with 95\% CI ribbons.
+    \textbf{Filter:} \texttt{filter(n >= 50)}.
+  \item[1b] Kernel density of instantaneous speed (both species overlaid).
+    \textbf{Filter:} \texttt{filter(disp\_3d > 0)}.
+  \item[1c] Percentage of vegetalward steps over time.
+    \textbf{Filter:} \texttt{filter(n >= 50)}.
+  \item[1d] Track-level movement type proportions (stacked bar).
+  \item[1e] Strict epiboly velocity (vegetalward-only steps).
+    \textbf{Filter:} \texttt{filter(v\_epiboly > 0), filter(n >= 50)}.
+  \item[1f] Net epiboly velocity (all steps, signed).
+    \textbf{Filter:} \texttt{filter(n >= 50)}.
+  \item[1g] Angular epiboly rate $d\theta/dt$ (deg/min).
+  \item[1h] Summary bar chart: overall speed, epiboly speed, net epiboly,
+    vegetalward fraction, angular rate.
+\end{description}
+
+
+% ── Comparison Figure 2 ──
+\subsection*{Comparison Figure 2: Straightness \& Persistence}
+
+\noindent\textbf{Output:} \texttt{comparison\_02\_straightness.pdf}
+(6 panels, 3 rows)
+
+Validates that species differences in turning angle and straightness are
+real biological signals, not segmentation noise, by recomputing at four
+smoothing levels per species.
+
+\begin{description}[style=nextline,leftmargin=1.5cm]
+  \item[2a] Turning angle density by species, coloured by smoothing level.
+  \item[2b] Median turning angle vs.\ smoothing level.
+  \item[2c] Straightness density by species, coloured by smoothing level.
+  \item[2d] Median straightness vs.\ smoothing level.
+  \item[2e] Turning angle density after aggressive smoothing --- direct
+    species overlay.
+  \item[2f] Confinement ratio density, species overlaid.
+\end{description}
+
+
+% ── Comparison Figure 3 ──
+\subsection*{Comparison Figure 3: Mean Square Displacement}
+
+\noindent\textbf{Output:} \texttt{comparison\_03\_msd.pdf}
+(3 panels, 2 rows)
+
+\begin{description}[style=nextline,leftmargin=1.5cm]
+  \item[3a] MSD on log-log axes, species overlaid with $\alpha$ annotation.
+  \item[3b] MSD on linear axes.
+  \item[3c] Effective diffusivity $D_\mathrm{eff}(\tau)=\mathrm{MSD}/(4\tau)$.
+\end{description}
+
+
+% ── Comparison Figure 4 ──
+\subsection*{Comparison Figure 4: Blastoderm Thickness}
+
+\noindent\textbf{Output:} \texttt{comparison\_04\_thickness.pdf}
+(4 panels, 2 rows)
+
+\begin{description}[style=nextline,leftmargin=1.5cm]
+  \item[4a] LOESS-smoothed thickness (P5--P95) over time by zone.
+  \item[4b] Mean thickness by zone (grouped bar $\pm$\,SE).
+  \item[4c] Kernel density of spherical depth, species overlaid.
+  \item[4d] Estimated cell layers by zone.
+\end{description}
+
+
+% ── Comparison Figure 5 ──
+\subsection*{Comparison Figure 5: Nuclear Properties}
+
+\noindent\textbf{Output:} \texttt{comparison\_05\_nuclear.pdf}
+(8 panels, 4 rows)
+
+\begin{description}[style=nextline,leftmargin=1.5cm]
+  \item[5a] 3D equivalent-sphere diameter over time with CI ribbons.
+  \item[5b] 3D nuclear volume (median) over time.
+  \item[5c] Nuclei count over time.
+  \item[5d] 3D NN distance (median) over time.
+  \item[5e] Lateral nuclear width (bbox minor axis).
+  \item[5f] Cell-cycle duration:
+    $T_2 = \ln 2 / \lambda$, where
+    $\lambda = d(\ln N)/dt$ from LOESS-smoothed counts.
+  \item[5g] Summary bar chart: early-to-late \% change.
+  \item[5h] Nuclear aspect ratio (bbox major / minor).
+\end{description}
+
+
+% ── Comparison Figure 6 ──
+\subsection*{Comparison Figure 6: Directional Composition}
+
+\noindent\textbf{Output:} \texttt{comparison\_06\_direction.pdf}
+(4 panels, 2 rows)
+
+\begin{description}[style=nextline,leftmargin=1.5cm]
+  \item[6a] Fraction of vegetalward steps over time (10-min bins).
+  \item[6b] Mean net epiboly velocity over time.
+  \item[6c] Mean depth velocity over time.
+  \item[6d] Track movement-type composition (stacked bar, per species).
+\end{description}
+
+
+% ── Comparison Figure 7 ──
+\subsection*{Comparison Figure 7: Summary Table}
+
+\noindent\textbf{Output:} \texttt{comparison\_07\_summary\_table.pdf} and
+\texttt{comparison\_summary\_table.csv}
+
+Visual table showing all scalar summary metrics side by side with the
+Medaka/Zebrafish ratio.
+
+
+% ══════════════════════════════════════════════════════════════════════
+\newpage
+\section*{Master Filter Reference}
+\addcontentsline{toc}{section}{Master Filter Reference}
+
+The table below summarises all data filters and minimum-count thresholds
+applied across the unified pipeline (\texttt{gastrulation\_dynamics.R}).
+
+\begin{longtable}{p{4.5cm} p{3cm} p{7cm}}
+\toprule
+\textbf{Filter} & \textbf{Value} & \textbf{Where Applied} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Filter} & \textbf{Value} & \textbf{Where Applied} \\
+\midrule
+\endhead
+\texttt{dt\_frames == 1} & Consecutive & Velocity steps (Step~3) \\
+\texttt{n() >= MIN\_TRACK\_LENGTH} & $\ge 5$ frames & Track metrics (Step~6) \\
+\texttt{n\_frames >= 3} & $\ge 3$ frames & Ingression candidate tracks (Step~2) \\
+\texttt{n\_frames\_post >= 3} & $\ge 3$ frames & Post-onset depth tracks (Step~2) \\
+\texttt{n\_cells >= 50} & 50 per bin & Speed-over-time (Fig~02c/d), epiboly profiles \\
+\texttt{n >= FLOW\_MIN\_N} & $\ge 10$ & Flow tiles (Figs~04, 06e, 10), latitude bins \\
+\texttt{n >= 10} & 10 per bin & Epiboly profiles (Fig~03c) \\
+\texttt{n >= 20} & 20 per bin & Space-time alignment heatmap (Fig~08c) \\
+\texttt{n >= 3} & 3 per bin & Local alignment map (Fig~08d) \\
+\texttt{n\_cells >= 5} & 5 per tile & Depth/convergence tiles (Fig~04f arrow data) \\
+\texttt{nrow(sub) < 20} & skip frame & Neighbor coordination (Step~8) \\
+\texttt{sub > 3000 $\to$ sample} & 3\,000 & Max cells per frame for coordination \\
+$< 100$ tracks $\to$ skip & 100 & MSD time-windowed $\alpha$ (Step~7) \\
+\texttt{lag\_frames <= 10, msd > 0} & --- & MSD $\alpha$ fitting \\
+\texttt{FRAME >= onset} & --- & Post-onset depth distribution (Fig~05f) \\
+\texttt{depth >= local\_depth\_floor} & epoch median & Ingression zone depth criterion \\
+\texttt{depth < 20 um} & 20$\um$ & Leading edge cell selection \\
+\texttt{$|\theta - \mathrm{margin}| < 5$} & $5^\circ$ & Leading edge cell selection \\
+\texttt{$|$phi dist$| < 15$} & $15^\circ$ & CE coupling near-dorsal filter (Fig~04e) \\
+\texttt{ingr > 15\%} & 15\% & Dominant movement type threshold (Fig~10f) \\
+\bottomrule
+\caption{Complete filter reference for the unified pipeline.}
+\end{longtable}
+
+\end{document}

@@ -6,6 +6,8 @@ From: royerlab/ultrack:0.6.1-cpu
     pip install --no-cache-dir \
         "numpy>=1.23.5,<2.0" \
         "cupy-cuda12x>=13,<14" \
+        pybdv \
+        tqdm \
         nvidia-cuda-nvrtc-cu12 \
         nvidia-cuda-runtime-cu12 \
         nvidia-cuda-cccl-cu12 \

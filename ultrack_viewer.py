@@ -1998,6 +1998,9 @@ class EmbryoViewer:
         self,
         spots_df: pd.DataFrame | None = None,
         tracks_df: pd.DataFrame | None = None,
+        segments_zarr_path: str | Path | None = None,
+        voxel_size: tuple[float, float, float] = (1.0, 1.0, 1.0),
+        preload: bool = False,
     ):
         napari, magicgui = _import_napari()
 
@@ -2031,8 +2034,18 @@ class EmbryoViewer:
         )
         self._track_width: float = 2.0  # track line width
 
+        # Segments state
+        self._segments_data = None  # dask array (T, Z, Y, X)
+        self._segments_layer = None  # napari Labels layer
+        self._voxel_size = voxel_size  # (Z, Y, X) in µm
+        self._preload = preload
+
         # Create viewer
         self.viewer = napari.Viewer(title="Embryo 4D Viewer", ndisplay=3)
+
+        # Load segments if provided
+        if segments_zarr_path is not None:
+            self._load_segments(segments_zarr_path)
 
         # Load data layers if provided
         if self.spots is not None:
@@ -2055,6 +2068,87 @@ class EmbryoViewer:
 
         # Connect click handler for landmark selection
         self.viewer.mouse_drag_callbacks.append(self._on_click)
+
+    # ── Segments (Labels) layer ────────────────────────────────────────
+
+    def _load_segments(self, zarr_path: str | Path) -> None:
+        """Load segments.zarr lazily via dask and add a Labels layer."""
+        import dask.array as da
+        import zarr
+
+        zarr_path = Path(zarr_path).resolve()
+        print(f"Loading segments: {zarr_path}")
+        store = zarr.open(str(zarr_path), mode="r")
+
+        if isinstance(store, zarr.Array):
+            data = da.from_zarr(str(zarr_path))
+            print(f"  4D zarr array: shape={data.shape}, dtype={data.dtype}")
+        elif isinstance(store, zarr.Group):
+            keys = sorted(int(k) for k in store.keys())
+            first = store[str(keys[0])]
+            lazy_frames = [
+                da.from_zarr(str(zarr_path), component=str(k)) for k in keys
+            ]
+            data = da.stack(lazy_frames, axis=0)
+            print(f"  Zarr group: {len(keys)} timepoints, "
+                  f"spatial={first.shape}, dtype={first.dtype}")
+        else:
+            raise ValueError(f"Unexpected zarr layout at {zarr_path}")
+
+        if self._preload:
+            import time as _time
+            nbytes = data.nbytes
+            print(f"  Preloading {nbytes / 1e9:.1f} GB into RAM ...")
+            t0 = _time.time()
+            data = data.compute()  # dask → numpy: everything in RAM
+            elapsed = _time.time() - t0
+            print(f"  Preloaded in {elapsed:.0f}s — scrubbing will be instant")
+
+        self._segments_data = data
+        scale_4d = (1,) + tuple(self._voxel_size)  # (T, Z, Y, X)
+        self._segments_layer = self.viewer.add_labels(
+            data,
+            name="Nuclei 3D",
+            scale=scale_4d,
+            opacity=0.5,
+            rendering="translucent",
+        )
+        self.viewer.dims.axis_labels = ["t", "z", "y", "x"]
+        print(f"  Labels layer added: {data.shape[0]} timepoints, "
+              f"scale={scale_4d}")
+
+    def _load_segments_from_ui(self) -> None:
+        """Open a folder dialog to load a segments.zarr directory."""
+        from qtpy.QtWidgets import QFileDialog
+
+        zarr_dir = QFileDialog.getExistingDirectory(
+            self.viewer.window._qt_window,
+            "Select segments.zarr directory",
+        )
+        if not zarr_dir:
+            return
+        try:
+            # Remove existing segments layer
+            if self._segments_layer is not None:
+                try:
+                    self.viewer.layers.remove(self._segments_layer)
+                except (ValueError, KeyError):
+                    pass
+                self._segments_layer = None
+            self._load_segments(zarr_dir)
+            self.lbl_segments_status.value = (
+                f"Loaded: {self._segments_data.shape}"
+            )
+        except Exception as e:
+            self.lbl_segments_status.value = f"Error: {e}"
+
+    def _on_segments_opacity_changed(self, value: float) -> None:
+        if self._segments_layer is not None:
+            self._segments_layer.opacity = value / 100.0
+
+    def _on_segments_visible_changed(self, value: bool) -> None:
+        if self._segments_layer is not None:
+            self._segments_layer.visible = value
 
     def _add_spots_layer(self):
         """Add the main nuclei points layer."""
@@ -2693,6 +2787,20 @@ class EmbryoViewer:
             else "No tracks loaded"
         )
 
+        btn_load_segments = PushButton(text="Load Segments (.zarr)")
+        btn_load_segments.changed.connect(self._load_segments_from_ui)
+        self.lbl_segments_status = Label(
+            value=f"Loaded: {self._segments_data.shape}"
+            if self._segments_data is not None
+            else "No segments loaded"
+        )
+        self.segments_visible_cb = CheckBox(value=True, text="Show 3D nuclei")
+        self.segments_visible_cb.changed.connect(self._on_segments_visible_changed)
+        self.segments_opacity_slider = FloatSlider(
+            value=50, min=0, max=100, step=5, label="Nuclei 3D opacity %"
+        )
+        self.segments_opacity_slider.changed.connect(self._on_segments_opacity_changed)
+
         # ── Display controls ──
         self.display_pct_slider = FloatSlider(
             value=100, min=1, max=100, step=1, label="Display %"
@@ -2846,6 +2954,10 @@ class EmbryoViewer:
                 self.lbl_spots_status,
                 btn_load_tracks,
                 self.lbl_tracks_status,
+                btn_load_segments,
+                self.lbl_segments_status,
+                self.segments_visible_cb,
+                self.segments_opacity_slider,
                 Label(value="━━ ⏱ TIME WINDOW ━━"),
                 self.track_frame_start,
                 self.track_frame_end,
@@ -4060,35 +4172,65 @@ def main():
         "--tracks", "-t", default=None, help="Path to tracks CSV (optional)"
     )
     parser.add_argument(
+        "--segments", "-s", default=None,
+        help="Path to segments.zarr (ultrack label volume, 4D)",
+    )
+    parser.add_argument(
+        "--voxel-size", type=float, nargs=3, default=[1.0, 1.0, 1.0],
+        metavar=("Z", "Y", "X"),
+        help="Voxel size in µm (Z Y X) for segments layer. Default: 1.0 1.0 1.0",
+    )
+    parser.add_argument(
         "--max-spots",
         type=int,
         default=None,
         help="Max spots to load (subsample for speed)",
+    )
+    parser.add_argument(
+        "--preload",
+        action="store_true",
+        help="Load entire segments.zarr into RAM for smooth time scrubbing "
+             "(requires enough memory for the full volume)",
     )
     args = parser.parse_args()
 
     spots_df = None
     tracks_df = None
 
-    if args.spots:
-        fmt = _detect_csv_format(args.spots)
-        print(f"Loading spots from {args.spots} (detected: {fmt} format)...")
-        spots_df = load_spots(args.spots)
+    # Determine spots source: explicit spots arg, or fall back to --tracks
+    spots_path = args.spots
+    if spots_path is None and args.tracks is not None:
+        spots_path = args.tracks  # tracks CSV has all position columns
+
+    if spots_path:
+        fmt = _detect_csv_format(spots_path)
+        print(f"Loading spots from {spots_path} (detected: {fmt} format)...")
+        spots_df = load_spots(spots_path)
         print(f"  {len(spots_df):,} spots, {spots_df['FRAME'].nunique()} frames")
 
         if args.max_spots and len(spots_df) > args.max_spots:
             print(f"  Subsampling to {args.max_spots:,} spots...")
             spots_df = spots_df.sample(args.max_spots, random_state=42)
 
-        if args.tracks:
-            print(f"Loading tracks from {args.tracks}...")
+    if args.tracks:
+        print(f"Loading tracks from {args.tracks}...")
+        fmt_t = _detect_csv_format(args.tracks)
+        if fmt_t == "ultrack":
+            tracks_df = load_ultrack_csv(args.tracks)
+        else:
             tracks_df = load_trackmate_csv(args.tracks)
-            print(f"  {len(tracks_df):,} track records")
-    else:
-        print("Launching viewer — use 'Load Spots CSV' button to open files.")
+        print(f"  {len(tracks_df):,} track records")
+
+    if spots_df is None and args.segments is None:
+        print("Launching viewer — use buttons to open files.")
 
     print("Launching napari viewer...")
-    viewer = EmbryoViewer(spots_df, tracks_df)
+    viewer = EmbryoViewer(
+        spots_df, tracks_df,
+        segments_zarr_path=args.segments,
+        voxel_size=tuple(args.voxel_size),
+        preload=args.preload,
+    )
 
     napari, _ = _import_napari()
     napari.run()

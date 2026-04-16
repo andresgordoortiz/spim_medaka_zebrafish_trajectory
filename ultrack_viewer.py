@@ -1023,7 +1023,7 @@ class CrossSectionViewer:
         self.frame_slider = FloatSlider(
             value=fmin, min=fmin, max=fmax, step=1, label="Frame"
         )
-        self.frame_slider.changed.connect(self._schedule_rebuild)
+        self.frame_slider.changed.connect(self._on_frame_changed)
 
         self.all_frames_check = CheckBox(value=False, text="Show all frames")
         self.all_frames_check.changed.connect(self._on_all_frames_changed)
@@ -1192,7 +1192,7 @@ class CrossSectionViewer:
         self._first_rebuild = True
         self._last_axis = self._axis
         self._in_rebuild = False
-        self._oriented_grid_cache = None  # cached grid for oriented extraction
+        self._oriented_grid_cache = {}  # ds → grid dict for oriented extraction
 
         # Sync cross-section frame with main viewer's timepoint
         self._sync_with_main = True
@@ -1286,14 +1286,14 @@ class CrossSectionViewer:
         self.pos_slider.max = r[1]
         self.pos_slider.value = mid
         # Image dimensions change with axis — must recreate layers + grid
-        self._oriented_grid_cache = None
+        self._oriented_grid_cache = {}
         self._remove_image_layers()
         self._rebuild()
 
     def _on_thickness_changed(self):
         self._thickness = self.thickness_slider.value
         # Thickness change affects image extraction — recreate grid
-        self._oriented_grid_cache = None
+        self._oriented_grid_cache = {}
         self._remove_image_layers()
         self._schedule_rebuild()
 
@@ -1335,14 +1335,113 @@ class CrossSectionViewer:
         self._rebuild()
 
     def _schedule_rebuild(self, *_args):
-        """Debounce rapid slider changes with 50ms QTimer."""
+        """Debounce rapid slider changes with 50ms QTimer (full rebuild)."""
         from qtpy.QtCore import QTimer
 
+        # Cancel pending frame-only update — full rebuild supersedes it
+        if hasattr(self, "_frame_timer") and self._frame_timer.isActive():
+            self._frame_timer.stop()
         if not hasattr(self, "_debounce_timer"):
             self._debounce_timer = QTimer()
             self._debounce_timer.setSingleShot(True)
             self._debounce_timer.timeout.connect(self._rebuild)
         self._debounce_timer.start(50)
+
+    def _on_frame_changed(self, *_args):
+        """Schedule lightweight frame-only update (skip sphere/tracks/landmarks)."""
+        from qtpy.QtCore import QTimer
+
+        # If a full rebuild is pending, skip — it handles everything
+        if hasattr(self, "_debounce_timer") and self._debounce_timer.isActive():
+            return
+        if self._recording:
+            self._schedule_rebuild()
+            return
+        if not hasattr(self, "_frame_timer"):
+            self._frame_timer = QTimer()
+            self._frame_timer.setSingleShot(True)
+            self._frame_timer.timeout.connect(self._frame_update)
+        self._frame_timer.start(50)
+
+    def _frame_update(self):
+        """Fast path when only the frame changed.
+
+        Updates image slices and points only.  Tracks auto-filter via
+        napari's dims slider.  Sphere, landmarks, and center don't
+        depend on frame and are left untouched.
+        """
+        if self._in_rebuild:
+            return
+        self._in_rebuild = True
+        try:
+            # ── Image slices ──
+            self._update_image_slices()
+
+            # ── Points ──
+            if self.points_layer is not None:
+                try:
+                    self.viewer.layers.remove(self.points_layer)
+                except Exception:
+                    pass
+                self.points_layer = None
+
+            mask = self._get_slab_mask()
+            idx = np.where(mask)[0]
+
+            if self._display_pct < 100 and len(idx) > 0:
+                n_show = max(100, int(len(idx) * self._display_pct / 100))
+                if n_show < len(idx):
+                    rng = np.random.default_rng(0)
+                    idx = rng.choice(idx, n_show, replace=False)
+                    idx.sort()
+
+            if len(idx) > 0:
+                data = self._project(idx)
+                colors = self._get_colors(idx)
+                self.points_layer = self.viewer.add_points(
+                    data,
+                    name="Nuclei",
+                    size=self.point_size_slider.value,
+                    face_color=colors,
+                    border_width=0,
+                    ndim=2,
+                )
+
+            # ── Info label ──
+            pos = self.pos_slider.value
+            half = self._thickness / 2.0
+            info = f"Cut {self._axis}={pos:.0f} ± {half:.0f}  |  {len(idx):,} spots"
+            if not self._show_all:
+                info += f"  |  frame {int(self.frame_slider.value)}"
+            else:
+                info += "  |  all frames"
+            n_tracks = 0
+            if self.tracks_layer is not None:
+                try:
+                    n_tracks = len(np.unique(self.tracks_layer.data[:, 0]))
+                except Exception:
+                    pass
+            if n_tracks > 0:
+                info += f"  |  {n_tracks:,} tracks"
+            self.lbl_info.value = info
+
+            # ── Canvas repaint ──
+            try:
+                self.viewer.window._qt_viewer.canvas.native.update()
+            except Exception:
+                pass
+
+            # ── Dims step for tracks auto-filtering ──
+            frame = int(self.frame_slider.value)
+            try:
+                step = list(self.viewer.dims.current_step)
+                if len(step) >= 3:
+                    step[0] = frame
+                    self.viewer.dims.current_step = tuple(step)
+            except Exception:
+                pass
+        finally:
+            self._in_rebuild = False
 
     # ── Core rebuild ─────────────────────────────────────────────────
 
@@ -1414,7 +1513,7 @@ class CrossSectionViewer:
                 idx = rng.choice(idx, n_show, replace=False)
                 idx.sort()
 
-        # ── Image slices (persistent layers, updated in-place) ──
+        # ── Image slices (remove/re-add each frame) ──
         self._update_image_slices()
 
         # ── Points ──
@@ -1844,10 +1943,14 @@ class CrossSectionViewer:
         pos = self.pos_slider.value
         half = self._thickness / 2.0
 
-        cache_key = (axis, round(pos, 1), round(half, 1), round(ds, 2))
-        if (self._oriented_grid_cache is not None
-                and self._oriented_grid_cache.get("key") == cache_key):
-            return self._oriented_grid_cache
+        # Include id(params) + MIP state so cache invalidates correctly
+        mip_on = getattr(self, "slice_mip_check", None)
+        mip_on = mip_on.value if mip_on is not None else True
+        cache_key = (axis, round(pos, 1), round(half, 1), round(ds, 2), id(params), mip_on)
+        ds_key = round(ds, 2)
+        cached = self._oriented_grid_cache.get(ds_key)
+        if cached is not None and cached.get("key") == cache_key:
+            return cached
 
         R1, R2, center = params["R1"], params["R2"], params["center"]
         R_inv = R1.T @ R2.T
@@ -1871,8 +1974,7 @@ class CrossSectionViewer:
         v_idx = self._COL_TO_IDX[v_col]
         h_idx = self._COL_TO_IDX[h_col]
 
-        use_mip = getattr(self, "slice_mip_check", None)
-        use_mip = use_mip.value if use_mip is not None else True
+        use_mip = mip_on
         if use_mip:
             n_slab = max(1, min(int(2 * half / max(ds, 1)), 5))
             pos_vals = np.linspace(pos - half, pos + half, max(n_slab, 3))
@@ -1902,7 +2004,7 @@ class CrossSectionViewer:
         )
         translate_out = (v_min, h_min)
 
-        self._oriented_grid_cache = {
+        entry = {
             "key": cache_key,
             "coords_list": coords_list,
             "n_v": n_v,
@@ -1910,40 +2012,48 @@ class CrossSectionViewer:
             "scale": scale_out,
             "translate": translate_out,
         }
-        return self._oriented_grid_cache
+        self._oriented_grid_cache[ds_key] = entry
+        return entry
 
     def _extract_oriented_slab_slice(
         self, volume: np.ndarray, pos: float, half: float, ds: float = 1.0,
     ) -> tuple[np.ndarray | None, tuple | None, tuple | None]:
-        """Extract a 2D slab slice, handling embryo orientation.
+        """Extract a 2D slab slice via cached oriented grid.
 
-        Uses cached sampling grid for speed.  Only map_coordinates
-        is called per-frame; the grid is built once per slab change.
+        Uses direct numpy indexing (nearest-neighbour) instead of
+        scipy.ndimage.map_coordinates to avoid the expensive float
+        copy of the entire volume (~232 MB per call).
         """
         grid = self._get_oriented_grid(ds)
         if grid is None:
             img = self._extract_slab_slice(volume, pos, half, ds)
             return img, None, None
 
-        from scipy.ndimage import map_coordinates
-
         coords_list = grid["coords_list"]
         n_v, n_h = grid["n_v"], grid["n_h"]
+        nz, ny, nx = volume.shape
+        flat_n = n_v * n_h
 
-        vol = volume if volume.dtype == np.float32 else volume.astype(np.float32)
-        img_max = np.zeros(n_v * n_h, dtype=np.float32)
+        result = np.zeros(flat_n, dtype=volume.dtype)
 
         for coords in coords_list:
-            sampled = map_coordinates(vol, coords, order=0, mode="constant", cval=0)
-            np.maximum(img_max, sampled, out=img_max)
+            zi = np.round(coords[0]).astype(np.intp)
+            yi = np.round(coords[1]).astype(np.intp)
+            xi = np.round(coords[2]).astype(np.intp)
+            valid = (
+                (zi >= 0) & (zi < nz)
+                & (yi >= 0) & (yi < ny)
+                & (xi >= 0) & (xi < nx)
+            )
+            sampled = np.zeros(flat_n, dtype=volume.dtype)
+            sampled[valid] = volume[zi[valid], yi[valid], xi[valid]]
+            np.maximum(result, sampled, out=result)
 
-        img_max = img_max.reshape(n_v, n_h)
-        if volume.dtype == np.uint8:
-            result = np.clip(img_max, 0, 255).astype(np.uint8)
-        else:
-            result = img_max.astype(volume.dtype)
-
-        return np.ascontiguousarray(result), grid["scale"], grid["translate"]
+        return (
+            np.ascontiguousarray(result.reshape(n_v, n_h)),
+            grid["scale"],
+            grid["translate"],
+        )
 
     def _frame_to_volume_index(self, frame: int, n_tp: int) -> int:
         """Convert a FRAME value to a 0-based index into the volume list.
@@ -1956,11 +2066,21 @@ class CrossSectionViewer:
         return max(0, min(t, n_tp - 1))
 
     def _update_image_slices(self):
-        """Update raw/segmentation image slices.
+        """Remove old image layers and re-add with fresh data.
 
-        Creates layers on first call; subsequent calls swap .data in-place
-        for speed.  Falls back to remove/re-add if shape changes.
+        Uses remove/re-add pattern because napari's .data= swap
+        does not reliably refresh the canvas for 2D Image layers.
         """
+        # Always remove old layers first
+        for attr in ("_raw_image_layer", "_seg_image_layer"):
+            layer = getattr(self, attr, None)
+            if layer is not None:
+                try:
+                    self.viewer.layers.remove(layer)
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+
         pos = self.pos_slider.value
         half = self._thickness / 2.0
         frame = int(self.frame_slider.value)
@@ -1976,15 +2096,17 @@ class CrossSectionViewer:
                     raw_frames[t], pos, half, ds=1.0,
                 )
                 if img is not None:
-                    self._set_image_layer("_raw_image_layer", img, scale, translate,
-                                         name="Raw slice", colormap="gray",
-                                         opacity=self.raw_opacity_slider.value / 100.0)
-                elif self._raw_image_layer is not None:
-                    self._raw_image_layer.visible = False
-            elif self._raw_image_layer is not None:
-                self._raw_image_layer.visible = False
-        elif self._raw_image_layer is not None:
-            self._raw_image_layer.visible = False
+                    kw = dict(
+                        name="Raw slice",
+                        colormap="gray",
+                        contrast_limits=[0, 255],
+                        opacity=self.raw_opacity_slider.value / 100.0,
+                        blending="translucent",
+                    )
+                    if scale is not None:
+                        kw["scale"] = scale
+                        kw["translate"] = translate
+                    self._raw_image_layer = self.viewer.add_image(img, **kw)
 
         # ── Segmentation slice ──
         seg_frames = getattr(self.parent, '_segment_frames', None)
@@ -1996,51 +2118,18 @@ class CrossSectionViewer:
                     seg_frames[t], pos, half, ds=float(ds),
                 )
                 if img is not None:
-                    self._set_image_layer("_seg_image_layer", img, scale, translate,
-                                         name="Segmentation slice", colormap="turbo",
-                                         opacity=self.seg_opacity_slider.value / 100.0,
-                                         default_scale=(float(ds), float(ds)))
-                elif self._seg_image_layer is not None:
-                    self._seg_image_layer.visible = False
-            elif self._seg_image_layer is not None:
-                self._seg_image_layer.visible = False
-        elif self._seg_image_layer is not None:
-            self._seg_image_layer.visible = False
-
-    def _set_image_layer(self, attr: str, img: np.ndarray,
-                         scale: tuple | None, translate: tuple | None,
-                         *, name: str, colormap: str, opacity: float,
-                         default_scale: tuple | None = None):
-        """Create or update an image layer.  Swaps .data when possible."""
-        layer = getattr(self, attr, None)
-        if layer is not None:
-            try:
-                if layer.data.shape == img.shape:
-                    layer.data = img
-                    layer.opacity = opacity
-                    layer.visible = True
+                    kw = dict(
+                        name="Segmentation slice",
+                        colormap="turbo",
+                        opacity=self.seg_opacity_slider.value / 100.0,
+                        blending="translucent",
+                    )
                     if scale is not None:
-                        layer.scale = scale
-                        layer.translate = translate
-                    layer.refresh()
-                    return
-                else:
-                    # Shape changed — must recreate
-                    self.viewer.layers.remove(layer)
-                    setattr(self, attr, None)
-            except Exception:
-                setattr(self, attr, None)
-
-        kw = dict(name=name, colormap=colormap, opacity=opacity,
-                  blending="translucent")
-        if name == "Raw slice":
-            kw["contrast_limits"] = [0, 255]
-        if scale is not None:
-            kw["scale"] = scale
-            kw["translate"] = translate
-        elif default_scale is not None:
-            kw["scale"] = default_scale
-        setattr(self, attr, self.viewer.add_image(img, **kw))
+                        kw["scale"] = scale
+                        kw["translate"] = translate
+                    else:
+                        kw["scale"] = (float(ds), float(ds))
+                    self._seg_image_layer = self.viewer.add_image(img, **kw)
 
     def _get_colors(self, idx: np.ndarray) -> np.ndarray:
         """Color the cross-section points."""

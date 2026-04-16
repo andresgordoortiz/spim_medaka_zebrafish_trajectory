@@ -954,31 +954,33 @@ class CrossSectionViewer:
         self._show_all = False
         self._track_width = 2.0
         self._show_tracks = True
+        self._points_visible = True  # track user's nuclei visibility preference
+        self._tracks_visible_state = True  # track user's tracks visibility
 
-        # Set max tracks to actual track count
-        if "TRACK_ID" in self.df.columns:
-            n_total_tracks = int(self.df["TRACK_ID"].nunique())
+        # ── Pre-cache numpy arrays from DF (avoids repeated .values calls) ──
+        df = self.df
+        self._pos_x = df["POSITION_X"].values
+        self._pos_y = df["POSITION_Y"].values
+        self._pos_z = df["POSITION_Z"].values
+        self._frames = df["FRAME"].values
+
+        # Set max tracks to actual track count (fast on numpy)
+        if "TRACK_ID" in df.columns:
+            self._track_ids = df["TRACK_ID"].values
+            n_total_tracks = len(np.unique(self._track_ids[~np.isnan(self._track_ids)])) if self._track_ids.dtype.kind == 'f' else len(np.unique(self._track_ids))
         else:
+            self._track_ids = None
             n_total_tracks = 500
         self._max_tracks = n_total_tracks
 
-        # Compute axis ranges
+        # Compute axis ranges (single pass on cached arrays)
         self._ranges = {
-            "X": (
-                float(self.df["POSITION_X"].min()),
-                float(self.df["POSITION_X"].max()),
-            ),
-            "Y": (
-                float(self.df["POSITION_Y"].min()),
-                float(self.df["POSITION_Y"].max()),
-            ),
-            "Z": (
-                float(self.df["POSITION_Z"].min()),
-                float(self.df["POSITION_Z"].max()),
-            ),
+            "X": (float(self._pos_x.min()), float(self._pos_x.max())),
+            "Y": (float(self._pos_y.min()), float(self._pos_y.max())),
+            "Z": (float(self._pos_z.min()), float(self._pos_z.max())),
         }
-        fmin = int(self.df["FRAME"].min())
-        fmax = int(self.df["FRAME"].max())
+        fmin = int(self._frames.min())
+        fmax = int(self._frames.max())
 
         # Separate napari viewer in 2D
         self.viewer = napari.Viewer(title="Cross-Section View", ndisplay=2)
@@ -1236,7 +1238,9 @@ class CrossSectionViewer:
         self.viewer.dims.events.current_step.connect(_on_xs_dims_changed)
         self._xs_dims_cb = _on_xs_dims_changed  # prevent GC
 
-        self._rebuild()
+        # Defer initial rebuild so the window appears immediately
+        from qtpy.QtCore import QTimer
+        QTimer.singleShot(0, self._rebuild)
 
     # ── Quick-jump helpers ───────────────────────────────────────────
 
@@ -1340,6 +1344,8 @@ class CrossSectionViewer:
 
         # Invalidate spatial mask cache (position/thickness/axis may have changed)
         self._spatial_mask_cache = None
+        # Invalidate raw contrast limits (recalculate for new spatial region)
+        self._raw_contrast_limits = None
         if not hasattr(self, "_debounce_timer"):
             self._debounce_timer = QTimer()
             self._debounce_timer.setSingleShot(True)
@@ -1355,10 +1361,22 @@ class CrossSectionViewer:
         # If a full rebuild is pending, skip — it handles everything
         if hasattr(self, "_debounce_timer") and self._debounce_timer.isActive():
             return
+        # During recording, _record_video handles per-frame updates itself
         if self._recording:
-            self._schedule_rebuild()
             return
         self._frame_update()
+
+    def _save_camera(self):
+        """Return current camera state dict."""
+        cam = self.viewer.camera
+        return {"center": tuple(cam.center), "zoom": cam.zoom}
+
+    def _restore_camera(self, state):
+        """Restore camera from saved state dict."""
+        if state is None:
+            return
+        self.viewer.camera.center = state["center"]
+        self.viewer.camera.zoom = state["zoom"]
 
     def _frame_update(self):
         """Fast path when only the frame changed.
@@ -1373,53 +1391,60 @@ class CrossSectionViewer:
         try:
             frame = int(self.frame_slider.value)
 
+            # Save camera so layer add/remove cannot reset zoom/pan
+            cam_state = self._save_camera()
+
             # ── Image slices (vispy texture swap) ──
             self._update_image_slices()
 
             # ── Points (fast filter + vispy update) ──
-            # Use cached spatial mask to avoid full 2M-row scan each frame
-            spatial_mask = self._get_spatial_mask()
+            # When show_all is on, points don't change per frame —
+            # skip the expensive re-filter + re-color.
             if not self._show_all:
-                frame_vals = self.df["FRAME"].values
-                idx = np.where(spatial_mask & (frame_vals == frame))[0]
-            else:
-                idx = np.where(spatial_mask)[0]
-
-            if self._display_pct < 100 and len(idx) > 0:
-                n_show = max(100, int(len(idx) * self._display_pct / 100))
-                if n_show < len(idx):
-                    rng = np.random.default_rng(0)
-                    idx = rng.choice(idx, n_show, replace=False)
-                    idx.sort()
-
-            if len(idx) > 0:
-                data = self._project(idx)
-                colors = self._get_colors(idx)
+                # Read current visibility before any layer manipulation
                 if self.points_layer is not None:
-                    try:
-                        self.points_layer.data = data
-                        self.points_layer.face_color = colors
-                    except Exception:
+                    self._points_visible = self.points_layer.visible
+
+                spatial_mask = self._get_spatial_mask()
+                idx = np.where(spatial_mask & (self._frames == frame))[0]
+
+                if self._display_pct < 100 and len(idx) > 0:
+                    n_show = max(100, int(len(idx) * self._display_pct / 100))
+                    if n_show < len(idx):
+                        rng = np.random.default_rng(0)
+                        idx = rng.choice(idx, n_show, replace=False)
+                        idx.sort()
+
+                if len(idx) > 0:
+                    data = self._project(idx)
+                    colors = self._get_colors(idx)
+                    if self.points_layer is not None:
                         try:
-                            self.viewer.layers.remove(self.points_layer)
+                            self.points_layer.data = data
+                            self.points_layer.face_color = colors
                         except Exception:
-                            pass
+                            try:
+                                self.viewer.layers.remove(self.points_layer)
+                            except Exception:
+                                pass
+                            self.points_layer = self.viewer.add_points(
+                                data, name="Nuclei",
+                                size=self.point_size_slider.value,
+                                face_color=colors, border_width=0, ndim=2,
+                                visible=self._points_visible,
+                            )
+                    else:
                         self.points_layer = self.viewer.add_points(
                             data, name="Nuclei",
                             size=self.point_size_slider.value,
                             face_color=colors, border_width=0, ndim=2,
+                            visible=self._points_visible,
                         )
-                else:
-                    self.points_layer = self.viewer.add_points(
-                        data, name="Nuclei",
-                        size=self.point_size_slider.value,
-                        face_color=colors, border_width=0, ndim=2,
-                    )
-            elif self.points_layer is not None:
-                try:
-                    self.points_layer.data = np.empty((0, 2))
-                except Exception:
-                    pass
+                elif self.points_layer is not None:
+                    try:
+                        self.points_layer.data = np.empty((0, 2))
+                    except Exception:
+                        pass
 
             # ── Dims step for tracks auto-filtering ──
             try:
@@ -1429,6 +1454,9 @@ class CrossSectionViewer:
                     self.viewer.dims.current_step = tuple(step)
             except Exception:
                 pass
+
+            # Restore camera (layer add/data changes may have shifted it)
+            self._restore_camera(cam_state)
         finally:
             self._in_rebuild = False
 
@@ -1439,7 +1467,7 @@ class CrossSectionViewer:
         spatial = self._get_spatial_mask()
         if not self._show_all:
             frame = int(self.frame_slider.value)
-            frame_mask = self.df["FRAME"].values == frame
+            frame_mask = self._frames == frame
             return spatial & frame_mask
         return spatial
 
@@ -1452,19 +1480,19 @@ class CrossSectionViewer:
         cached = getattr(self, "_spatial_mask_cache", None)
         if cached is not None and cached[0] == key:
             return cached[1]
-        df = self.df
-        axis_col = f"POSITION_{self._axis}"
+        axis_arr = {"X": self._pos_x, "Y": self._pos_y, "Z": self._pos_z}[self._axis]
         pos = self.pos_slider.value
         half = self._thickness / 2.0
-        mask = (df[axis_col].values >= pos - half) & (df[axis_col].values <= pos + half)
+        mask = (axis_arr >= pos - half) & (axis_arr <= pos + half)
         self._spatial_mask_cache = (key, mask)
         return mask
 
     def _project(self, idx: np.ndarray) -> np.ndarray:
         """Project indexed spots to 2D [v, h] coordinates."""
         v_col, h_col = self._AXES_MAP[self._axis]
-        h = self.df[h_col].values[idx]
-        v = self.df[v_col].values[idx]
+        _col_arr = {"POSITION_X": self._pos_x, "POSITION_Y": self._pos_y, "POSITION_Z": self._pos_z}
+        h = _col_arr[h_col][idx]
+        v = _col_arr[v_col][idx]
         return np.column_stack([v, h])
 
     def _remove_image_layers(self):
@@ -1487,6 +1515,15 @@ class CrossSectionViewer:
             self._in_rebuild = False
 
     def _rebuild_inner(self):
+        # Save camera before removing/adding layers
+        self._rebuild_cam_state = self._save_camera()
+
+        # Capture visibility of managed layers before removing them
+        if self.points_layer is not None:
+            self._points_visible = self.points_layer.visible
+        if self.tracks_layer is not None:
+            self._tracks_visible_state = self.tracks_layer.visible
+
         # Remove managed layers
         for attr in (
             "points_layer",
@@ -1528,11 +1565,15 @@ class CrossSectionViewer:
                 face_color=colors,
                 border_width=0,
                 ndim=2,
+                visible=self._points_visible,
             )
 
         # ── Tracks within slab ──
         if self._show_tracks and len(idx) > 0:
             self._add_slab_tracks(mask)
+            # Restore tracks visibility from saved state
+            if self.tracks_layer is not None:
+                self.tracks_layer.visible = self._tracks_visible_state
 
         # ── Sphere cross-section circle ──
         if self.show_sphere_check.value:
@@ -1601,6 +1642,9 @@ class CrossSectionViewer:
             self.viewer.reset_view()
             self._first_rebuild = False
             self._last_axis = self._axis
+        else:
+            # Restore camera that was saved at start of _rebuild_inner
+            self._restore_camera(self._rebuild_cam_state)
 
         # Force the vispy canvas to repaint so image layers are visible
         try:
@@ -1678,13 +1722,22 @@ class CrossSectionViewer:
                         pass
 
     def _add_slab_tracks(self, slab_mask: np.ndarray):
-        """Add 2D tracks for track segments within the slab."""
-        df = self.df
-        if "TRACK_ID" not in df.columns:
+        """Add 2D tracks for track segments within the slab.
+
+        Uses cached numpy arrays — avoids pandas isin/groupby/sort
+        on the full DataFrame for speed.
+        """
+        if self._track_ids is None:
             return
 
-        # Get track IDs that have spots in slab
-        slab_tids = df.loc[slab_mask, "TRACK_ID"].dropna().unique()
+        track_ids = self._track_ids
+        frames = self._frames
+
+        # Get track IDs that have spots in slab (numpy, no pandas)
+        slab_tids_arr = track_ids[slab_mask]
+        if slab_tids_arr.dtype.kind == 'f':
+            slab_tids_arr = slab_tids_arr[~np.isnan(slab_tids_arr)]
+        slab_tids = np.unique(slab_tids_arr)
         if len(slab_tids) == 0:
             return
 
@@ -1693,43 +1746,56 @@ class CrossSectionViewer:
             rng = np.random.default_rng(42)
             slab_tids = rng.choice(slab_tids, self._max_tracks, replace=False)
 
-        # Get ALL points of those tracks (not just slab points) so
-        # trajectories are continuous, then filter by slab + time
-        tid_set = set(slab_tids)
-        in_tracks = df["TRACK_ID"].isin(tid_set).values
+        # Fast membership test via set
+        tid_set = set(slab_tids.tolist())
+        in_tracks = np.fromiter(
+            (t in tid_set for t in track_ids), dtype=bool, count=len(track_ids)
+        )
         if not self._show_all:
-            # For single-frame mode, show full track history of those tracks
-            # within the slab for context
-            axis_col = f"POSITION_{self._axis}"
-            pos = self.pos_slider.value
-            half = self._thickness / 2.0
-            in_slab = (df[axis_col].values >= pos - half) & (
-                df[axis_col].values <= pos + half
-            )
+            in_slab = self._get_spatial_mask()
             track_mask = in_tracks & in_slab
         else:
             track_mask = in_tracks & slab_mask
 
-        df_t = df.loc[track_mask].copy()
-        if df_t.empty:
+        sel_idx = np.where(track_mask)[0]
+        if len(sel_idx) == 0:
             return
 
-        track_len = df_t.groupby("TRACK_ID")["FRAME"].transform("count")
-        df_t = df_t[track_len >= 2]
-        if df_t.empty:
-            return
-
-        df_t = df_t.sort_values(["TRACK_ID", "FRAME"])
-
+        # Extract columns using cached arrays
+        sel_tids = track_ids[sel_idx]
+        sel_frames = frames[sel_idx]
+        _col_arr = {
+            "POSITION_X": self._pos_x,
+            "POSITION_Y": self._pos_y,
+            "POSITION_Z": self._pos_z,
+        }
         v_col, h_col = self._AXES_MAP[self._axis]
-        tracks_arr = np.column_stack(
-            [
-                df_t["TRACK_ID"].values,
-                df_t["FRAME"].values,
-                df_t[v_col].values,
-                df_t[h_col].values,
-            ]
+        sel_v = _col_arr[v_col][sel_idx]
+        sel_h = _col_arr[h_col][sel_idx]
+
+        # Sort by (track_id, frame) using numpy lexsort
+        order = np.lexsort((sel_frames, sel_tids))
+        sel_tids = sel_tids[order]
+        sel_frames = sel_frames[order]
+        sel_v = sel_v[order]
+        sel_h = sel_h[order]
+        sel_idx = sel_idx[order]
+
+        # Keep only tracks with >=2 points (numpy, no groupby)
+        unique_tids, counts = np.unique(sel_tids, return_counts=True)
+        keep_tids = set(unique_tids[counts >= 2].tolist())
+        if not keep_tids:
+            return
+        keep_mask = np.fromiter(
+            (t in keep_tids for t in sel_tids), dtype=bool, count=len(sel_tids)
         )
+        sel_tids = sel_tids[keep_mask]
+        sel_frames = sel_frames[keep_mask]
+        sel_v = sel_v[keep_mask]
+        sel_h = sel_h[keep_mask]
+        sel_idx = sel_idx[keep_mask]
+
+        tracks_arr = np.column_stack([sel_tids, sel_frames, sel_v, sel_h])
 
         # Color tracks consistently with points
         props = {}
@@ -1744,22 +1810,26 @@ class CrossSectionViewer:
             "frame": "FRAME",
         }
         mode = self._color_mode
-        if mode == "depth_travel" and "SPHERICAL_DEPTH" in df_t.columns:
-            depth_range = df_t.groupby("TRACK_ID")["SPHERICAL_DEPTH"].transform(
-                lambda s: s.max() - s.min()
-            ).values.astype(float)
-            nan_m = np.isnan(depth_range)
-            if not nan_m.all():
-                depth_range[nan_m] = 0.0
-                valid = depth_range[~nan_m]
-                if len(valid) > 0:
-                    vmax = max(np.percentile(valid, 98), 1e-6)
-                    depth_range = np.clip(depth_range / vmax, 0, 1)
+        df = self.df
+        if mode == "depth_travel" and "SPHERICAL_DEPTH" in df.columns:
+            depth_vals = df["SPHERICAL_DEPTH"].values[sel_idx].astype(float)
+            valid_d = ~np.isnan(depth_vals)
+            if valid_d.any():
+                _, inv = np.unique(sel_tids, return_inverse=True)
+                n_ut = inv.max() + 1
+                dmax = np.full(n_ut, -np.inf)
+                dmin = np.full(n_ut, np.inf)
+                np.maximum.at(dmax, inv[valid_d], depth_vals[valid_d])
+                np.minimum.at(dmin, inv[valid_d], depth_vals[valid_d])
+                depth_range = np.maximum(dmax - dmin, 0.0)[inv]
+                depth_range[~valid_d] = 0.0
+                vmax = max(np.percentile(depth_range[valid_d], 98), 1e-6)
+                depth_range = np.clip(depth_range / vmax, 0, 1)
                 props["color_value"] = depth_range
                 color_by = "color_value"
                 cmap = "plasma"
-        elif mode in col_map and col_map[mode] in df_t.columns:
-            vals = df_t[col_map[mode]].values.astype(float)
+        elif mode in col_map and col_map[mode] in df.columns:
+            vals = df[col_map[mode]].values[sel_idx].astype(float)
             nan_m = np.isnan(vals)
             if not nan_m.all():
                 vals[nan_m] = np.nanmedian(vals)
@@ -1773,6 +1843,7 @@ class CrossSectionViewer:
             tail_length=40,
             color_by=color_by,
             colormap=cmap,
+            visible=self._tracks_visible_state,
         )
         if props:
             kw["properties"] = props
@@ -1881,8 +1952,9 @@ class CrossSectionViewer:
     # ── Image slice extraction ───────────────────────────────────────
 
     def _extract_slab_slice(self, volume: np.ndarray, pos: float,
-                            half: float, ds: float = 1.0) -> np.ndarray | None:
-        """Extract a 2D slice (or MIP) from a 3D volume at the slab position.
+                            half: float, ds: float = 1.0,
+                            projection: str = "max") -> np.ndarray | None:
+        """Extract a 2D slice from a 3D volume at the slab position.
 
         Parameters
         ----------
@@ -1890,6 +1962,7 @@ class CrossSectionViewer:
         pos : cutting position in world/voxel coords
         half : half-thickness in world/voxel coords
         ds : downsample factor (volume indices = world_coords / ds)
+        projection : 'max' for MIP, 'mean' for average projection
 
         Returns
         -------
@@ -1910,11 +1983,13 @@ class CrossSectionViewer:
         use_mip = use_mip.value if use_mip is not None else True
 
         if use_mip and hi > lo:
-            # Max-intensity projection across the slab
             slc = [slice(None)] * 3
             slc[vol_axis] = slice(lo, hi + 1)
             slab = volume[tuple(slc)]
-            img_2d = slab.max(axis=vol_axis)
+            if projection == "mean":
+                img_2d = slab.mean(axis=vol_axis).astype(volume.dtype)
+            else:
+                img_2d = slab.max(axis=vol_axis)
         else:
             # Single central slice
             mid_idx = (lo + hi) // 2
@@ -2016,15 +2091,22 @@ class CrossSectionViewer:
 
     def _extract_oriented_slab_slice(
         self, volume: np.ndarray, pos: float, half: float, ds: float = 1.0,
+        projection: str = "max",
     ) -> tuple[np.ndarray | None, tuple | None, tuple | None]:
         """Extract a 2D slab slice via cached oriented grid.
 
         Uses pre-computed integer index arrays from the grid cache
         for direct numpy fancy-indexing — zero per-frame allocation.
+
+        Parameters
+        ----------
+        projection : 'max' for MIP (good for segmentation),
+                     'mean' for average (good for raw microscopy).
         """
         grid = self._get_oriented_grid(ds)
         if grid is None:
-            img = self._extract_slab_slice(volume, pos, half, ds)
+            img = self._extract_slab_slice(volume, pos, half, ds,
+                                           projection=projection)
             return img, None, None
 
         coords_list = grid["coords_list"]
@@ -2032,22 +2114,58 @@ class CrossSectionViewer:
         nz, ny, nx = volume.shape
         flat_n = n_v * n_h
 
-        # Re-use a pre-allocated buffer if available
-        buf = getattr(self, "_xs_slice_buf", None)
-        if buf is None or buf.shape != (flat_n,) or buf.dtype != volume.dtype:
-            buf = np.empty(flat_n, dtype=volume.dtype)
-            self._xs_slice_buf = buf
-        buf[:] = 0
+        # Pre-compute validity masks (cached in grid, volume-shape-dependent)
+        vol_key = (nz, ny, nx)
+        if grid.get("_valid_vol_key") != vol_key:
+            grid["_valid_masks"] = []
+            for zi, yi, xi in coords_list:
+                valid = (
+                    (zi >= 0) & (zi < nz)
+                    & (yi >= 0) & (yi < ny)
+                    & (xi >= 0) & (xi < nx)
+                )
+                grid["_valid_masks"].append(valid)
+            grid["_valid_vol_key"] = vol_key
+        valid_masks = grid["_valid_masks"]
 
-        for zi, yi, xi in coords_list:
-            valid = (
-                (zi >= 0) & (zi < nz)
-                & (yi >= 0) & (yi < ny)
-                & (xi >= 0) & (xi < nx)
-            )
-            sampled = np.zeros(flat_n, dtype=volume.dtype)
-            sampled[valid] = volume[zi[valid], yi[valid], xi[valid]]
-            np.maximum(buf, sampled, out=buf)
+        if projection == "mean" and len(coords_list) > 1:
+            # Mean projection: accumulate in-place, reuse buffers
+            buf_key = f"_mean_buf_{flat_n}"
+            cnt_key = f"_mean_cnt_{flat_n}"
+            acc = getattr(self, buf_key, None)
+            if acc is None or acc.shape[0] != flat_n:
+                acc = np.empty(flat_n, dtype=np.float32)
+                setattr(self, buf_key, acc)
+            count = getattr(self, cnt_key, None)
+            if count is None or count.shape[0] != flat_n:
+                count = np.empty(flat_n, dtype=np.float32)
+                setattr(self, cnt_key, count)
+            acc[:] = 0.0
+            count[:] = 0.0
+            for (zi, yi, xi), valid in zip(coords_list, valid_masks):
+                vals = volume[zi[valid], yi[valid], xi[valid]]
+                acc[valid] += vals.astype(np.float32)
+                count[valid] += 1.0
+            count[count == 0] = 1.0
+            np.divide(acc, count, out=acc)
+            buf = acc.astype(volume.dtype)
+        else:
+            # Max projection (MIP) — reuse buffer
+            mip_key = f"_mip_buf_{flat_n}"
+            buf = getattr(self, mip_key, None)
+            if buf is None or buf.shape[0] != flat_n or buf.dtype != volume.dtype:
+                buf = np.empty(flat_n, dtype=volume.dtype)
+                setattr(self, mip_key, buf)
+            buf[:] = 0
+            samp_key = f"_samp_buf_{flat_n}"
+            sampled = getattr(self, samp_key, None)
+            if sampled is None or sampled.shape[0] != flat_n or sampled.dtype != volume.dtype:
+                sampled = np.empty(flat_n, dtype=volume.dtype)
+                setattr(self, samp_key, sampled)
+            for (zi, yi, xi), valid in zip(coords_list, valid_masks):
+                sampled[:] = 0
+                sampled[valid] = volume[zi[valid], yi[valid], xi[valid]]
+                np.maximum(buf, sampled, out=buf)
 
         return (
             np.ascontiguousarray(buf.reshape(n_v, n_h)),
@@ -2086,11 +2204,24 @@ class CrossSectionViewer:
             if 0 <= t < n_tp:
                 img, scale, translate = self._extract_oriented_slab_slice(
                     raw_frames[t], pos, half, ds=1.0,
+                    projection="mean",
                 )
                 if img is not None:
+                    # Compute contrast once; reuse on subsequent frames
+                    raw_cl = getattr(self, '_raw_contrast_limits', None)
+                    if raw_cl is None:
+                        nz = img[img > 0]
+                        if len(nz) > 0:
+                            c_lo = int(np.percentile(nz, 1))
+                            c_hi = int(np.percentile(nz, 99.5))
+                        else:
+                            c_lo, c_hi = 0, 255
+                        c_hi = max(c_hi, c_lo + 1)
+                        self._raw_contrast_limits = [c_lo, c_hi]
+                        raw_cl = self._raw_contrast_limits
                     self._push_image("_raw_image_layer", img, scale, translate,
                                      name="Raw slice", colormap="gray",
-                                     contrast_limits=[0, 255],
+                                     contrast_limits=raw_cl,
                                      opacity=self.raw_opacity_slider.value / 100.0)
 
         # ── Segmentation slice ──
@@ -2130,6 +2261,7 @@ class CrossSectionViewer:
 
         if layer is not None and layer.data.shape == img.shape:
             # Fast path: swap vispy texture directly
+            # Preserve all layer settings (visibility, opacity, colormap, etc.)
             try:
                 layer._data = img
                 qt_viewer = self.viewer.window._qt_viewer
@@ -2146,15 +2278,24 @@ class CrossSectionViewer:
                 pass  # fall through to slow path
 
         # Slow path: remove old layer and create new one
+        # Preserve user-modified settings from the existing layer
+        cam_state = self._save_camera()
+        prev_visible = True
+        prev_opacity = opacity
         if layer is not None:
+            try:
+                prev_visible = layer.visible
+                prev_opacity = layer.opacity
+            except Exception:
+                pass
             try:
                 self.viewer.layers.remove(layer)
             except Exception:
                 pass
             setattr(self, attr, None)
 
-        kw = dict(name=name, colormap=colormap, opacity=opacity,
-                  blending="translucent")
+        kw = dict(name=name, colormap=colormap, opacity=prev_opacity,
+                  blending="translucent", visible=prev_visible)
         if contrast_limits is not None:
             kw["contrast_limits"] = contrast_limits
         if scale is not None:
@@ -2163,6 +2304,9 @@ class CrossSectionViewer:
         elif default_scale is not None:
             kw["scale"] = default_scale
         setattr(self, attr, self.viewer.add_image(img, **kw))
+
+        # Restore camera after layer creation
+        self._restore_camera(cam_state)
 
     def _get_colors(self, idx: np.ndarray) -> np.ndarray:
         """Color the cross-section points."""
@@ -2276,11 +2420,11 @@ class CrossSectionViewer:
             self.lbl_record.value = f"Error: {e}"
 
     def _record_video(self):
-        """Record a time-lapse video — same approach as main embryo viewer.
+        """Record a time-lapse video by iterating frames in 2D mode.
 
-        Builds all slab data with a time dimension (ndim=3), then steps
-        through frames with dims.current_step and takes screenshots.
-        No manual per-frame layer manipulation needed.
+        For each frame: update images + points, restore camera, screenshot.
+        Points and tracks are set up as 3D (time, v, h) so napari's dims
+        slider auto-filters them; images are swapped per-frame via vispy.
         """
         from qtpy.QtCore import QTimer
 
@@ -2318,21 +2462,20 @@ class CrossSectionViewer:
 
         # ── Build 3D (time, v, h) points for ALL slab frames ──
         df = self.df
-        axis_col = f"POSITION_{self._axis}"
+        axis_arr = {"X": self._pos_x, "Y": self._pos_y, "Z": self._pos_z}[self._axis]
         pos = self.pos_slider.value
         half = self._thickness / 2.0
-        slab_mask = (df[axis_col].values >= pos - half) & (
-            df[axis_col].values <= pos + half
-        )
+        slab_mask = (axis_arr >= pos - half) & (axis_arr <= pos + half)
 
         v_col, h_col = self._AXES_MAP[self._axis]
+        _col_arr = {"POSITION_X": self._pos_x, "POSITION_Y": self._pos_y, "POSITION_Z": self._pos_z}
         slab_idx = np.where(slab_mask)[0]
 
         # Display % subsampling per frame
         if self._display_pct < 100 and len(slab_idx) > 0:
             keep = np.zeros(len(df), dtype=bool)
             for f in frames:
-                fm = slab_mask & (df["FRAME"].values == f)
+                fm = slab_mask & (self._frames == f)
                 fidx = np.where(fm)[0]
                 n_show = max(100, int(len(fidx) * self._display_pct / 100))
                 if n_show < len(fidx):
@@ -2343,18 +2486,19 @@ class CrossSectionViewer:
 
         saved = self._saved_view_state or {}
         saved_layers = saved.get("layers", {})
-        nuclei_visible = saved_layers.get("Nuclei", {}).get("visible", True)
+        nuclei_visible = saved_layers.get("Nuclei", {}).get(
+            "visible", self._points_visible
+        )
         tracks_visible = saved_layers.get("Tracks", {}).get(
-            "visible", self._show_tracks
+            "visible", self._tracks_visible_state
         )
 
         if nuclei_visible and len(slab_idx) > 0:
-            # 3D data: [frame, v, h]
             data_3d = np.column_stack(
                 [
-                    df["FRAME"].values[slab_idx],
-                    df[v_col].values[slab_idx],
-                    df[h_col].values[slab_idx],
+                    self._frames[slab_idx],
+                    _col_arr[v_col][slab_idx],
+                    _col_arr[h_col][slab_idx],
                 ]
             )
             colors = self._get_colors(slab_idx)
@@ -2409,7 +2553,7 @@ class CrossSectionViewer:
         self._vid_total = len(frames)
         self._vid_path = vid_path
         self.lbl_record.value = f"Recording: 0/{self._vid_total}..."
-        self.viewer.status = "Recording cross-section video \u2014 please wait..."
+        self.viewer.status = "Recording cross-section video — please wait..."
 
         def _capture_next():
             if self._vid_idx >= self._vid_total:
@@ -2417,16 +2561,27 @@ class CrossSectionViewer:
                 return
 
             frame = self._vid_frames[self._vid_idx]
-            # Step through time — exactly like the main embryo viewer
-            dims = list(self.viewer.dims.current_step)
-            dims[0] = frame
-            self.viewer.dims.current_step = tuple(dims)
+
+            # Update image slices for this frame (raw + seg)
+            self.frame_slider.value = frame
+            self._update_image_slices()
+
+            # Step dims so points/tracks auto-filter to this frame
+            try:
+                dims = list(self.viewer.dims.current_step)
+                if len(dims) >= 3:
+                    dims[0] = frame
+                    self.viewer.dims.current_step = tuple(dims)
+            except Exception:
+                pass
+
+            # Restore camera + layer settings
+            self._restore_view_state()
 
             def _screenshot():
                 try:
                     img = self.viewer.screenshot(canvas_only=True)
                 except (RuntimeError, AttributeError):
-                    # Widget was closed during recording
                     return
                 if img.ndim == 3 and img.shape[2] == 4:
                     img = img[:, :, :3]
@@ -2724,8 +2879,8 @@ class EmbryoViewer:
                 self._segment_frames[0],
                 name="Nuclei 3D",
                 scale=scale_3d,
-                opacity=0.9,
-                rendering="attenuated_mip",
+                opacity=0.7,
+                rendering="mip",
                 colormap=cmap,
                 contrast_limits=[0, 255],
                 blending="translucent",
@@ -3263,16 +3418,21 @@ class EmbryoViewer:
         print(f"  Building {n_tp} display frames ...", end=" ", flush=True)
         t0 = _time.time()
 
-        # Global min/max for consistent contrast across all frames
-        dmin = float(data_np.min())
-        dmax = float(data_np.max())
-        scale_factor = 255.0 / max(dmax - dmin, 1e-10)
+        # Percentile-based contrast (robust to hot pixels / outliers)
+        # Subsample for speed: take every 4th frame, every 2nd voxel
+        sample = data_np[::4, ::2, ::2, ::2].ravel()
+        p_low, p_high = np.percentile(sample[sample > 0], [0.5, 99.5]) \
+            if np.any(sample > 0) else (float(data_np.min()), float(data_np.max()))
+        p_low = float(p_low)
+        p_high = float(p_high)
+        scale_factor = 255.0 / max(p_high - p_low, 1e-10)
+        print(f"contrast range [{p_low:.0f}, {p_high:.0f}] ", end="")
 
         self._raw_frames = []
         for i in range(n_tp):
             frame = data_np[i]
-            # Convert to uint8 with global contrast
-            f8 = np.clip((frame.astype(np.float32) - dmin) * scale_factor,
+            # Convert to uint8 with percentile-based contrast
+            f8 = np.clip((frame.astype(np.float32) - p_low) * scale_factor,
                          0, 255).astype(np.uint8)
             self._raw_frames.append(np.ascontiguousarray(f8))
 
@@ -3285,16 +3445,17 @@ class EmbryoViewer:
         ds = getattr(self, '_display_ds', 1) or 1
         scale_3d = (ds, ds, ds)
 
-        # Add as 3D Image layer (grayscale, translucent)
+        # Add as 3D Image layer (grayscale, additive for overlay with segments)
         self._raw_layer = self.viewer.add_image(
             self._raw_frames[0],
             name="Raw",
             scale=scale_3d,
-            opacity=0.5,
-            rendering="attenuated_mip",
+            opacity=0.7,
+            rendering="mip",
             colormap="gray",
             contrast_limits=[0, 255],
-            blending="translucent",
+            blending="additive",
+            gamma=0.7,
         )
         self._raw_layer._update_thumbnail = lambda: None
         self._raw_layer._clear_extent = lambda: None
@@ -4038,10 +4199,10 @@ class EmbryoViewer:
 
         # ── Track time range ──
         self.track_frame_start = FloatSlider(
-            value=fmin_data, min=fmin_data, max=fmax_data, step=1, label="▶ Start frame"
+            value=fmin_data, min=fmin_data, max=fmax_data, step=1, label="Track start frame"
         )
         self.track_frame_end = FloatSlider(
-            value=fmax_data, min=fmin_data, max=fmax_data, step=1, label="■ End frame"
+            value=fmax_data, min=fmin_data, max=fmax_data, step=1, label="Track end frame"
         )
         self.track_frame_start.changed.connect(self._on_track_frame_changed)
         self.track_frame_end.changed.connect(self._on_track_frame_changed)
@@ -4173,7 +4334,7 @@ class EmbryoViewer:
                 self.lbl_raw_status,
                 self.raw_visible_cb,
                 self.raw_opacity_slider,
-                Label(value="━━ ⏱ TIME WINDOW ━━"),
+                Label(value="━━ TRACK FRAME RANGE ━━"),
                 self.track_frame_start,
                 self.track_frame_end,
                 Label(value="── Display ──"),
@@ -4373,9 +4534,17 @@ class EmbryoViewer:
             colors.append("magenta")
 
         if pts:
-            self.landmarks_layer.data = np.array(pts)
-            self.landmarks_layer.face_color = colors
-            self.landmarks_layer.size = 20
+            arr = np.array(pts)
+            # Remove and re-add to avoid multiple per-property refreshes
+            try:
+                self.viewer.layers.remove(self.landmarks_layer)
+            except Exception:
+                pass
+            self.landmarks_layer = self.viewer.add_points(
+                arr, name="Landmarks", size=20,
+                face_color=colors, symbol="diamond",
+                ndim=3, border_width=0,
+            )
         else:
             self.landmarks_layer.data = np.empty((0, 3))
 
@@ -4810,6 +4979,10 @@ class EmbryoViewer:
             f_end = f_start
         self._track_frame_min = f_start
         self._track_frame_max = f_end
+        self.viewer.status = (
+            f"Tracks filtered to frames {f_start}–{f_end} "
+            f"(only tracks with data in this range are shown)"
+        )
         self._schedule_track_rebuild()
 
     def _schedule_track_rebuild(self):

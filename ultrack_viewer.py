@@ -44,6 +44,7 @@ import argparse
 import os
 import sys
 import threading
+import traceback
 from pathlib import Path
 
 # ── Wayland / DPI fixes for Fedora GNOME ──────────────────────────────────
@@ -2700,6 +2701,7 @@ class EmbryoViewer:
 
         self.spots = spots_df
         self.tracks_raw = tracks_df
+        self._track_id_index: dict[int, np.ndarray] | None = None  # tid→row indices
 
         # State
         self.animal_pole: np.ndarray | None = None
@@ -2727,6 +2729,23 @@ class EmbryoViewer:
             None  # indices into self.spots for displayed subset
         )
         self._track_width: float = 2.0  # track line width
+
+        # Track selection state
+        self._selected_track_ids: set[int] = set()
+        self._selection_active: bool = False
+        self._follow_selection: bool = False
+        self._selection_lut: np.ndarray | None = None  # label→uint8 LUT for selection
+        self._selection_spots_overlay = None  # napari Points (selection overlay)
+        self._selection_tracks_overlay = None  # napari Tracks (selection overlay)
+        self._track_id_index: dict | None = None
+        # Random-subsample state (IDs already drawn, never resampled)
+        self._random_sampled_ids: set[int] = set()
+        # Metrics params (match gastrulation_dynamics_comparison.R)
+        #   Medaka: FI=30 s, lag=4 fr (=2 min), smooth_k=5 fr (=2.5 min)
+        #   Zebrafish: FI=120 s, lag=1 fr (=2 min), smooth_k=3 fr (=6 min)
+        self._metrics_lag: int = 4
+        self._metrics_smooth_k: int = 5
+        self._metrics_fi_sec: float = 30.0
 
         # Segments state
         self._segments_data = None  # dask array (T, Z, Y, X)
@@ -2756,6 +2775,7 @@ class EmbryoViewer:
 
         # Load data layers if provided
         if self.spots is not None:
+            self._build_track_id_index()
             self._add_spots_layer()
             self._add_tracks_layer()
 
@@ -2775,6 +2795,15 @@ class EmbryoViewer:
 
         # Connect click handler for landmark selection
         self.viewer.mouse_drag_callbacks.append(self._on_click)
+
+        # Follow-selection camera update on time change (works for all modes,
+        # including lazy/non-preload where _on_segments_time is not installed).
+        def _on_time_follow(event):
+            if self._follow_selection and self._selection_active:
+                self._center_on_selection()
+
+        self._follow_time_cb = _on_time_follow
+        self.viewer.dims.events.current_step.connect(_on_time_follow)
 
     # ── Segments (Labels) layer ────────────────────────────────────────
 
@@ -2959,23 +2988,38 @@ class EmbryoViewer:
                 t = int(self.viewer.dims.current_step[0])
 
                 # ── 1. Swap segments vispy texture (instant) ──
-                frames = self._segment_frames
-                if frames is not None and 0 <= t < len(frames):
-                    if vol is not None:
-                        vol.set_data(frames[t])
-                        canv.native.update()
-                    elif self._segments_layer is not None:
-                        self._segments_layer.data = frames[t]
-                    # Sync layer._data reference so visibility toggles
-                    # show the correct frame.  Do NOT use np.copyto —
-                    # that corrupts _segment_frames[0] because layer.data
-                    # is the same array object.
-                    seg_lyr = self._segments_layer
-                    if seg_lyr is not None:
-                        try:
-                            seg_lyr._data = frames[t]
-                        except Exception:
-                            pass
+                # When a track selection is active, apply the selection LUT
+                # on-the-fly to the current frame (avoids prebuilding all).
+                sel_lut = self._selection_lut
+                if self._selection_active and sel_lut is not None:
+                    dl = getattr(self, '_display_labels', None)
+                    if dl is not None and 0 <= t < dl.shape[0]:
+                        frame = sel_lut[dl[t]]
+                        if vol is not None:
+                            vol.set_data(frame)
+                            canv.native.update()
+                        elif self._segments_layer is not None:
+                            self._segments_layer.data = frame
+                        seg_lyr = self._segments_layer
+                        if seg_lyr is not None:
+                            try:
+                                seg_lyr._data = frame
+                            except Exception:
+                                pass
+                else:
+                    frames = self._segment_frames
+                    if frames is not None and 0 <= t < len(frames):
+                        if vol is not None:
+                            vol.set_data(frames[t])
+                            canv.native.update()
+                        elif self._segments_layer is not None:
+                            self._segments_layer.data = frames[t]
+                        seg_lyr = self._segments_layer
+                        if seg_lyr is not None:
+                            try:
+                                seg_lyr._data = frames[t]
+                            except Exception:
+                                pass
 
                 # ── 1b. Swap raw vispy texture (instant) ──
                 raw_frames = self._raw_frames
@@ -3523,10 +3567,15 @@ class EmbryoViewer:
         )
 
     def _build_display_points(self):
-        """Build display arrays, respecting display %, ROI and ingression filters."""
+        """Build display arrays, respecting display %, ROI, ingression, and selection filters."""
         df = self.spots
         n = len(df)
         mask = np.ones(n, dtype=bool)
+
+        # Track selection filter
+        if self._selection_active and self._selected_track_ids:
+            if "TRACK_ID" in df.columns:
+                mask &= df["TRACK_ID"].isin(self._selected_track_ids).values
 
         # ROI filter
         if self._roi_only and self._roi_bounds is not None:
@@ -3697,7 +3746,7 @@ class EmbryoViewer:
     def _build_tracks_data(self):
         """Build tracks array + filtered DataFrame applying all active filters.
 
-        Respects: ROI-only, ingression-only, time window, max tracks.
+        Respects: selection, ROI-only, ingression-only, time window, max tracks.
         Returns (tracks_array, df_filtered) or (None, None).
         """
         if self.spots is None or "TRACK_ID" not in self.spots.columns:
@@ -3706,6 +3755,12 @@ class EmbryoViewer:
         df = self.spots.dropna(subset=["TRACK_ID"]).copy()
         if df.empty:
             return None, None
+
+        # Track selection filter: restrict to selected tracks
+        if self._selection_active and self._selected_track_ids:
+            df = df[df["TRACK_ID"].isin(self._selected_track_ids)]
+            if df.empty:
+                return None, None
 
         # ROI filter: keep tracks that have at least one spot in ROI
         if self._roi_only and "IN_ROI" in df.columns:
@@ -3989,6 +4044,18 @@ class EmbryoViewer:
         self.lbl_ingression.value = "Ingression: not computed"
         self.ingression_tracks_only.value = False
 
+        # Clear track selection
+        self._selected_track_ids.clear()
+        self._random_sampled_ids.clear()
+        self._selection_active = False
+        self._selection_lut = None
+        self._follow_selection = False
+        self._remove_layer("_selection_spots_overlay")
+        self._remove_layer("_selection_tracks_overlay")
+        if hasattr(self, "follow_selection_cb"):
+            self.follow_selection_cb.value = False
+        self._update_selection_label()
+
         # Update frame range sliders to new data
         if self.spots is not None:
             fmin = int(self.spots["FRAME"].min())
@@ -4058,6 +4125,7 @@ class EmbryoViewer:
         self._remove_layer("spots_layer")
 
         self.viewer.status = "Building point cloud..."
+        self._build_track_id_index()
         self._add_spots_layer()
         self._add_tracks_layer()
 
@@ -4118,6 +4186,7 @@ class EmbryoViewer:
             FloatSlider,
             CheckBox,
             Container,
+            SpinBox,
         )
 
         # Determine frame range for sliders
@@ -4206,6 +4275,35 @@ class EmbryoViewer:
         )
         self.track_frame_start.changed.connect(self._on_track_frame_changed)
         self.track_frame_end.changed.connect(self._on_track_frame_changed)
+
+        # ── Track Selection ──
+        btn_select_track = PushButton(text="\U0001f50d Select Track (click)")
+        btn_select_track.changed.connect(self._toggle_select_track_mode)
+        btn_clear_selection = PushButton(text="✕ Clear Selection")
+        btn_clear_selection.changed.connect(self._clear_selection)
+        self.lbl_selection = Label(value="No tracks selected")
+        self.follow_selection_cb = CheckBox(
+            value=False, text="Follow selected nuclei"
+        )
+        self.follow_selection_cb.changed.connect(self._on_follow_selection_changed)
+        btn_goto_selection = PushButton(text="⊕ Go To Selection")
+        btn_goto_selection.changed.connect(self._go_to_selection)
+
+        # Random subsample (no-repeat)
+        self.random_sample_n = SpinBox(
+            value=50, min=1, max=10000, step=1, label="Random N"
+        )
+        btn_random_sample = PushButton(text="🎲 Sample N random (no repeat)")
+        btn_random_sample.changed.connect(self._random_sample_tracks)
+        btn_random_sample_reset = PushButton(text="↻ Reset random pool")
+        btn_random_sample_reset.changed.connect(self._reset_random_sample_pool)
+
+        # Filter segments volume by selection (expensive; OFF by default)
+        self.filter_segments_cb = CheckBox(
+            value=False, text="Filter segments by selection (slow)"
+        )
+        self.filter_segments_cb.changed.connect(
+            self._on_filter_segments_changed)
 
         # ── Landmark picking ──
         self._pick_mode = "none"
@@ -4341,6 +4439,16 @@ class EmbryoViewer:
                 self.display_pct_slider,
                 self.max_tracks_slider,
                 self.track_width_slider,
+                Label(value="━━ TRACK SELECTION ━━"),
+                btn_select_track,
+                btn_clear_selection,
+                self.lbl_selection,
+                self.follow_selection_cb,
+                btn_goto_selection,
+                self.random_sample_n,
+                btn_random_sample,
+                btn_random_sample_reset,
+                self.filter_segments_cb,
                 Label(value="── Landmarks ──"),
                 btn_ap,
                 self.lbl_ap,
@@ -4402,7 +4510,8 @@ class EmbryoViewer:
 
         self.viewer.window.add_dock_widget(scroll, name="Controls", area="right")
 
-    # ── Landmark picking ──────────────────────────────────────────────
+        # Metrics plot dock (selected tracks)
+        self._build_metrics_dock()
 
     def _set_pick_mode(self, mode: str):
         if self._pick_mode == mode:
@@ -4425,18 +4534,25 @@ class EmbryoViewer:
             )
 
     def _on_click(self, viewer, event):
-        """Handle mouse click for landmark picking (snaps to nearest spot)."""
+        """Handle mouse click for landmark picking and track selection."""
         if self._pick_mode == "none":
             return
         if self.spots_layer is None or self.spots is None:
             self.viewer.status = "Load spots first!"
             return
 
-        # Get click world coords \u2014 napari gives (t, z, y, x) for 4D
+        # Get click world coords — napari gives (t, z, y, x) for 4D
         world = np.array(event.position)
         if len(world) < 4:
             return
         click_x, click_y, click_z = world[3], world[2], world[1]
+
+        # In 3D view, event.position is a point on the camera ray, not the
+        # spot the user intended.  Use point-to-ray distance (the minimum
+        # distance from each spot to the camera ray) so that tilting the
+        # view doesn't break selection accuracy.
+        view_dir = getattr(event, "view_direction", None)
+        use_ray = view_dir is not None and self.viewer.dims.ndisplay == 3
 
         # Find nearest spot in the current frame
         current_frame = int(round(self.viewer.dims.current_step[0]))
@@ -4449,10 +4565,48 @@ class EmbryoViewer:
         sx = self.spots.loc[frame_mask, "POSITION_X"].values
         sy = self.spots.loc[frame_mask, "POSITION_Y"].values
         sz = self.spots.loc[frame_mask, "POSITION_Z"].values
-        dists = np.sqrt((sx - click_x) ** 2 + (sy - click_y) ** 2 + (sz - click_z) ** 2)
+
+        if use_ray:
+            # view_direction is (t, z, y, x) — extract spatial components
+            vd = np.array(view_dir)
+            d = np.array([vd[3], vd[2], vd[1]])  # x, y, z
+            d_norm = np.linalg.norm(d)
+            if d_norm > 1e-10:
+                d = d / d_norm
+            # Point-to-ray distance: ||cross(spot - origin, d)||
+            origin = np.array([click_x, click_y, click_z])
+            diff = np.column_stack([sx - origin[0],
+                                    sy - origin[1],
+                                    sz - origin[2]])
+            cross = np.column_stack([
+                diff[:, 1] * d[2] - diff[:, 2] * d[1],
+                diff[:, 2] * d[0] - diff[:, 0] * d[2],
+                diff[:, 0] * d[1] - diff[:, 1] * d[0],
+            ])
+            dists = np.sqrt((cross ** 2).sum(axis=1))
+        else:
+            dists = np.sqrt((sx - click_x) ** 2 + (sy - click_y) ** 2 + (sz - click_z) ** 2)
         nearest = int(dists.argmin())
         pos_xyz = np.array([sx[nearest], sy[nearest], sz[nearest]])
         snap_d = dists[nearest]
+
+        # ── Track selection mode ──
+        if self._pick_mode == "select_track":
+            # Look up the track_id directly — the nearest spot is already found
+            df_frame = self.spots[frame_mask]
+            tid_vals = df_frame["TRACK_ID"].values if "TRACK_ID" in df_frame.columns else None
+            if tid_vals is not None:
+                tid = int(tid_vals[nearest])
+                self._handle_track_selection_click(tid)
+            else:
+                tid = None
+            # Exit pick mode after each selection so user can navigate
+            self._pick_mode = "none"
+            if tid is not None:
+                self.viewer.status = (
+                    f"Track {tid} toggled — click \U0001f50d again to select more"
+                )
+            return
 
         if self._pick_mode == "ap":
             self.animal_pole = pos_xyz
@@ -4547,6 +4701,751 @@ class EmbryoViewer:
             )
         else:
             self.landmarks_layer.data = np.empty((0, 3))
+
+    # ── Track Selection ───────────────────────────────────────────────
+
+    def _build_track_id_index(self):
+        """Pre-build a dict mapping track_id → array of row indices.
+
+        With 2M spots and ~140K tracks this takes ~200 ms and makes
+        every subsequent selection operation O(selected_tracks) instead
+        of O(all_spots).
+        """
+        if self.spots is None or "TRACK_ID" not in self.spots.columns:
+            self._track_id_index = None
+            return
+        tids = self.spots["TRACK_ID"].values
+        order = np.argsort(tids, kind="stable")
+        sorted_tids = tids[order]
+        # Find boundaries between different track IDs
+        breaks = np.flatnonzero(np.diff(sorted_tids) != 0) + 1
+        groups = np.split(order, breaks)
+        unique_tids = sorted_tids[np.r_[0, breaks]]
+        self._track_id_index = {
+            int(uid): grp for uid, grp in zip(unique_tids, groups)
+            if not np.isnan(uid)
+        }
+
+    def _toggle_select_track_mode(self):
+        """Toggle click-to-select-track pick mode."""
+        if self._pick_mode == "select_track":
+            self._pick_mode = "none"
+            self.viewer.status = "Track selection pick mode OFF"
+        else:
+            self._pick_mode = "select_track"
+            self.viewer.status = (
+                "\U0001f3af CLICK on a nucleus to select/deselect its track. "
+                "Click the button again to stop selecting."
+            )
+
+    def _clear_selection(self):
+        """Clear all selected tracks and restore full display."""
+        self._selected_track_ids.clear()
+        self._random_sampled_ids.clear()
+        self._selection_active = False
+        self._selection_lut = None
+        self._pick_mode = "none"
+        self._update_selection_label()
+        self._apply_selection_display()
+        self.viewer.status = "Selection cleared — showing all nuclei"
+
+    def _reset_random_sample_pool(self):
+        """Clear the 'already sampled' pool so IDs may be drawn again."""
+        self._random_sampled_ids.clear()
+        self.viewer.status = "Random-sample pool reset (all tracks eligible)"
+
+    def _random_sample_tracks(self):
+        """Add N random track IDs to the selection, never repeating."""
+        if self.spots is None or self._track_id_index is None:
+            self.viewer.status = "Load tracks first"
+            return
+        n_req = int(self.random_sample_n.value)
+        all_ids = np.fromiter(self._track_id_index.keys(),
+                              dtype=np.int64,
+                              count=len(self._track_id_index))
+        # Eligible = not previously drawn
+        if self._random_sampled_ids:
+            already = np.fromiter(self._random_sampled_ids,
+                                  dtype=np.int64,
+                                  count=len(self._random_sampled_ids))
+            eligible = np.setdiff1d(all_ids, already, assume_unique=True)
+        else:
+            eligible = all_ids
+        if eligible.size == 0:
+            self.viewer.status = (
+                "All tracks have been sampled — press 'Reset random pool' "
+                "to start over")
+            return
+        n_draw = min(n_req, eligible.size)
+        rng = np.random.default_rng()
+        picked = rng.choice(eligible, size=n_draw, replace=False)
+        self._random_sampled_ids.update(int(t) for t in picked)
+        self._selected_track_ids.update(int(t) for t in picked)
+        self._selection_active = True
+        self._update_selection_label()
+        self._apply_selection_display()
+        self.viewer.status = (
+            f"Sampled {n_draw} random track(s) — "
+            f"{len(self._selected_track_ids)} currently selected, "
+            f"{eligible.size - n_draw} still in pool")
+
+    def _update_selection_label(self):
+        """Update the selection info label."""
+        lbl = getattr(self, "lbl_selection", None)
+        if lbl is None:
+            return
+        n = len(self._selected_track_ids)
+        if n == 0:
+            lbl.value = "No tracks selected"
+        elif n <= 5:
+            ids = sorted(self._selected_track_ids)
+            lbl.value = f"Selected: {', '.join(str(i) for i in ids)}"
+        else:
+            lbl.value = f"Selected: {n} tracks"
+
+    def _handle_track_selection_click(self, tid: int):
+        """Toggle track *tid* in/out of the selection and update display."""
+        try:
+            self._handle_track_selection_click_impl(tid)
+        except Exception:
+            traceback.print_exc()
+            self.viewer.status = "ERROR in track selection — see terminal"
+
+    def _handle_track_selection_click_impl(self, tid: int):
+        if self.spots is None:
+            return
+
+        # Toggle: add or remove
+        if tid in self._selected_track_ids:
+            self._selected_track_ids.discard(tid)
+            action = "deselected"
+        else:
+            self._selected_track_ids.add(tid)
+            action = "selected"
+
+        self._selection_active = len(self._selected_track_ids) > 0
+        self._update_selection_label()
+        self._apply_selection_display()
+
+        self.viewer.status = (
+            f"Track {tid} {action} — "
+            f"{len(self._selected_track_ids)} track(s) selected"
+        )
+
+    def _apply_selection_display(self):
+        """Rebuild all display layers to show only selected tracks (or all)."""
+        try:
+            self._apply_selection_display_impl()
+        except Exception:
+            traceback.print_exc()
+            self.viewer.status = "ERROR in selection display — see terminal"
+
+    def _apply_selection_display_impl(self):
+        """Apply track selection using persistent overlay layers.
+
+        Main "Nuclei" and "Tracks" layers stay intact.  When a selection
+        is active we hide them and show pre-created overlay layers whose
+        `.data` we update in-place (no layer creation → instant even
+        for hundreds of tracks).
+        """
+        df = self.spots
+        sel_ids = self._selected_track_ids
+        idx_map = getattr(self, "_track_id_index", None)
+
+        # ── No selection: show main layers, hide overlays ────────────
+        if not self._selection_active or not sel_ids or df is None:
+            if self._selection_spots_overlay is not None:
+                self._selection_spots_overlay.visible = False
+            if self._selection_tracks_overlay is not None:
+                self._selection_tracks_overlay.visible = False
+            if self.spots_layer is not None:
+                self.spots_layer.visible = True
+            if self.tracks_layer is not None:
+                self.tracks_layer.visible = True
+            if getattr(self, "filter_segments_cb", None) is not None \
+                    and self.filter_segments_cb.value:
+                self._rebuild_selection_segments()
+            self._update_metrics_plot()
+            return
+
+        # ── Gather row indices for selected tracks (O(|selected|)) ───
+        if idx_map is not None:
+            parts = [idx_map[t] for t in sel_ids if t in idx_map]
+            sel_idx = (np.concatenate(parts)
+                       if parts else np.empty(0, dtype=np.intp))
+        else:
+            mask = df["TRACK_ID"].isin(sel_ids).values
+            sel_idx = np.flatnonzero(mask)
+
+        if len(sel_idx) == 0:
+            self.viewer.status = "No spots match current selection"
+            if getattr(self, "filter_segments_cb", None) is not None \
+                    and self.filter_segments_cb.value:
+                self._rebuild_selection_segments()
+            self._update_metrics_plot()
+            return
+
+        tids = df["TRACK_ID"].values[sel_idx].astype(np.int64)
+        frames = df["FRAME"].values[sel_idx]
+
+        # Sort by (track_id, frame) — required by napari Tracks layer
+        order = np.lexsort((frames, tids))
+        sel_idx = sel_idx[order]
+        tids = tids[order]
+        frames = frames[order]
+        zz = df["POSITION_Z"].values[sel_idx]
+        yy = df["POSITION_Y"].values[sel_idx]
+        xx = df["POSITION_X"].values[sel_idx]
+
+        spots_data = np.column_stack([frames, zz, yy, xx])
+
+        # Fast filter to keep only tracks with ≥2 spots (np.unique + bincount)
+        uniq, inverse = np.unique(tids, return_inverse=True)
+        counts = np.bincount(inverse)
+        multi = counts >= 2
+        track_mask = multi[inverse]
+        tracks_data = np.column_stack(
+            [tids[track_mask], frames[track_mask], zz[track_mask],
+             yy[track_mask], xx[track_mask]]
+        )
+
+        # Hide main layers
+        if self.spots_layer is not None:
+            self.spots_layer.visible = False
+        if self.tracks_layer is not None:
+            self.tracks_layer.visible = False
+
+        # ── Update persistent overlay layers in-place ────────────────
+        self._ensure_selection_overlays()
+        sp_over = self._selection_spots_overlay
+        tr_over = self._selection_tracks_overlay
+
+        if sp_over is not None:
+            sp_over.data = spots_data
+            sp_over.visible = True
+
+        if tr_over is not None:
+            if len(tracks_data) > 0:
+                tr_over.data = tracks_data
+                tr_over.visible = True
+            else:
+                tr_over.visible = False
+
+        # Segments + plot + camera
+        if getattr(self, "filter_segments_cb", None) is not None \
+                and self.filter_segments_cb.value:
+            self._rebuild_selection_segments()
+        self._update_metrics_plot()
+        if self._follow_selection:
+            self._center_on_selection()
+
+    def _on_filter_segments_changed(self, value: bool):
+        """Toggle segment-volume filtering on selection."""
+        if value:
+            self._rebuild_selection_segments()
+        else:
+            # Restore unfiltered segments
+            seg_layer = self._segments_layer
+            seg_data = self._segments_data
+            if seg_layer is not None and seg_data is not None \
+                    and seg_layer.data is not seg_data:
+                seg_layer.data = seg_data
+                try:
+                    seg_layer.refresh()
+                except Exception:
+                    pass
+            self._selection_lut = None
+
+    def _ensure_selection_overlays(self):
+        """Create the persistent Selection overlay layers if missing."""
+        if self._selection_spots_overlay is None:
+            dummy = np.zeros((1, 4), dtype=float)
+            self._selection_spots_overlay = self.viewer.add_points(
+                dummy,
+                name="Selection: Nuclei",
+                size=3,
+                face_color="#FFD700",
+                border_color="#FF4500",
+                border_width=0.2,
+                ndim=4,
+                out_of_slice_display=False,
+                visible=False,
+            )
+        if self._selection_tracks_overlay is None:
+            # napari Tracks needs ≥2 rows with same track_id
+            dummy = np.array([[0, 0, 0.0, 0.0, 0.0],
+                              [0, 1, 0.0, 0.0, 0.0]], dtype=float)
+            self._selection_tracks_overlay = self.viewer.add_tracks(
+                dummy,
+                name="Selection: Tracks",
+                tail_width=max(self._track_width, 3.0),
+                tail_length=40,
+                color_by="track_id",
+                colormap="turbo",
+                visible=False,
+            )
+
+    def _rebuild_selection_segments(self):
+        """Build a lightweight selection LUT for segment display.
+
+        Instead of prebuilding ALL frames (slow, uses lots of RAM),
+        we just build a tiny label→uint8 lookup table.  The per-frame
+        time callback applies it on-the-fly to the current frame only
+        (~5 ms for a single 3D volume — instant for scrubbing).
+        """
+        if not self._preload:
+            self._rebuild_selection_segments_lazy()
+            return
+
+        if not hasattr(self, '_display_labels') or self._display_labels is None:
+            return
+
+        if not self._selection_active:
+            # Restore original display by clearing the selection LUT
+            if self._selection_lut is not None:
+                self._selection_lut = None
+            # Refresh current frame from the original frames
+            t = int(self.viewer.dims.current_step[0])
+            self._swap_segment_frame(t)
+            return
+
+        display_labels = self._display_labels
+        max_label = int(display_labels.max())
+        lut = np.zeros(max_label + 1, dtype=np.uint8)
+
+        # Only selected labels get a visible color (Knuth hash)
+        for tid in self._selected_track_ids:
+            if 0 < tid <= max_label:
+                lut[tid] = int(
+                    ((np.uint64(tid) * np.uint64(2654435761))
+                     % np.uint64(251)) + np.uint64(5)
+                )
+
+        self._selection_lut = lut
+
+        # Immediately show the current frame
+        t = int(self.viewer.dims.current_step[0])
+        self._swap_segment_frame(t)
+
+    def _rebuild_selection_segments_lazy(self):
+        """Lazy-mode: filter segments via dask map_blocks.
+
+        Labels layer `.data` is swapped for a new filtered dask array
+        that zeroes out non-selected labels.  Much cheaper than
+        removing and re-adding the layer.
+        """
+        if self._segments_layer is None or self._segments_data is None:
+            return
+
+        import dask.array as da
+        seg_data = self._segments_data
+
+        if not self._selection_active or not self._selected_track_ids:
+            # Restore original
+            if self._segments_layer.data is not seg_data:
+                self._segments_layer.data = seg_data
+                self._segments_layer.refresh()
+            return
+
+        selected = sorted(self._selected_track_ids)
+        max_id = int(max(selected))
+        lut = np.zeros(max_id + 2, dtype=seg_data.dtype)
+        for tid in selected:
+            if 0 < tid <= max_id:
+                lut[tid] = tid
+
+        def _apply_lut(block, block_info=None):
+            safe = np.where((block >= 0) & (block <= max_id), block, 0)
+            return lut[safe]
+
+        filtered = da.map_blocks(_apply_lut, seg_data, dtype=seg_data.dtype)
+        self._segments_layer.data = filtered
+        self._segments_layer.refresh()
+
+    def _swap_segment_frame(self, t: int):
+        """Swap the displayed segment frame, respecting selection state."""
+        sel_lut = self._selection_lut
+        if self._selection_active and sel_lut is not None:
+            # On-the-fly LUT application for the single current frame
+            dl = getattr(self, '_display_labels', None)
+            if dl is None or t < 0 or t >= dl.shape[0]:
+                return
+            frame = sel_lut[dl[t]]
+        else:
+            frames = getattr(self, '_segment_frames', None)
+            if frames is None or t < 0 or t >= len(frames):
+                return
+            frame = frames[t]
+
+        vol = getattr(self, '_vispy_volume', None)
+        canv = getattr(self, '_vispy_canvas', None)
+        if vol is not None:
+            vol.set_data(frame)
+            if canv is not None:
+                canv.native.update()
+        elif self._segments_layer is not None:
+            self._segments_layer.data = frame
+
+        # Sync layer._data reference
+        seg_lyr = self._segments_layer
+        if seg_lyr is not None:
+            try:
+                seg_lyr._data = frame
+            except Exception:
+                pass
+
+    def _center_on_selection(self):
+        """Center the 3D camera on the mean position of selected nuclei."""
+        if not self._selected_track_ids or self.spots is None:
+            return
+
+        current_frame = int(self.viewer.dims.current_step[0])
+        mask = (
+            self.spots["TRACK_ID"].isin(self._selected_track_ids)
+            & (self.spots["FRAME"] == current_frame)
+        )
+        if not mask.any():
+            # Fall back to nearest frame with data
+            sel_spots = self.spots[
+                self.spots["TRACK_ID"].isin(self._selected_track_ids)
+            ]
+            if sel_spots.empty:
+                return
+            nearest_frame = int(sel_spots["FRAME"].iloc[
+                (sel_spots["FRAME"] - current_frame).abs().argmin()
+            ])
+            mask = (
+                self.spots["TRACK_ID"].isin(self._selected_track_ids)
+                & (self.spots["FRAME"] == nearest_frame)
+            )
+
+        sub = self.spots[mask]
+        cx = sub["POSITION_X"].mean()
+        cy = sub["POSITION_Y"].mean()
+        cz = sub["POSITION_Z"].mean()
+
+        # Set napari 3D camera center (z, y, x order)
+        cam = self.viewer.camera
+        cam.center = (current_frame, cz, cy, cx)
+
+    def _go_to_selection(self):
+        """One-shot: center camera on selected nuclei."""
+        if not self._selected_track_ids:
+            self.viewer.status = "No tracks selected"
+            return
+        self._center_on_selection()
+        self.viewer.status = f"Camera centered on {len(self._selected_track_ids)} selected track(s)"
+
+    def _on_follow_selection_changed(self, value: bool):
+        """Toggle follow-selection camera mode."""
+        self._follow_selection = value
+        if value and self._selection_active:
+            self._center_on_selection()
+
+    # ── Selection metrics plot ───────────────────────────────────────
+
+    def _build_metrics_dock(self):
+        """Create a matplotlib dock widget showing metrics for selected tracks.
+
+        Rationale (mirrors ``gastrulation_dynamics_comparison.R``):
+          • Instantaneous speed is computed over a *velocity lag*
+            (``MEDAKA_VEL_LAG = 4`` frames = 2 min, ``ZEBRAFISH_VEL_LAG = 1``
+            frame = 2 min) rather than consecutive frames, to smooth
+            nuclear-centroid segmentation jitter.
+          • A rolling-mean of window ``smooth_k`` is applied afterwards
+            (5 fr = 2.5 min for medaka, 3 fr = 6 min for zebrafish).
+          • Speeds are reported in µm/min using the voxel calibration
+            (isotropic mean of ``voxel_size``) and the frame interval.
+        """
+        try:
+            from matplotlib.figure import Figure
+            from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+            from qtpy.QtWidgets import (
+                QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSpinBox,
+                QDoubleSpinBox, QPushButton,
+            )
+        except ImportError:
+            self._metrics_fig = None
+            self._metrics_canvas = None
+            return
+
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(3)
+
+        # Row 1: frame interval / lag / smooth-K
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("FI(s)"))
+        self._sp_fi = QDoubleSpinBox()
+        self._sp_fi.setRange(0.01, 3600.0)
+        self._sp_fi.setDecimals(2)
+        self._sp_fi.setValue(self._metrics_fi_sec)
+        self._sp_fi.valueChanged.connect(self._on_metrics_params_changed)
+        row1.addWidget(self._sp_fi)
+        row1.addWidget(QLabel("lag"))
+        self._sp_lag = QSpinBox()
+        self._sp_lag.setRange(1, 50)
+        self._sp_lag.setValue(self._metrics_lag)
+        self._sp_lag.valueChanged.connect(self._on_metrics_params_changed)
+        row1.addWidget(self._sp_lag)
+        row1.addWidget(QLabel("smooth K"))
+        self._sp_smooth = QSpinBox()
+        self._sp_smooth.setRange(1, 50)
+        self._sp_smooth.setValue(self._metrics_smooth_k)
+        self._sp_smooth.valueChanged.connect(self._on_metrics_params_changed)
+        row1.addWidget(self._sp_smooth)
+        layout.addLayout(row1)
+
+        # Row 2: species presets
+        row2 = QHBoxLayout()
+        btn_medaka = QPushButton("Medaka preset")
+        btn_medaka.clicked.connect(
+            lambda: self._apply_metrics_preset(fi=30.0, lag=4, k=5))
+        row2.addWidget(btn_medaka)
+        btn_zebra = QPushButton("Zebrafish preset")
+        btn_zebra.clicked.connect(
+            lambda: self._apply_metrics_preset(fi=120.0, lag=1, k=3))
+        row2.addWidget(btn_zebra)
+        layout.addLayout(row2)
+
+        # Matplotlib figure
+        fig = Figure(figsize=(6, 6), tight_layout=True, facecolor="#262930")
+        fig.patch.set_alpha(0)
+        self._metrics_fig = fig
+        self._metrics_axes = fig.subplots(2, 2)
+        for ax in self._metrics_axes.flat:
+            ax.set_facecolor("#1a1b20")
+            for spine in ax.spines.values():
+                spine.set_color("#888")
+            ax.tick_params(colors="#ccc", labelsize=7)
+            ax.title.set_color("#fff")
+
+        self._metrics_canvas = FigureCanvasQTAgg(fig)
+        self._metrics_canvas.setMinimumWidth(380)
+        self._metrics_canvas.setMinimumHeight(420)
+        layout.addWidget(self._metrics_canvas)
+
+        self.viewer.window.add_dock_widget(
+            panel, name="Selection metrics", area="left"
+        )
+        self._update_metrics_plot()
+
+    def _apply_metrics_preset(self, fi: float, lag: int, k: int):
+        self._sp_fi.setValue(fi)
+        self._sp_lag.setValue(lag)
+        self._sp_smooth.setValue(k)
+        # valueChanged handlers will trigger the recompute.
+
+    def _on_metrics_params_changed(self, *_):
+        self._metrics_fi_sec = float(self._sp_fi.value())
+        self._metrics_lag = int(self._sp_lag.value())
+        self._metrics_smooth_k = int(self._sp_smooth.value())
+        self._update_metrics_plot()
+
+    @staticmethod
+    def _rolling_mean(arr: np.ndarray, k: int) -> np.ndarray:
+        """Centered rolling mean with window ``k`` (NaN-tolerant)."""
+        if k <= 1 or arr.size < 2:
+            return arr.astype(float, copy=False)
+        k = int(k)
+        # Use a convolution on the masked array, then normalise by the
+        # number of finite contributions so NaNs don't poison the window.
+        a = np.where(np.isnan(arr), 0.0, arr)
+        w = np.where(np.isnan(arr), 0.0, 1.0)
+        kernel = np.ones(k, dtype=float)
+        num = np.convolve(a, kernel, mode="same")
+        den = np.convolve(w, kernel, mode="same")
+        with np.errstate(invalid="ignore", divide="ignore"):
+            out = np.where(den > 0, num / den, np.nan)
+        return out
+
+    def _compute_selection_metrics(self) -> dict | None:
+        """Compute metrics for selected tracks (R-script rationale).
+
+        Returns ``None`` if no valid selection, otherwise a dict:
+          - ``inst_speed_steps``   µm/min per lag-step (smoothed)
+          - ``mean_speed_per_track`` µm/min, mean of the smoothed series
+          - ``track_length``       minutes per track
+          - ``straightness``       net/path
+        """
+        if (self.spots is None
+                or not self._selected_track_ids
+                or "TRACK_ID" not in self.spots.columns):
+            return None
+
+        idx_map = getattr(self, "_track_id_index", None)
+        if idx_map is None:
+            return None
+        parts = [idx_map[t] for t in self._selected_track_ids if t in idx_map]
+        if not parts:
+            return None
+        sel_idx = np.concatenate(parts)
+        if len(sel_idx) < 2:
+            return None
+
+        df = self.spots
+        tids = df["TRACK_ID"].values[sel_idx].astype(np.int64)
+        frames = df["FRAME"].values[sel_idx].astype(np.int64)
+
+        # Voxel calibration → µm.  Isotropic mean of (Z,Y,X) voxel size.
+        vs = self._voxel_size
+        scale = float(np.mean(vs)) if vs is not None else 1.0
+        x = df["POSITION_X"].values[sel_idx].astype(float) * scale
+        y = df["POSITION_Y"].values[sel_idx].astype(float) * scale
+        z = df["POSITION_Z"].values[sel_idx].astype(float) * scale
+
+        # Sort by (track_id, frame)
+        order = np.lexsort((frames, tids))
+        tids, frames = tids[order], frames[order]
+        x, y, z = x[order], y[order], z[order]
+
+        lag = max(1, int(self._metrics_lag))
+        smooth_k = max(1, int(self._metrics_smooth_k))
+        fi_min = float(self._metrics_fi_sec) / 60.0  # minutes per frame
+
+        # Per-track aggregation
+        unique_tids, first_idx = np.unique(tids, return_index=True)
+        bounds = np.r_[first_idx, len(tids)]
+
+        inst_all: list[np.ndarray] = []
+        mean_speed = np.full(len(unique_tids), np.nan, dtype=float)
+        track_len = np.zeros(len(unique_tids), dtype=np.int64)
+        straight = np.full(len(unique_tids), np.nan, dtype=float)
+
+        for k in range(len(unique_tids)):
+            lo, hi = bounds[k], bounds[k + 1]
+            n = hi - lo
+            track_len[k] = n
+            if n < 2:
+                continue
+            tx, ty, tz = x[lo:hi], y[lo:hi], z[lo:hi]
+            tf = frames[lo:hi]
+
+            # Straightness uses full consecutive path
+            seg = np.sqrt(np.diff(tx) ** 2 + np.diff(ty) ** 2
+                          + np.diff(tz) ** 2)
+            path_len = seg.sum()
+            net = np.sqrt((tx[-1] - tx[0]) ** 2
+                          + (ty[-1] - ty[0]) ** 2
+                          + (tz[-1] - tz[0]) ** 2)
+            straight[k] = (net / path_len) if path_len > 0 else np.nan
+
+            # Velocity at lag, same-track only, mask gaps
+            if n <= lag:
+                continue
+            dx = tx[lag:] - tx[:-lag]
+            dy = ty[lag:] - ty[:-lag]
+            dz = tz[lag:] - tz[:-lag]
+            df_fr = (tf[lag:] - tf[:-lag]).astype(float)
+            disp = np.sqrt(dx * dx + dy * dy + dz * dz)
+            # µm/min: only valid if frame gap == lag (no missing frames)
+            valid = df_fr == lag
+            spd = np.where(valid, disp / (lag * fi_min), np.nan)
+            spd_s = self._rolling_mean(spd, smooth_k)
+            finite = spd_s[np.isfinite(spd_s)]
+            if finite.size:
+                inst_all.append(finite)
+                mean_speed[k] = float(np.mean(finite))
+
+        inst_speed = (np.concatenate(inst_all)
+                      if inst_all else np.empty(0, dtype=float))
+        return {
+            "inst_speed_steps": inst_speed,
+            "mean_speed_per_track": mean_speed,
+            "track_length_min": track_len.astype(float) * fi_min,
+            "straightness": straight,
+            "n_tracks": int(len(unique_tids)),
+            "lag": lag,
+            "smooth_k": smooth_k,
+            "fi_sec": float(self._metrics_fi_sec),
+            "scaled_um": vs is not None,
+        }
+
+    def _update_metrics_plot(self):
+        """Redraw the selection-metrics figure."""
+        fig = getattr(self, "_metrics_fig", None)
+        canvas = getattr(self, "_metrics_canvas", None)
+        if fig is None or canvas is None:
+            return
+        axes = self._metrics_axes
+        for ax in axes.flat:
+            ax.clear()
+            ax.set_facecolor("#1a1b20")
+            for spine in ax.spines.values():
+                spine.set_color("#888")
+            ax.tick_params(colors="#ccc", labelsize=7)
+            ax.title.set_color("#fff")
+
+        m = self._compute_selection_metrics()
+        if m is None:
+            axes[0, 0].text(
+                0.5, 0.5, "Select tracks to\nshow metrics",
+                ha="center", va="center",
+                transform=axes[0, 0].transAxes,
+                color="#888", fontsize=11,
+            )
+            for ax in axes.flat:
+                ax.set_xticks([])
+                ax.set_yticks([])
+            canvas.draw_idle()
+            return
+
+        color_hist = "#FFD700"
+        color_edge = "#FF4500"
+        unit = "µm/min" if m["scaled_um"] else "px/min"
+
+        # (0,0) instantaneous speed (smoothed, per-step)
+        ax = axes[0, 0]
+        vals = m["inst_speed_steps"]
+        if len(vals) > 1:
+            ax.hist(vals, bins=min(40, max(5, int(np.sqrt(len(vals))))),
+                    color=color_hist, edgecolor=color_edge)
+            ax.set_title(
+                f"Inst. speed\n(lag={m['lag']} fr, k={m['smooth_k']}, "
+                f"n={len(vals)} steps)", fontsize=8)
+            ax.set_xlabel(unit, fontsize=7)
+        else:
+            ax.text(0.5, 0.5, "tracks too short\nfor lag",
+                    ha="center", va="center",
+                    transform=ax.transAxes, color="#888")
+
+        # (0,1) mean speed per track
+        ax = axes[0, 1]
+        vals = m["mean_speed_per_track"]
+        vals = vals[np.isfinite(vals)]
+        if len(vals) > 0:
+            bins = min(20, max(3, int(np.sqrt(len(vals)))))
+            ax.hist(vals, bins=bins, color=color_hist, edgecolor=color_edge)
+            ax.set_title(
+                f"Mean speed / track\n(n={m['n_tracks']}, "
+                f"med={np.median(vals):.2f} {unit})", fontsize=8)
+            ax.set_xlabel(unit, fontsize=7)
+
+        # (1,0) track length in minutes
+        ax = axes[1, 0]
+        vals = m["track_length_min"]
+        if len(vals) > 0:
+            bins = min(20, max(3, int(np.sqrt(len(vals)))))
+            ax.hist(vals, bins=bins, color=color_hist, edgecolor=color_edge)
+            ax.set_title(
+                f"Track length\n(med={np.median(vals):.1f} min)", fontsize=8)
+            ax.set_xlabel("minutes", fontsize=7)
+
+        # (1,1) straightness
+        ax = axes[1, 1]
+        vals = m["straightness"]
+        vals = vals[np.isfinite(vals)]
+        if len(vals) > 0:
+            bins = min(20, max(3, int(np.sqrt(len(vals)))))
+            ax.hist(vals, bins=bins, range=(0, 1),
+                    color=color_hist, edgecolor=color_edge)
+            ax.set_title(
+                f"Straightness\n(med={np.median(vals):.2f})", fontsize=8)
+            ax.set_xlabel("net / path", fontsize=7)
+            ax.set_xlim(0, 1)
+
+        canvas.draw_idle()
 
     # ── Orientation ───────────────────────────────────────────────────
 

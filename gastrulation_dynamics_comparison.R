@@ -32,9 +32,12 @@ ZEBRAFISH_INPUT <- "oriented_zebrafish_ultrack"
 MEDAKA_FI   <- 30   # frame interval in seconds
 ZEBRAFISH_FI <- 120
 
-MSD_MAX_LAG   <- 20
-MSD_N_TRACKS  <- 8000
-MIN_TRACK_LENGTH <- 5
+MEDAKA_MSD_MAX_LAG    <- 50   # match individual medaka script
+ZEBRAFISH_MSD_MAX_LAG <- 30   # match individual zebrafish script
+MSD_N_TRACKS  <- 10000
+MEDAKA_MIN_TRACK_LENGTH   <- 20L  # 20 × 30s  = 10 min
+ZEBRAFISH_MIN_TRACK_LENGTH <- 5L  #  5 × 120s = 10 min
+MIN_TRACK_LENGTH <- 5  # legacy (unused)
 
 # Voxel calibration — ultrack outputs positions in pixels.
 # From TIFF metadata (nuclear_stats_global.tsv):
@@ -102,9 +105,9 @@ tm_z <- fread(file.path(ZEBRAFISH_DIR, "zebrafish_dynamics_track_metrics.csv"), 
 # Harmonize columns — keep only shared ones + species specific
 shared_cols <- c("TRACK_ID", "n_frames", "duration_min", "mean_theta", "mean_phi", "mean_depth",
                  "net_disp", "total_path", "straightness", "confinement",
-                 "mean_speed", "mean_v_epiboly", "mean_v_depth",
+                 "mean_speed", "mean_v_epiboly", "mean_v_convergence", "mean_v_depth",
                  "net_dTheta", "net_dPhi", "mean_turning", "mean_acceleration",
-                 "persistence", "movement_type", "zone", "species")
+                 "persistence", "movement_type", "zone", "dist_to_ingression", "species")
 
 existing_m <- intersect(shared_cols, names(tm_m))
 existing_z <- intersect(shared_cols, names(tm_z))
@@ -124,6 +127,28 @@ spots_m <- fread(file.path(MEDAKA_INPUT, "oriented_tracks_medaka.csv"), showProg
 spots_z <- fread(file.path(ZEBRAFISH_INPUT, "oriented_tracks_zebrafish.csv"), showProgress = FALSE) %>%
   mutate(species = "Zebrafish", time_min = FRAME * ZEBRAFISH_FI / 60)
 
+# --- Filter: keep only tracks with >= 10 min duration ---
+filter_short_tracks <- function(dt, min_len, fi_sec, sp_name) {
+  tl <- dt[, .N, by = TRACK_ID]
+  n_before <- nrow(dt); nt_before <- nrow(tl)
+  keep_ids <- tl[N >= min_len, TRACK_ID]
+  dt <- dt[TRACK_ID %in% keep_ids]
+  n_after <- nrow(dt); nt_after <- length(keep_ids)
+  cat(sprintf("  %s track filter (>= %d frames = %.0f min):\n",
+              sp_name, min_len, min_len * fi_sec / 60))
+  cat(sprintf("    Tracks: %s -> %s (dropped %s, %.1f%%)\n",
+              format(nt_before, big.mark = ","), format(nt_after, big.mark = ","),
+              format(nt_before - nt_after, big.mark = ","),
+              100 * (nt_before - nt_after) / nt_before))
+  cat(sprintf("    Spots:  %s -> %s (dropped %s, %.1f%%)\n",
+              format(n_before, big.mark = ","), format(n_after, big.mark = ","),
+              format(n_before - n_after, big.mark = ","),
+              100 * (n_before - n_after) / n_before))
+  dt
+}
+spots_m <- filter_short_tracks(spots_m, MEDAKA_MIN_TRACK_LENGTH, MEDAKA_FI, "Medaka")
+spots_z <- filter_short_tracks(spots_z, ZEBRAFISH_MIN_TRACK_LENGTH, ZEBRAFISH_FI, "Zebrafish")
+
 # --- Voxel calibration: convert pixel positions to microns ---
 cat(sprintf("  Voxel calibration: medaka=%.5f um/px, zebrafish=%.5f um/px\n",
             MEDAKA_VOXEL_UM, ZEBRAFISH_VOXEL_UM))
@@ -131,6 +156,35 @@ for (col in c("POSITION_X", "POSITION_Y", "POSITION_Z", "RADIAL_DIST", "SPHERICA
   spots_m[[col]] <- spots_m[[col]] * MEDAKA_VOXEL_UM
   spots_z[[col]] <- spots_z[[col]] * ZEBRAFISH_VOXEL_UM
 }
+
+# Load sphere params and landmarks for spatial visualization
+cat("  Loading sphere params and landmarks...\n")
+sphere_m_raw <- read_csv(file.path(MEDAKA_INPUT, "sphere_params.csv"), show_col_types = FALSE)
+sphere_z_raw <- read_csv(file.path(ZEBRAFISH_INPUT, "sphere_params.csv"), show_col_types = FALSE)
+SPHERE_RADIUS_M <- as.numeric(sphere_m_raw$value[sphere_m_raw$parameter == "radius"]) * MEDAKA_VOXEL_UM
+SPHERE_RADIUS_Z <- as.numeric(sphere_z_raw$value[sphere_z_raw$parameter == "radius"]) * ZEBRAFISH_VOXEL_UM
+
+load_landmarks <- function(input_dir) {
+  lm_file <- file.path(input_dir, "gastrulation_landmarks.csv")
+  out <- list(margin_theta = NA_real_, ingr_theta = NA_real_, ingr_phi = NA_real_)
+  if (file.exists(lm_file)) {
+    lm_df <- read_csv(lm_file, show_col_types = FALSE)
+    mr <- lm_df %>% filter(landmark == "margin")
+    if (nrow(mr) == 1 && "theta" %in% names(mr)) out$margin_theta <- mr$theta[1]
+    ir <- lm_df %>% filter(landmark == "ingression_center")
+    if (nrow(ir) == 1 && "theta" %in% names(ir)) {
+      out$ingr_theta <- ir$theta[1]
+      out$ingr_phi   <- ir$phi[1]
+    }
+  }
+  out
+}
+lm_m <- load_landmarks(MEDAKA_INPUT)
+lm_z <- load_landmarks(ZEBRAFISH_INPUT)
+cat(sprintf("  Medaka  landmarks: margin=%.1f, ingression=(%.1f, %.1f)\n",
+            lm_m$margin_theta, lm_m$ingr_theta, lm_m$ingr_phi))
+cat(sprintf("  Zebrafish landmarks: margin=%.1f, ingression=(%.1f, %.1f)\n",
+            lm_z$margin_theta, lm_z$ingr_theta, lm_z$ingr_phi))
 
 # Compute velocity for both — with smoothing and configurable lag
 # vel_lag: number of frames to lag for displacement (4 for medaka = 2 min, 1 for zebrafish = 2 min)
@@ -176,6 +230,21 @@ compute_vel <- function(df, frame_int_sec, vel_lag = 1L, smooth_k = 5L) {
     v_depth       = dDepth / (dt_frames * fi_min)
   )]
 
+  # Turning angle (angle between consecutive displacement vectors)
+  dt[, `:=`(
+    lag_dx = shift(dx, VL),
+    lag_dy = shift(dy, VL),
+    lag_dz = shift(dz, VL),
+    mag_prev = shift(disp_3d, VL)
+  ), by = TRACK_ID]
+  dt[, `:=`(
+    dot_prev = dx * lag_dx + dy * lag_dy + dz * lag_dz,
+    mag_curr = disp_3d
+  )]
+  dt[, cos_angle := dot_prev / (mag_curr * mag_prev)]
+  dt[, turning_angle := acos(pmin(pmax(cos_angle, -1), 1)) * 180 / pi]
+  dt[, c("lag_dx", "lag_dy", "lag_dz", "dot_prev", "mag_curr", "mag_prev", "cos_angle") := NULL]
+
   setDF(dt)
   dt %>% filter(!is.na(dt_frames) & dt_frames == vel_lag)
 }
@@ -188,6 +257,14 @@ vel_m <- compute_vel(spots_m, MEDAKA_FI, vel_lag = MEDAKA_VEL_LAG, smooth_k = ME
 vel_z <- compute_vel(spots_z, ZEBRAFISH_FI, vel_lag = ZEBRAFISH_VEL_LAG, smooth_k = ZEBRAFISH_SMOOTH_K)
 vel_all <- bind_rows(vel_m, vel_z) %>%
   mutate(species = factor(species, levels = c("Medaka", "Zebrafish")))
+
+# Per-step classification (same logic as individual scripts)
+vel_all <- vel_all %>%
+  mutate(step_type = case_when(
+    abs(v_convergence) > abs(v_epiboly) ~ "Convergence",
+    v_epiboly > 0                       ~ "Epiboly",
+    TRUE                                ~ "Animalward"
+  ))
 
 # =============================================================================
 # SMOOTHING SENSITIVITY — TURNING ANGLE ARTIFACT TEST (both species)
@@ -510,14 +587,15 @@ compute_msd <- function(df, max_lag, n_sample, fi_min) {
   bind_rows(msd_list)
 }
 
-msd_m <- compute_msd(spots_m, MSD_MAX_LAG, MSD_N_TRACKS, MEDAKA_FI / 60) %>%
+msd_m <- compute_msd(spots_m, MEDAKA_MSD_MAX_LAG, MSD_N_TRACKS, MEDAKA_FI / 60) %>%
   mutate(species = "Medaka")
-msd_z <- compute_msd(spots_z, MSD_MAX_LAG, MSD_N_TRACKS, ZEBRAFISH_FI / 60) %>%
+msd_z <- compute_msd(spots_z, ZEBRAFISH_MSD_MAX_LAG, MSD_N_TRACKS, ZEBRAFISH_FI / 60) %>%
   mutate(species = "Zebrafish")
 msd_both <- bind_rows(msd_m, msd_z) %>%
   mutate(species = factor(species, levels = c("Medaka", "Zebrafish")))
 
-cat(sprintf("  MSD: Medaka %d lags, Zebrafish %d lags\n", nrow(msd_m), nrow(msd_z)))
+cat(sprintf("  MSD: Medaka %d lags (%.1f min max), Zebrafish %d lags (%.1f min max)\n",
+            nrow(msd_m), max(msd_m$lag_min), nrow(msd_z), max(msd_z$lag_min)))
 
 # ###########################################################################
 # FIGURES
@@ -527,6 +605,308 @@ cat("\n")
 cat(strrep("=", 70), "\n")
 cat("  GENERATING COMPARISON FIGURES\n")
 cat(strrep("=", 70), "\n")
+
+# ============================================================================
+# FIGURE 00: DATA OVERVIEW — BASIC STATS & EMBRYO MAPS
+# ============================================================================
+# Show: (a) data volume summary, (b) track length distributions,
+# (c) spatial coverage (theta-phi maps with cell density),
+# (d) ingression detection: where & how it was identified.
+# ============================================================================
+
+cat("\n=== FIGURE 00: DATA OVERVIEW ===\n")
+
+# --- Data volume stats ---
+n_spots_m   <- nrow(spots_m)
+n_spots_z   <- nrow(spots_z)
+n_tracks_m  <- length(unique(spots_m$TRACK_ID))
+n_tracks_z  <- length(unique(spots_z$TRACK_ID))
+n_frames_m  <- max(spots_m$FRAME) - min(spots_m$FRAME) + 1
+n_frames_z  <- max(spots_z$FRAME) - min(spots_z$FRAME) + 1
+dur_m       <- n_frames_m * MEDAKA_FI / 60  # total duration in minutes
+dur_z       <- n_frames_z * ZEBRAFISH_FI / 60
+
+cat(sprintf("  Medaka:    %s spots, %s tracks, %d frames (%.0f min), R=%.0f um\n",
+            format(n_spots_m, big.mark = ","), format(n_tracks_m, big.mark = ","),
+            n_frames_m, dur_m, SPHERE_RADIUS_M))
+cat(sprintf("  Zebrafish: %s spots, %s tracks, %d frames (%.0f min), R=%.0f um\n",
+            format(n_spots_z, big.mark = ","), format(n_tracks_z, big.mark = ","),
+            n_frames_z, dur_z, SPHERE_RADIUS_Z))
+
+# --- 00a: Summary bar chart ---
+overview_df <- data.frame(
+  metric = rep(c("Detections\n(x1000)", "Tracks\n(x1000)", "Frames", "Duration\n(min)",
+                 "Sphere R\n(um)"), each = 2),
+  species = rep(c("Medaka", "Zebrafish"), 5),
+  value = c(n_spots_m / 1e3, n_spots_z / 1e3,
+            n_tracks_m / 1e3, n_tracks_z / 1e3,
+            n_frames_m, n_frames_z,
+            dur_m, dur_z,
+            SPHERE_RADIUS_M, SPHERE_RADIUS_Z)
+)
+overview_df$species <- factor(overview_df$species, levels = c("Medaka", "Zebrafish"))
+overview_df$metric <- factor(overview_df$metric,
+                             levels = c("Detections\n(x1000)", "Tracks\n(x1000)", "Frames",
+                                        "Duration\n(min)", "Sphere R\n(um)"))
+
+p00a <- ggplot(overview_df, aes(x = metric, y = value, fill = species)) +
+  geom_col(position = "dodge", width = 0.65, alpha = 0.85) +
+  geom_text(aes(label = ifelse(value > 100, format(round(value), big.mark = ","),
+                                sprintf("%.0f", value))),
+            position = position_dodge(width = 0.65), vjust = -0.4, size = 3) +
+  scale_fill_manual(values = species_colors) +
+  labs(title = "Dataset overview", x = NULL, y = NULL, fill = "Species") +
+  theme_compare() +
+  theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(),
+        panel.grid = element_blank())
+
+# --- 00b: Track length distribution ---
+track_len_df <- bind_rows(
+  spots_m[, .(n_frames = .N), by = TRACK_ID][, species := "Medaka"],
+  spots_z[, .(n_frames = .N), by = TRACK_ID][, species := "Zebrafish"]
+) %>% mutate(species = factor(species, levels = c("Medaka", "Zebrafish")))
+
+med_len_m <- median(track_len_df$n_frames[track_len_df$species == "Medaka"])
+med_len_z <- median(track_len_df$n_frames[track_len_df$species == "Zebrafish"])
+
+p00b <- ggplot(track_len_df, aes(x = n_frames, fill = species)) +
+  geom_histogram(alpha = 0.5, position = "identity", bins = 80, color = NA) +
+  geom_vline(xintercept = med_len_m, color = species_colors["Medaka"],
+             linetype = "dashed", linewidth = 0.6) +
+  geom_vline(xintercept = med_len_z, color = species_colors["Zebrafish"],
+             linetype = "dashed", linewidth = 0.6) +
+  scale_fill_manual(values = species_colors) +
+  scale_x_continuous(limits = c(0, quantile(track_len_df$n_frames, 0.99))) +
+  labs(title = "Track length distribution",
+       subtitle = sprintf("Median: Medaka=%d frames (%.0f min), Zebrafish=%d frames (%.0f min)",
+                          med_len_m, med_len_m * MEDAKA_FI / 60,
+                          med_len_z, med_len_z * ZEBRAFISH_FI / 60),
+       x = "Track length (frames)", y = "Count", fill = "Species") +
+  theme_compare()
+
+# --- 00c: Track length in minutes ---
+track_len_df <- track_len_df %>%
+  mutate(duration_min = ifelse(species == "Medaka",
+                                n_frames * MEDAKA_FI / 60,
+                                n_frames * ZEBRAFISH_FI / 60))
+med_dur_m <- median(track_len_df$duration_min[track_len_df$species == "Medaka"])
+med_dur_z <- median(track_len_df$duration_min[track_len_df$species == "Zebrafish"])
+
+p00c <- ggplot(track_len_df, aes(x = duration_min, fill = species)) +
+  geom_histogram(alpha = 0.5, position = "identity", bins = 80, color = NA) +
+  geom_vline(xintercept = med_dur_m, color = species_colors["Medaka"],
+             linetype = "dashed", linewidth = 0.6) +
+  geom_vline(xintercept = med_dur_z, color = species_colors["Zebrafish"],
+             linetype = "dashed", linewidth = 0.6) +
+  scale_fill_manual(values = species_colors) +
+  scale_x_continuous(limits = c(0, quantile(track_len_df$duration_min, 0.99))) +
+  labs(title = "Track duration distribution",
+       subtitle = sprintf("Median: Medaka=%.1f min, Zebrafish=%.1f min", med_dur_m, med_dur_z),
+       x = "Track duration (min)", y = "Count", fill = "Species") +
+  theme_compare()
+
+# --- 00d: Nuclei per frame over time ---
+nuc_per_frame <- bind_rows(
+  spots_m[, .(n_nuclei = .N, species = "Medaka", time_min = FRAME[1] * MEDAKA_FI / 60), by = FRAME],
+  spots_z[, .(n_nuclei = .N, species = "Zebrafish", time_min = FRAME[1] * ZEBRAFISH_FI / 60), by = FRAME]
+) %>% mutate(species = factor(species, levels = c("Medaka", "Zebrafish")))
+
+p00d <- ggplot(nuc_per_frame, aes(x = time_min, y = n_nuclei, color = species)) +
+  geom_line(linewidth = 0.5, alpha = 0.8) +
+  scale_color_manual(values = species_colors) +
+  labs(title = "Detected nuclei per frame",
+       x = "Time (min)", y = "Nuclei count", color = "Species") +
+  theme_compare()
+
+# --- 00e-f: Spatial coverage (theta-phi density) per species ---
+# Sample frames for density map (every 10th frame)
+spatial_sample_m <- spots_m[FRAME %% 10 == 0, .(THETA_DEG, PHI_DEG)]
+spatial_sample_z <- spots_z[FRAME %% 10 == 0, .(THETA_DEG, PHI_DEG)]
+
+p00e <- ggplot(spatial_sample_m, aes(x = PHI_DEG, y = THETA_DEG)) +
+  stat_bin_2d(bins = 60, aes(fill = after_stat(count)), color = NA) +
+  scale_fill_viridis(option = "inferno", name = "Count", trans = "log10") +
+  geom_hline(yintercept = lm_m$margin_theta, color = "cyan", linetype = "dashed", linewidth = 0.6) +
+  annotate("point", x = lm_m$ingr_phi, y = lm_m$ingr_theta,
+           color = "cyan", size = 4, shape = 4, stroke = 1.5) +
+  annotate("text", x = lm_m$ingr_phi, y = lm_m$ingr_theta - 3,
+           label = "Ingression", color = "cyan", size = 3, fontface = "bold") +
+  annotate("text", x = min(spatial_sample_m$PHI_DEG) + 5, y = lm_m$margin_theta + 2,
+           label = "Margin", color = "cyan", size = 3, hjust = 0) +
+  scale_y_reverse() +
+  labs(title = "Medaka -- spatial coverage (theta-phi)", x = "Phi (deg)", y = "Theta (deg)") +
+  theme_compare()
+
+p00f <- ggplot(spatial_sample_z, aes(x = PHI_DEG, y = THETA_DEG)) +
+  stat_bin_2d(bins = 60, aes(fill = after_stat(count)), color = NA) +
+  scale_fill_viridis(option = "inferno", name = "Count", trans = "log10") +
+  geom_hline(yintercept = lm_z$margin_theta, color = "cyan", linetype = "dashed", linewidth = 0.6) +
+  annotate("point", x = lm_z$ingr_phi, y = lm_z$ingr_theta,
+           color = "cyan", size = 4, shape = 4, stroke = 1.5) +
+  annotate("text", x = lm_z$ingr_phi, y = lm_z$ingr_theta - 3,
+           label = "Ingression", color = "cyan", size = 3, fontface = "bold") +
+  annotate("text", x = min(spatial_sample_z$PHI_DEG) + 5, y = lm_z$margin_theta + 2,
+           label = "Margin", color = "cyan", size = 3, hjust = 0) +
+  scale_y_reverse() +
+  labs(title = "Zebrafish -- spatial coverage (theta-phi)", x = "Phi (deg)", y = "Theta (deg)") +
+  theme_compare()
+
+# --- 00g-h: Movement type spatial maps ---
+# Show where each movement type lives (theta-phi scatter, color = movement type)
+mvt_colors_00 <- c("Epiboly" = "#EF8A62", "Convergence" = "#1B7837",
+                     "Animalward" = "#FDDBC7", "Ingression" = "#2166AC")
+
+# Use track_all which has movement_type, mean_theta, mean_phi
+track_mvt_m <- track_all %>% filter(species == "Medaka" & !is.na(movement_type))
+track_mvt_z <- track_all %>% filter(species == "Zebrafish" & !is.na(movement_type))
+
+p00g <- ggplot(track_mvt_m, aes(x = mean_phi, y = mean_theta, color = movement_type)) +
+  geom_point(size = 0.3, alpha = 0.3) +
+  geom_hline(yintercept = lm_m$margin_theta, color = "grey30", linetype = "dashed", linewidth = 0.5) +
+  annotate("point", x = lm_m$ingr_phi, y = lm_m$ingr_theta,
+           color = "black", size = 5, shape = 4, stroke = 2) +
+  scale_color_manual(values = mvt_colors_00) +
+  scale_y_reverse() +
+  labs(title = "Medaka -- track movement types",
+       subtitle = sprintf("N=%s tracks  |  x = ingression center, dashed = margin",
+                          format(nrow(track_mvt_m), big.mark = ",")),
+       x = "Phi (deg)", y = "Theta (deg)", color = "Movement") +
+  guides(color = guide_legend(override.aes = list(size = 3, alpha = 1))) +
+  theme_compare()
+
+p00h <- ggplot(track_mvt_z, aes(x = mean_phi, y = mean_theta, color = movement_type)) +
+  geom_point(size = 0.3, alpha = 0.3) +
+  geom_hline(yintercept = lm_z$margin_theta, color = "grey30", linetype = "dashed", linewidth = 0.5) +
+  annotate("point", x = lm_z$ingr_phi, y = lm_z$ingr_theta,
+           color = "black", size = 5, shape = 4, stroke = 2) +
+  scale_color_manual(values = mvt_colors_00) +
+  scale_y_reverse() +
+  labs(title = "Zebrafish -- track movement types",
+       subtitle = sprintf("N=%s tracks  |  x = ingression center, dashed = margin",
+                          format(nrow(track_mvt_z), big.mark = ",")),
+       x = "Phi (deg)", y = "Theta (deg)", color = "Movement") +
+  guides(color = guide_legend(override.aes = list(size = 3, alpha = 1))) +
+  theme_compare()
+
+# --- 00i-j: Depth maps (theta-phi, color = depth) for ingression visualization ---
+# Show depth at a late timepoint to highlight where cells go deep (= ingression zone)
+late_frac <- 0.8
+late_frame_m <- round(max(spots_m$FRAME) * late_frac)
+late_frame_z <- round(max(spots_z$FRAME) * late_frac)
+
+depth_m <- spots_m[FRAME == late_frame_m, .(THETA_DEG, PHI_DEG, SPHERICAL_DEPTH)]
+depth_z <- spots_z[FRAME == late_frame_z, .(THETA_DEG, PHI_DEG, SPHERICAL_DEPTH)]
+
+p00i <- ggplot(depth_m, aes(x = PHI_DEG, y = THETA_DEG, color = SPHERICAL_DEPTH)) +
+  geom_point(size = 0.8, alpha = 0.7) +
+  scale_color_viridis(option = "mako", name = "Depth (um)", direction = -1) +
+  geom_hline(yintercept = lm_m$margin_theta, color = "red", linetype = "dashed", linewidth = 0.5) +
+  annotate("point", x = lm_m$ingr_phi, y = lm_m$ingr_theta,
+           color = "red", size = 5, shape = 4, stroke = 2) +
+  scale_y_reverse() +
+  labs(title = sprintf("Medaka -- depth map at frame %d (%.0f min)", late_frame_m, late_frame_m * MEDAKA_FI / 60),
+       subtitle = "Deep cells near x = ingression cluster",
+       x = "Phi (deg)", y = "Theta (deg)") +
+  theme_compare()
+
+p00j <- ggplot(depth_z, aes(x = PHI_DEG, y = THETA_DEG, color = SPHERICAL_DEPTH)) +
+  geom_point(size = 0.8, alpha = 0.7) +
+  scale_color_viridis(option = "mako", name = "Depth (um)", direction = -1) +
+  geom_hline(yintercept = lm_z$margin_theta, color = "red", linetype = "dashed", linewidth = 0.5) +
+  annotate("point", x = lm_z$ingr_phi, y = lm_z$ingr_theta,
+           color = "red", size = 5, shape = 4, stroke = 2) +
+  scale_y_reverse() +
+  labs(title = sprintf("Zebrafish -- depth map at frame %d (%.0f min)", late_frame_z, late_frame_z * ZEBRAFISH_FI / 60),
+       subtitle = "Deep cells near x = ingression cluster",
+       x = "Phi (deg)", y = "Theta (deg)") +
+  theme_compare()
+
+# --- 00k-l: Spatial map of mean track duration (theta-phi heatmap) ---
+# Compute per-track: mean position (theta, phi) and duration in min
+tlen_m <- spots_m[, .(mean_theta = mean(THETA_DEG), mean_phi = mean(PHI_DEG),
+                       duration_min = (.N) * MEDAKA_FI / 60), by = TRACK_ID]
+tlen_z <- spots_z[, .(mean_theta = mean(THETA_DEG), mean_phi = mean(PHI_DEG),
+                       duration_min = (.N) * ZEBRAFISH_FI / 60), by = TRACK_ID]
+
+# Shared color scale
+dur_max <- max(quantile(tlen_m$duration_min, 0.95), quantile(tlen_z$duration_min, 0.95))
+
+p00k <- ggplot(tlen_m, aes(x = mean_phi, y = mean_theta, z = duration_min)) +
+  stat_summary_2d(fun = "median", bins = 40) +
+  scale_fill_viridis(option = "plasma", name = "Median\nduration\n(min)",
+                     limits = c(0, dur_max), oob = scales::squish) +
+  geom_hline(yintercept = lm_m$margin_theta, color = "cyan", linetype = "dashed", linewidth = 0.6) +
+  annotate("point", x = lm_m$ingr_phi, y = lm_m$ingr_theta,
+           color = "cyan", size = 4, shape = 4, stroke = 1.5) +
+  scale_y_reverse() +
+  labs(title = "Medaka -- median track duration (spatial)",
+       subtitle = sprintf("N=%s tracks | x = ingression, dashed = margin",
+                          format(nrow(tlen_m), big.mark = ",")),
+       x = "Phi (deg)", y = "Theta (deg)") +
+  theme_compare()
+
+p00l <- ggplot(tlen_z, aes(x = mean_phi, y = mean_theta, z = duration_min)) +
+  stat_summary_2d(fun = "median", bins = 40) +
+  scale_fill_viridis(option = "plasma", name = "Median\nduration\n(min)",
+                     limits = c(0, dur_max), oob = scales::squish) +
+  geom_hline(yintercept = lm_z$margin_theta, color = "cyan", linetype = "dashed", linewidth = 0.6) +
+  annotate("point", x = lm_z$ingr_phi, y = lm_z$ingr_theta,
+           color = "cyan", size = 4, shape = 4, stroke = 1.5) +
+  scale_y_reverse() +
+  labs(title = "Zebrafish -- median track duration (spatial)",
+       subtitle = sprintf("N=%s tracks | x = ingression, dashed = margin",
+                          format(nrow(tlen_z), big.mark = ",")),
+       x = "Phi (deg)", y = "Theta (deg)") +
+  theme_compare()
+
+# --- 00m: Track duration over time (by track start frame) ---
+tstart_m <- spots_m[, .(start_frame = min(FRAME), duration_min = (.N) * MEDAKA_FI / 60),
+                     by = TRACK_ID][, `:=`(species = "Medaka",
+                                           start_min = start_frame * MEDAKA_FI / 60)]
+tstart_z <- spots_z[, .(start_frame = min(FRAME), duration_min = (.N) * ZEBRAFISH_FI / 60),
+                     by = TRACK_ID][, `:=`(species = "Zebrafish",
+                                           start_min = start_frame * ZEBRAFISH_FI / 60)]
+tstart_all <- rbindlist(list(tstart_m, tstart_z))
+tstart_all[, species := factor(species, levels = c("Medaka", "Zebrafish"))]
+
+# Bin start time and compute median duration per bin
+time_bin_width <- 10  # minutes
+tstart_all[, time_bin := floor(start_min / time_bin_width) * time_bin_width + time_bin_width / 2]
+tstart_binned <- tstart_all[, .(median_dur = median(duration_min),
+                                 q25 = quantile(duration_min, 0.25),
+                                 q75 = quantile(duration_min, 0.75),
+                                 n = .N),
+                             by = .(species, time_bin)]
+
+p00m <- ggplot(tstart_binned, aes(x = time_bin, y = median_dur, color = species)) +
+  geom_ribbon(aes(ymin = q25, ymax = q75, fill = species), alpha = 0.15, color = NA) +
+  geom_line(linewidth = 0.7) +
+  scale_color_manual(values = species_colors) +
+  scale_fill_manual(values = species_colors) +
+  labs(title = "Track duration by start time",
+       subtitle = "Median +/- IQR, later tracks are shorter (truncated by recording end)",
+       x = "Track start time (min)", y = "Track duration (min)",
+       color = "Species", fill = "Species") +
+  theme_compare()
+
+# --- Compose Figure 00 ---
+fig00 <- (p00a + p00b + p00c) /
+         (p00d + p00m + plot_spacer()) /
+         (p00e + p00f) /
+         (p00k + p00l) /
+         (p00g + p00h) /
+         (p00i + p00j) +
+  plot_annotation(
+    title = "Medaka vs Zebrafish -- Data Overview & Spatial Context",
+    subtitle = paste0(
+      sprintf("Medaka: %s spots, %s tracks, %d frames (%.0f min) | ",
+              format(n_spots_m, big.mark = ","), format(n_tracks_m, big.mark = ","), n_frames_m, dur_m),
+      sprintf("Zebrafish: %s spots, %s tracks, %d frames (%.0f min)",
+              format(n_spots_z, big.mark = ","), format(n_tracks_z, big.mark = ","), n_frames_z, dur_z)),
+    theme = theme(plot.title = element_text(hjust = 0, face = "bold", size = 14),
+                  plot.subtitle = element_text(hjust = 0, size = 10, color = "grey40"))
+  )
+save_pdf(fig00, "comparison_00_data_overview.pdf", width = 18, height = 42)
 
 # ============================================================================
 # FIGURE 1: VELOCITY & EPIBOLY COMPARISON
@@ -956,48 +1336,102 @@ save_pdf(fig2, "comparison_02_straightness.pdf", width = 16, height = 18)
 
 cat("\n=== FIGURE 3: MSD ===\n")
 
-# Fit alpha
-fit_alpha <- function(msd_df) {
-  d <- msd_df %>% filter(lag_frames <= 10 & mean_msd > 0)
+# Fit alpha — CRITICAL: must use matching TIME windows, not matching FRAME counts.
+# Medaka frames are 0.5 min, zebrafish 2.0 min, so "lag_frames <= 10" covers
+# 0.5-5 min for medaka vs 2-20 min for zebrafish — completely different scales.
+# Instead, fit alpha over time windows: (a) the shared/overlapping window for
+# fair comparison, and (b) species-specific full range for completeness.
+
+fit_alpha_time <- function(msd_df, t_lo, t_hi) {
+  d <- msd_df %>% filter(lag_min >= t_lo & lag_min <= t_hi & mean_msd > 0)
   if (nrow(d) < 3) return(NA_real_)
   coef(lm(log10(mean_msd) ~ log10(lag_min), data = d))[2]
 }
 
-alpha_m <- fit_alpha(msd_m)
-alpha_z <- fit_alpha(msd_z)
+# Time range covered by each species
+t_range_m <- range(msd_m$lag_min)
+t_range_z <- range(msd_z$lag_min)
+cat(sprintf("  Medaka:    %.1f - %.1f min (%d lags x %.1f min/frame)\n",
+            t_range_m[1], t_range_m[2], nrow(msd_m), MEDAKA_FI / 60))
+cat(sprintf("  Zebrafish: %.1f - %.1f min (%d lags x %.1f min/frame)\n",
+            t_range_z[1], t_range_z[2], nrow(msd_z), ZEBRAFISH_FI / 60))
 
+# Overlapping time window = the only range where both species have data
+t_overlap_lo <- max(t_range_m[1], t_range_z[1])
+t_overlap_hi <- min(t_range_m[2], t_range_z[2])
+msd_overlap <- msd_both %>% filter(lag_min >= t_overlap_lo & lag_min <= t_overlap_hi)
+
+# Alpha fits:
+# (1) Shared window — fair comparison on identical time scale
+alpha_shared_m <- fit_alpha_time(msd_m, t_overlap_lo, t_overlap_hi)
+alpha_shared_z <- fit_alpha_time(msd_z, t_overlap_lo, t_overlap_hi)
+# (2) Full range — each species' own entire data
+alpha_full_m <- fit_alpha_time(msd_m, t_range_m[1], t_range_m[2])
+alpha_full_z <- fit_alpha_time(msd_z, t_range_z[1], t_range_z[2])
+# (3) Short window (2-10 min) — early dynamics only
+alpha_short_m <- fit_alpha_time(msd_m, 2, 10)
+alpha_short_z <- fit_alpha_time(msd_z, 2, 10)
+
+cat(sprintf("  Alpha (shared window %.0f-%.0f min): Medaka = %.2f, Zebrafish = %.2f\n",
+            t_overlap_lo, t_overlap_hi, alpha_shared_m, alpha_shared_z))
+cat(sprintf("  Alpha (full range):                Medaka = %.2f (%.1f-%.1f min), Zebrafish = %.2f (%.1f-%.1f min)\n",
+            alpha_full_m, t_range_m[1], t_range_m[2], alpha_full_z, t_range_z[1], t_range_z[2]))
+cat(sprintf("  Alpha (short 2-10 min):            Medaka = %.2f, Zebrafish = %.2f\n",
+            alpha_short_m, alpha_short_z))
+
+# 3a: Log-log — full range with per-species fit lines
 p3a <- ggplot(msd_both, aes(x = lag_min, y = mean_msd, color = species)) +
   geom_line(linewidth = 1) + geom_point(size = 1.5) +
+  annotate("rect", xmin = t_overlap_lo, xmax = t_overlap_hi, ymin = 0, ymax = Inf,
+           alpha = 0.08, fill = "grey50") +
   scale_x_log10() + scale_y_log10() + annotation_logticks(sides = "bl") +
   scale_color_manual(values = species_colors) +
-  labs(title = "MSD comparison (log-log)",
-       subtitle = sprintf("alpha: Medaka=%.2f, Zebrafish=%.2f", alpha_m, alpha_z),
+  labs(title = "MSD (log-log) -- full range",
+       subtitle = sprintf("Full-range alpha: Med=%.2f (%.0f-%.0f min), ZF=%.2f (%.0f-%.0f min)  |  Grey = shared window",
+                          alpha_full_m, t_range_m[1], t_range_m[2],
+                          alpha_full_z, t_range_z[1], t_range_z[2]),
        x = "Time lag (min)", y = expression(MSD~(mu*m^2)), color = "Species") +
   theme_compare()
 
-p3b <- ggplot(msd_both, aes(x = lag_min, y = mean_msd, color = species)) +
+# 3b: Log-log — overlapping time window only, with FAIR alpha fit
+p3b <- ggplot(msd_overlap, aes(x = lag_min, y = mean_msd, color = species)) +
+  geom_line(linewidth = 1) + geom_point(size = 1.5) +
+  scale_x_log10() + scale_y_log10() + annotation_logticks(sides = "bl") +
+  scale_color_manual(values = species_colors) +
+  labs(title = sprintf("MSD -- shared window only (%.0f-%.0f min)", t_overlap_lo, t_overlap_hi),
+       subtitle = sprintf("alpha (same time scale): Medaka = %.2f, Zebrafish = %.2f",
+                          alpha_shared_m, alpha_shared_z),
+       x = "Time lag (min)", y = expression(MSD~(mu*m^2)), color = "Species") +
+  theme_compare()
+
+# 3c: Linear — full range
+p3c <- ggplot(msd_both, aes(x = lag_min, y = mean_msd, color = species)) +
   geom_line(linewidth = 1) + geom_point(size = 1.5) +
   scale_color_manual(values = species_colors) +
-  labs(title = "MSD comparison (linear)", x = "Time lag (min)",
+  labs(title = "MSD (linear) -- full range", x = "Time lag (min)",
        y = expression(MSD~(mu*m^2)), color = "Species") +
   theme_compare()
 
-# Diffusivity (MSD/4t)
+# 3d: Effective diffusivity (MSD/4t) — full range
 msd_diff <- msd_both %>% mutate(D_eff = mean_msd / (4 * lag_min))
 
-p3c <- ggplot(msd_diff, aes(x = lag_min, y = D_eff, color = species)) +
-  geom_line(linewidth = 0.8) +
+p3d <- ggplot(msd_diff, aes(x = lag_min, y = D_eff, color = species)) +
+  geom_line(linewidth = 0.8) + geom_point(size = 1) +
   scale_color_manual(values = species_colors) +
   labs(title = "Effective diffusivity", x = "Time lag (min)",
        y = expression(D[eff]~(mu*m^2/min)), color = "Species") +
   theme_compare()
 
-fig3 <- (p3a + p3b) / (p3c + plot_spacer()) +
+fig3 <- (p3a + p3b) / (p3c + p3d) +
   plot_annotation(
     title = "Medaka vs Zebrafish -- Mean Square Displacement",
-    theme = theme(plot.title = element_text(hjust = 0, face = "bold", size = 14))
+    subtitle = sprintf("Shared window (%.0f-%.0f min) alpha: Med=%.2f, ZF=%.2f  |  Short (2-10 min) alpha: Med=%.2f, ZF=%.2f",
+                        t_overlap_lo, t_overlap_hi, alpha_shared_m, alpha_shared_z,
+                        alpha_short_m, alpha_short_z),
+    theme = theme(plot.title = element_text(hjust = 0, face = "bold", size = 14),
+                  plot.subtitle = element_text(hjust = 0, size = 10, color = "grey40"))
   )
-save_pdf(fig3, "comparison_03_msd.pdf", width = 14, height = 10)
+save_pdf(fig3, "comparison_03_msd.pdf", width = 16, height = 12)
 
 # ============================================================================
 # FIGURE 4: THICKNESS
@@ -1471,6 +1905,225 @@ fig6 <- (p6a + p6b) / (p6c + p6d) +
 save_pdf(fig6, "comparison_06_direction.pdf", width = 14, height = 10)
 
 # ============================================================================
+# FIGURE 6b: TURNING ANGLE → DIRECTIONAL COMMITMENT → FLOW
+# ============================================================================
+# Question: How does single-track turning angle translate into global flow?
+#   - Does higher turning angle → lower straightness → less net displacement?
+#   - Is this universal across movement types, or type-specific?
+#   - What fraction of the speed budget converts to net directional progress?
+#
+# Key concept: "directional efficiency" = |net velocity component| / speed.
+# A cell with high turning wastes speed on direction changes. A straight cell
+# converts most speed into net displacement along one axis.
+# ============================================================================
+
+cat("\n=== FIGURE 6b: TURNING ANGLE → FLOW ANALYSIS ===\n")
+
+# --- Per-track analysis: turning angle vs straightness by movement type ---
+track_ta <- track_all %>%
+  filter(!is.na(mean_turning) & !is.na(straightness) & !is.na(movement_type)) %>%
+  mutate(movement_type = factor(movement_type,
+                                levels = c("Epiboly", "Convergence", "Animalward", "Ingression")))
+
+# Compute directional efficiency per track
+track_ta <- track_ta %>%
+  mutate(
+    epiboly_efficiency = ifelse(mean_speed > 0, abs(mean_v_epiboly) / mean_speed, NA_real_),
+    total_v_frac = ifelse(mean_speed > 0,
+                          (abs(mean_v_epiboly) + abs(mean_v_depth)) / mean_speed, NA_real_)
+  )
+
+# Summary table: turning angle, straightness, efficiency by species × movement type
+ta_summary <- track_ta %>%
+  group_by(species, movement_type) %>%
+  summarise(
+    n = n(),
+    median_turning    = median(mean_turning, na.rm = TRUE),
+    median_straight   = median(straightness, na.rm = TRUE),
+    median_speed      = median(mean_speed, na.rm = TRUE),
+    median_epi_eff    = median(epiboly_efficiency, na.rm = TRUE),
+    mean_v_epi        = mean(mean_v_epiboly, na.rm = TRUE),
+    pct_of_tracks     = NA_real_,  # filled below
+    .groups = "drop"
+  )
+# Fill percentage within species
+ta_summary <- ta_summary %>%
+  group_by(species) %>%
+  mutate(pct_of_tracks = round(100 * n / sum(n), 1)) %>%
+  ungroup()
+
+cat("  Turning angle → straightness → efficiency by species x movement type:\n")
+cat(sprintf("  %-10s %-14s %5s %6s  turn  straight  speed  epi_eff  v_epi\n",
+            "Species", "Movement", "N", "pct"))
+for (i in seq_len(nrow(ta_summary))) {
+  r <- ta_summary[i, ]
+  cat(sprintf("  %-10s %-14s %5d %5.1f%%  %4.1f   %5.3f   %5.2f   %5.3f   %+.3f\n",
+              r$species, r$movement_type, r$n, r$pct_of_tracks,
+              r$median_turning, r$median_straight, r$median_speed,
+              r$median_epi_eff, r$mean_v_epi))
+}
+
+# --- Per-step analysis: turning angle distribution by step type ---
+step_ta <- vel_all %>%
+  filter(!is.na(turning_angle) & !is.na(step_type)) %>%
+  mutate(step_type = factor(step_type, levels = c("Epiboly", "Convergence", "Animalward")))
+
+step_ta_summary <- step_ta %>%
+  group_by(species, step_type) %>%
+  summarise(
+    n = n(),
+    median_turn = median(turning_angle, na.rm = TRUE),
+    median_speed = median(inst_speed, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  group_by(species) %>%
+  mutate(pct = round(100 * n / sum(n), 1)) %>%
+  ungroup()
+
+cat("\n  Per-step turning angle by step type:\n")
+cat(sprintf("  %-10s %-14s %8s %5s  med_turn  med_speed\n", "Species", "Step type", "N", "pct"))
+for (i in seq_len(nrow(step_ta_summary))) {
+  r <- step_ta_summary[i, ]
+  cat(sprintf("  %-10s %-14s %8d %5.1f%%  %5.1f     %5.2f\n",
+              r$species, r$step_type, r$n, r$pct, r$median_turn, r$median_speed))
+}
+
+# --- Theoretical link: random turning model ---
+# If each step turns by angle alpha, after N steps the straightness is approximately:
+#   S ~ 1 / sqrt(N) for pure random walk (alpha=90 avg)
+#   S → 1 for alpha→0 (straight line)
+# More precisely, for a correlated random walk with mean turning angle <alpha>:
+#   persistence length L_p ~ step_length / (1 - cos(<alpha>))
+#   straightness ~ tanh(N * step / L_p) [ballistic at short, diffusive at long]
+#
+# Expected straightness from median turning angle (correlated random walk model):
+# cos_persist = cos(alpha_rad), straightness ≈ sqrt((1+cos)/(1-cos)) for N→∞
+# But for finite N, use: straightness ≈ sqrt(2*cos/(1-cos) * (1 - cos^N)/N + cos^(2N))
+# Simplified: at median track length, compute expected straightness
+
+median_n_m <- median(track_ta$n_frames[track_ta$species == "Medaka"], na.rm = TRUE)
+median_n_z <- median(track_ta$n_frames[track_ta$species == "Zebrafish"], na.rm = TRUE)
+
+crw_straightness <- function(alpha_deg, N) {
+  # Correlated random walk expected straightness (net/total)
+  # For equal step lengths: E[net^2] = N + 2*sum_{k=1}^{N-1} (N-k)*cos(alpha)^k
+  c <- cos(alpha_deg * pi / 180)
+  if (abs(c) > 0.9999) return(1.0)
+  # E[R^2] / (N*l)^2 where l=1
+  # E[R^2] = N + 2*c*(N - (1-c^N)/(1-c)) / (1-c)  [geometric sum]
+  E_R2 <- N + 2 * c * (N * (1 - c) - (1 - c^N)) / ((1 - c)^2)
+  if (E_R2 < 0) E_R2 <- N  # fallback
+  # straightness = E[R] / (N*l) ≈ sqrt(E[R^2]) / N
+  sqrt(max(E_R2, 0)) / N
+}
+
+alpha_vals <- seq(5, 90, by = 1)
+crw_curves <- expand.grid(alpha = alpha_vals,
+                          N = c(median_n_m, median_n_z),
+                          stringsAsFactors = FALSE) %>%
+  mutate(
+    species_n = ifelse(N == median_n_m, sprintf("Medaka (N=%d)", median_n_m),
+                       sprintf("Zebrafish (N=%d)", median_n_z)),
+    expected_S = mapply(crw_straightness, alpha, N)
+  )
+
+# Observed data points for overlay
+obs_points <- ta_summary %>%
+  filter(movement_type != "Ingression") %>%
+  mutate(N = ifelse(species == "Medaka", median_n_m, median_n_z))
+
+# --- PLOTS ---
+
+mvt_colors_fig <- c("Epiboly" = "#EF8A62", "Convergence" = "#1B7837",
+                     "Animalward" = "#FDDBC7", "Ingression" = "#2166AC")
+
+# 6b-a: Turning angle distributions by movement type (track level)
+p6b_a <- ggplot(track_ta, aes(x = mean_turning, fill = species)) +
+  geom_density(alpha = 0.4, color = NA) +
+  facet_wrap(~ movement_type, scales = "free_y", ncol = 2) +
+  scale_fill_manual(values = species_colors) +
+  geom_vline(data = ta_summary, aes(xintercept = median_turning, color = species),
+             linetype = "dashed", linewidth = 0.6) +
+  scale_color_manual(values = species_colors) +
+  labs(title = "Mean turning angle by movement type",
+       subtitle = "Dashed lines = median per species",
+       x = "Mean turning angle (deg)", y = "Density") +
+  theme_compare()
+
+# 6b-b: Straightness by movement type
+p6b_b <- ggplot(track_ta, aes(x = straightness, fill = species)) +
+  geom_density(alpha = 0.4, color = NA) +
+  facet_wrap(~ movement_type, scales = "free_y", ncol = 2) +
+  scale_fill_manual(values = species_colors) +
+  geom_vline(data = ta_summary, aes(xintercept = median_straight, color = species),
+             linetype = "dashed", linewidth = 0.6) +
+  scale_color_manual(values = species_colors) +
+  labs(title = "Track straightness by movement type",
+       x = "Straightness (net/total)", y = "Density") +
+  theme_compare()
+
+# 6b-c: Turning angle vs straightness scatter (binned hex) by species
+p6b_c <- ggplot(track_ta %>% filter(movement_type != "Ingression"),
+                aes(x = mean_turning, y = straightness)) +
+  geom_hex(bins = 40, alpha = 0.8) +
+  scale_fill_viridis(option = "inferno", trans = "log10", name = "Count") +
+  facet_wrap(~ species) +
+  geom_smooth(method = "loess", se = FALSE, color = "white", linewidth = 0.8) +
+  labs(title = "Turning angle vs straightness",
+       subtitle = "Each hexbin = tracks; white line = LOESS trend",
+       x = "Mean turning angle (deg)", y = "Straightness") +
+  theme_compare()
+
+# 6b-d: Observed vs CRW-predicted straightness
+# Shows whether the straightness difference is FULLY explained by turning angle
+p6b_d <- ggplot(crw_curves, aes(x = alpha, y = expected_S, linetype = species_n)) +
+  geom_line(linewidth = 0.8, color = "grey40") +
+  geom_point(data = obs_points,
+             aes(x = median_turning, y = median_straight,
+                 color = species, shape = movement_type),
+             size = 3, inherit.aes = FALSE) +
+  scale_color_manual(values = species_colors) +
+  scale_shape_manual(values = c("Epiboly" = 16, "Convergence" = 17, "Animalward" = 15)) +
+  labs(title = "Observed vs CRW-predicted straightness",
+       subtitle = "Grey = correlated random walk prediction; points = observed (species x movement type)",
+       x = "Mean turning angle (deg)", y = "Straightness",
+       linetype = "CRW model", color = "Species", shape = "Movement") +
+  theme_compare()
+
+# 6b-e: Epiboly efficiency by movement type — how much speed becomes net progress?
+p6b_e <- ggplot(track_ta %>% filter(!is.na(epiboly_efficiency)),
+                aes(x = movement_type, y = epiboly_efficiency, fill = species)) +
+  geom_boxplot(outlier.size = 0.3, alpha = 0.7, width = 0.6) +
+  scale_fill_manual(values = species_colors) +
+  labs(title = "Epiboly efficiency by movement type",
+       subtitle = "|mean_v_epiboly| / mean_speed  (what fraction of speed becomes epiboly?)",
+       x = NULL, y = "Epiboly efficiency") +
+  coord_cartesian(ylim = c(0, 1)) +
+  theme_compare()
+
+# 6b-f: Step-level turning angle by step type
+p6b_f <- ggplot(step_ta, aes(x = turning_angle, fill = species)) +
+  geom_density(alpha = 0.4, color = NA) +
+  facet_wrap(~ step_type, ncol = 3) +
+  scale_fill_manual(values = species_colors) +
+  geom_vline(data = step_ta_summary, aes(xintercept = median_turn, color = species),
+             linetype = "dashed", linewidth = 0.6) +
+  scale_color_manual(values = species_colors) +
+  labs(title = "Per-step turning angle by step type",
+       subtitle = "Does the turning-angle gap persist within identical step types?",
+       x = "Turning angle (deg)", y = "Density") +
+  theme_compare()
+
+fig6b <- (p6b_a + p6b_b) / (p6b_c) / (p6b_d + p6b_e) / (p6b_f) +
+  plot_annotation(
+    title = "Medaka vs Zebrafish -- Turning Angle, Straightness & Directional Efficiency",
+    subtitle = "Does per-step turning explain track straightness, and does straightness explain global flow differences?",
+    theme = theme(plot.title = element_text(hjust = 0, face = "bold", size = 14),
+                  plot.subtitle = element_text(hjust = 0, size = 10, color = "grey40"))
+  )
+save_pdf(fig6b, "comparison_06b_turning_flow.pdf", width = 16, height = 24)
+
+# ============================================================================
 # FIGURE 7: SUMMARY TABLE (as a plot)
 # ============================================================================
 
@@ -1479,6 +2132,13 @@ cat("\n=== FIGURE 7: SUMMARY TABLE ===\n")
 # Build a comparison table from summary CSVs
 sum_wide <- summary_both %>%
   pivot_wider(names_from = species, values_from = value)
+
+# Override msd_alpha with fair shared-window values (per-species scripts
+# fit alpha over different time ranges due to different frame intervals)
+if ("msd_alpha" %in% sum_wide$metric) {
+  sum_wide$Medaka[sum_wide$metric == "msd_alpha"]    <- alpha_shared_m
+  sum_wide$Zebrafish[sum_wide$metric == "msd_alpha"] <- alpha_shared_z
+}
 
 # Also compute the ratio
 sum_wide$ratio <- ifelse(!is.na(sum_wide$Medaka) & !is.na(sum_wide$Zebrafish) &

@@ -50,7 +50,7 @@ ZONE_MARGIN_WIDTH  <- 5
 ZONE_PREMARG_WIDTH <- 10
 INGRESSION_DEPTH_PCTILE <- 0.95
 INGRESSION_ONSET_GAP_WINDOW <- 5
-MIN_TRACK_LENGTH <- 5
+MIN_TRACK_LENGTH <- 20  # 20 × 30s = 10 min minimum track duration
 DEPTH_EPOCH_SIZE <- 20
 SMOOTH_K       <- 5    # position smoothing window (frames)
 VELOCITY_LAG   <- 4    # frames over which to compute velocity (4×30s = 2 min)
@@ -186,6 +186,29 @@ if (file.exists(LANDMARK_FILE)) {
 }
 
 spots <- spots %>% mutate(time_min = frame_to_min(FRAME))
+
+# --- Filter: keep only tracks with >= MIN_TRACK_LENGTH frames (10 min) ---
+track_lengths <- spots %>% count(TRACK_ID, name = "n_frames_track")
+n_before <- nrow(spots)
+n_tracks_before <- length(unique(spots$TRACK_ID))
+spots <- spots %>%
+  inner_join(track_lengths %>% filter(n_frames_track >= MIN_TRACK_LENGTH),
+             by = "TRACK_ID") %>%
+  select(-n_frames_track)
+n_after <- nrow(spots)
+n_tracks_after <- length(unique(spots$TRACK_ID))
+cat(sprintf("  Track duration filter (>= %d frames = %.0f min):\n",
+            MIN_TRACK_LENGTH, MIN_TRACK_LENGTH * FRAME_INTERVAL_MIN))
+cat(sprintf("    Tracks: %s -> %s (dropped %s, %.1f%%)\n",
+            format(n_tracks_before, big.mark = ","),
+            format(n_tracks_after, big.mark = ","),
+            format(n_tracks_before - n_tracks_after, big.mark = ","),
+            100 * (n_tracks_before - n_tracks_after) / n_tracks_before))
+cat(sprintf("    Spots:  %s -> %s (dropped %s, %.1f%%)\n",
+            format(n_before, big.mark = ","),
+            format(n_after, big.mark = ","),
+            format(n_before - n_after, big.mark = ","),
+            100 * (n_before - n_after) / n_before))
 
 # =============================================================================
 # STEP 2: INGRESSION CLUSTER DETECTION
@@ -1390,37 +1413,33 @@ p6c <- ggplot(thick_map, aes(x = phi_bin, y = theta_bin, fill = thickness)) +
   labs(title = "Thickness spatial map (early vs late)", x = PHI_LABEL, y = THETA_LABEL) +
   theme_spatial()
 
-# 6d: Number of cell layers estimate
-# Cell spacing = nuclear diameter + internuclear gap (NN distance - diameter)
-# Use time-varying nuclear stats when available
+# 6d: Estimated cell layers by zone (mean P5-P95 thickness / mean NN distance)
+# Matches comparison script: one bar per zone, single mean cell spacing.
+thick_mean <- thickness_zone_time %>%
+  group_by(zone) %>%
+  summarise(mean_thick = mean(thickness_p90, na.rm = TRUE),
+            se = sd(thickness_p90, na.rm = TRUE) / sqrt(n()),
+            .groups = "drop")
+
 if (HAS_NUCLEAR) {
-  nuc_spacing <- nuc_time %>%
-    mutate(time_min = timepoint * FRAME_INTERVAL_MIN,
-           time_bin = floor(time_min / 5) * 5,
-           cell_spacing = nn3d_mean_um) %>%
-    group_by(time_bin) %>%
-    summarise(cell_spacing = mean(cell_spacing, na.rm = TRUE),
-              nuc_diam = mean(eqsph_diam_mean_um, na.rm = TRUE),
-              nn_dist  = mean(nn3d_mean_um, na.rm = TRUE), .groups = "drop")
-  cell_layers_time <- thickness_zone_time %>%
-    left_join(nuc_spacing, by = "time_bin") %>%
-    mutate(cell_spacing = ifelse(is.na(cell_spacing), mean(nuc_spacing$cell_spacing), cell_spacing),
-           n_layers = thickness_p90 / cell_spacing)
-  spacing_label <- sprintf("cell spacing = NN dist (mean %.1f um)", mean(nuc_spacing$cell_spacing))
+  nn_mean <- mean(nuc_time$nn3d_mean_um, na.rm = TRUE)
+  thick_layers <- thick_mean %>%
+    mutate(n_layers = mean_thick / nn_mean)
+  spacing_label <- sprintf("Thickness P5-P95 / NN distance (%.1f um)", nn_mean)
 } else {
-  mean_cell_spacing <- 12
-  cell_layers_time <- thickness_zone_time %>%
-    mutate(n_layers = thickness_p90 / mean_cell_spacing)
-  spacing_label <- sprintf("cell spacing = %.0f um (fallback)", mean_cell_spacing)
+  nuc_diam_fallback <- 11.4
+  thick_layers <- thick_mean %>%
+    mutate(n_layers = mean_thick / nuc_diam_fallback)
+  spacing_label <- sprintf("Thickness P5-P95 / nuclear diameter (%.1f um, fallback)", nuc_diam_fallback)
 }
 
-p6d <- ggplot(cell_layers_time, aes(x = time_bin, y = n_layers, color = zone)) +
-  geom_line(linewidth = 0.8) +
-  scale_color_manual(values = zone_colors) +
-  labs(title = "Estimated cell layers (thickness / NN distance)",
+p6d <- ggplot(thick_layers, aes(x = zone, y = n_layers, fill = zone)) +
+  geom_col(alpha = 0.8) +
+  scale_fill_manual(values = zone_colors) +
+  labs(title = "Estimated cell layers by zone",
        subtitle = spacing_label,
-       x = "Time (min)", y = "Estimated layers", color = "Zone") +
-  theme_dynamics()
+       x = NULL, y = "Layers") +
+  theme_dynamics() + theme(legend.position = "none")
 
 fig6 <- (p6a + p6b) / (p6c + p6d) +
   plot_annotation(

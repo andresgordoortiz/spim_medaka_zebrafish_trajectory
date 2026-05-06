@@ -6,7 +6,6 @@ From: royerlab/ultrack:0.6.1-cpu
     pip install --no-cache-dir \
         "numpy>=1.23.5,<2.0" \
         "cupy-cuda12x>=13,<14" \
-        pybdv \
         tqdm \
         nvidia-cuda-nvrtc-cu12 \
         nvidia-cuda-runtime-cu12 \
@@ -17,6 +16,9 @@ From: royerlab/ultrack:0.6.1-cpu
         nvidia-cufft-cu12 \
         nvidia-curand-cu12 \
         nvidia-nvjitlink-cu12
+
+    # pybdv for BDV/HDF5 export (not on PyPI, install from GitHub tarball)
+    pip install --no-cache-dir "https://github.com/constantinpape/pybdv/archive/refs/heads/master.tar.gz"
 
     # Create a unified CUDA lib directory with symlinks
     mkdir -p /usr/local/cuda/lib64 /usr/local/cuda/include

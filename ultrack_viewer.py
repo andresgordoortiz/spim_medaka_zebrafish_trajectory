@@ -990,13 +990,13 @@ class CrossSectionViewer:
         self._sphere_layer = None
         self._landmarks_layer = None
         self._center_layer = None
-        self._raw_image_layer = None
+        self._processed_image_layer = None
         self._seg_image_layer = None
         self._recording = False
         self._saved_view_state = None  # camera + layer settings snapshot
 
         # Check which image data is available from parent viewer
-        self._has_raw = getattr(parent, '_raw_frames', None) is not None
+        self._has_processed = getattr(parent, '_processed_frames', None) is not None
         self._has_seg = getattr(parent, '_segment_frames', None) is not None
 
         r = self._ranges[self._axis]
@@ -1091,10 +1091,10 @@ class CrossSectionViewer:
         self.show_center_check.changed.connect(self._schedule_rebuild)
 
         # ── Image layer toggles ──
-        self.show_raw_check = CheckBox(
-            value=self._has_raw, text="Show raw image slice"
+        self.show_processed_check = CheckBox(
+            value=self._has_processed, text="Show processed image slice"
         )
-        self.show_raw_check.changed.connect(self._schedule_rebuild)
+        self.show_processed_check.changed.connect(self._schedule_rebuild)
         self.show_seg_check = CheckBox(
             value=self._has_seg, text="Show segmentation slice"
         )
@@ -1103,10 +1103,10 @@ class CrossSectionViewer:
             value=True, text="Max-intensity projection (slab)"
         )
         self.slice_mip_check.changed.connect(self._schedule_rebuild)
-        self.raw_opacity_slider = FloatSlider(
-            value=60, min=0, max=100, step=5, label="Raw opacity %"
+        self.processed_opacity_slider = FloatSlider(
+            value=60, min=0, max=100, step=5, label="Processed opacity %"
         )
-        self.raw_opacity_slider.changed.connect(self._schedule_rebuild)
+        self.processed_opacity_slider.changed.connect(self._schedule_rebuild)
         self.seg_opacity_slider = FloatSlider(
             value=40, min=0, max=100, step=5, label="Seg opacity %"
         )
@@ -1154,8 +1154,8 @@ class CrossSectionViewer:
                 self.show_sphere_check,
                 self.show_center_check,
                 Label(value="── Image Layers ──"),
-                self.show_raw_check,
-                self.raw_opacity_slider,
+                self.show_processed_check,
+                self.processed_opacity_slider,
                 self.show_seg_check,
                 self.seg_opacity_slider,
                 self.slice_mip_check,
@@ -1346,7 +1346,7 @@ class CrossSectionViewer:
         # Invalidate spatial mask cache (position/thickness/axis may have changed)
         self._spatial_mask_cache = None
         # Invalidate raw contrast limits (recalculate for new spatial region)
-        self._raw_contrast_limits = None
+        self._processed_contrast_limits = None
         if not hasattr(self, "_debounce_timer"):
             self._debounce_timer = QTimer()
             self._debounce_timer.setSingleShot(True)
@@ -1498,7 +1498,7 @@ class CrossSectionViewer:
 
     def _remove_image_layers(self):
         """Remove image layers (call when slab geometry changes)."""
-        for attr in ("_raw_image_layer", "_seg_image_layer"):
+        for attr in ("_processed_image_layer", "_seg_image_layer"):
             layer = getattr(self, attr, None)
             if layer is not None:
                 try:
@@ -2102,7 +2102,7 @@ class CrossSectionViewer:
         Parameters
         ----------
         projection : 'max' for MIP (good for segmentation),
-                     'mean' for average (good for raw microscopy).
+                     'mean' for average (good for processed microscopy).
         """
         grid = self._get_oriented_grid(ds)
         if grid is None:
@@ -2178,14 +2178,14 @@ class CrossSectionViewer:
         """Convert a FRAME value to a 0-based index into the volume list.
 
         FRAME values come from the DataFrame and may not start at 0.
-        Volume lists (_raw_frames, _segment_frames) are 0-indexed.
+        Volume lists (_processed_frames, _segment_frames) are 0-indexed.
         """
         fmin = int(self.frame_slider.min)
         t = frame - fmin
         return max(0, min(t, n_tp - 1))
 
     def _update_image_slices(self):
-        """Create or update raw/segmentation image layers.
+        """Create or update processed/segmentation image layers.
 
         On first call, creates the napari Image layers.
         On subsequent calls, extracts the new 2D slice and pushes it
@@ -2198,19 +2198,19 @@ class CrossSectionViewer:
         ds = getattr(self.parent, '_display_ds', 1) or 1
 
         # ── Raw image slice ──
-        raw_frames = getattr(self.parent, '_raw_frames', None)
-        if self.show_raw_check.value and raw_frames is not None:
-            n_tp = len(raw_frames)
+        processed_frames = getattr(self.parent, '_processed_frames', None)
+        if self.show_processed_check.value and processed_frames is not None:
+            n_tp = len(processed_frames)
             t = self._frame_to_volume_index(frame, n_tp)
             if 0 <= t < n_tp:
                 img, scale, translate = self._extract_oriented_slab_slice(
-                    raw_frames[t], pos, half, ds=1.0,
+                    processed_frames[t], pos, half, ds=1.0,
                     projection="mean",
                 )
                 if img is not None:
                     # Compute contrast once; reuse on subsequent frames
-                    raw_cl = getattr(self, '_raw_contrast_limits', None)
-                    if raw_cl is None:
+                    processed_cl = getattr(self, '_processed_contrast_limits', None)
+                    if processed_cl is None:
                         nz = img[img > 0]
                         if len(nz) > 0:
                             c_lo = int(np.percentile(nz, 1))
@@ -2218,12 +2218,12 @@ class CrossSectionViewer:
                         else:
                             c_lo, c_hi = 0, 255
                         c_hi = max(c_hi, c_lo + 1)
-                        self._raw_contrast_limits = [c_lo, c_hi]
-                        raw_cl = self._raw_contrast_limits
-                    self._push_image("_raw_image_layer", img, scale, translate,
+                        self._processed_contrast_limits = [c_lo, c_hi]
+                        processed_cl = self._processed_contrast_limits
+                    self._push_image("_processed_image_layer", img, scale, translate,
                                      name="Raw slice", colormap="gray",
-                                     contrast_limits=raw_cl,
-                                     opacity=self.raw_opacity_slider.value / 100.0)
+                                     contrast_limits=processed_cl,
+                                     opacity=self.processed_opacity_slider.value / 100.0)
 
         # ── Segmentation slice ──
         seg_frames = getattr(self.parent, '_segment_frames', None)
@@ -2450,7 +2450,7 @@ class CrossSectionViewer:
             "_sphere_layer",
             "_landmarks_layer",
             "_center_layer",
-            "_raw_image_layer",
+            "_processed_image_layer",
             "_seg_image_layer",
         ):
             layer = getattr(self, attr, None)
@@ -2692,7 +2692,7 @@ class EmbryoViewer:
         spots_df: pd.DataFrame | None = None,
         tracks_df: pd.DataFrame | None = None,
         segments_zarr_path: str | Path | None = None,
-        raw_path: str | Path | None = None,
+        processed_path: str | Path | None = None,
         voxel_size: tuple[float, float, float] = (1.0, 1.0, 1.0),
         downsample: int = 1,
         preload: bool = False,
@@ -2750,16 +2750,17 @@ class EmbryoViewer:
         # Segments state
         self._segments_data = None  # dask array (T, Z, Y, X)
         self._segments_layer = None  # napari Labels layer
+        self._segments_original_colormap = None  # baseline cyclic LUT
         self._voxel_size = voxel_size  # (Z, Y, X) in µm
         self._downsample_factor = downsample
         self._preload = preload
 
         # Raw image state
-        self._raw_path = raw_path
-        self._raw_data = None        # numpy array (T, Z, Y, X)
-        self._raw_layer = None       # napari Image layer
-        self._raw_frames = None      # list of 3D contiguous arrays
-        self._vispy_raw_volume = None
+        self._processed_path = processed_path
+        self._processed_data = None        # numpy array (T, Z, Y, X)
+        self._processed_layer = None       # napari Image layer
+        self._processed_frames = None      # list of 3D contiguous arrays
+        self._vispy_processed_volume = None
         self._segments_affine = np.eye(4)  # cumulative affine for segments/raw
 
         # Create viewer
@@ -2770,8 +2771,8 @@ class EmbryoViewer:
             self._load_segments(segments_zarr_path)
 
         # Load raw image if provided
-        if raw_path is not None:
-            self._load_raw(raw_path)
+        if processed_path is not None:
+            self._load_processed(processed_path)
 
         # Load data layers if provided
         if self.spots is not None:
@@ -2829,7 +2830,19 @@ class EmbryoViewer:
 
         zarr_path = Path(zarr_path).resolve()
         print(f"Loading segments: {zarr_path}")
-        store = zarr.open(str(zarr_path), mode="r")
+        # Try the three known ultrack layouts in order:
+        #   (a) bare 4D zarr array at the root
+        #   (b) zarr group with per-timepoint subarrays "0", "1", ...
+        #   (c) directory of per-timepoint zarr arrays (no parent group
+        #       metadata) — common with newer ultrack / zarr v3 writes
+        store = None
+        try:
+            store = zarr.open_array(str(zarr_path), mode="r")
+        except Exception:
+            try:
+                store = zarr.open_group(str(zarr_path), mode="r")
+            except Exception:
+                store = None
 
         if isinstance(store, zarr.Array):
             data = da.from_zarr(str(zarr_path))
@@ -2844,7 +2857,40 @@ class EmbryoViewer:
             print(f"  Zarr group: {len(keys)} timepoints, "
                   f"spatial={first.shape}, dtype={first.dtype}")
         else:
-            raise ValueError(f"Unexpected zarr layout at {zarr_path}")
+            # Fallback: scan the directory for numeric subdirectories that
+            # are themselves zarr arrays.
+            if not zarr_path.is_dir():
+                raise ValueError(
+                    f"Cannot open {zarr_path}: not a zarr array, group, "
+                    f"or directory of per-timepoint zarrs."
+                )
+            sub_keys = []
+            for child in zarr_path.iterdir():
+                if not child.is_dir():
+                    continue
+                try:
+                    sub_keys.append(int(child.name))
+                except ValueError:
+                    continue
+            if not sub_keys:
+                raise ValueError(
+                    f"No zarr array, group, or numeric subdirectories "
+                    f"found at {zarr_path}"
+                )
+            sub_keys.sort()
+            lazy_frames = []
+            first_shape = None
+            first_dtype = None
+            for k in sub_keys:
+                arr_path = zarr_path / str(k)
+                arr = zarr.open_array(str(arr_path), mode="r")
+                if first_shape is None:
+                    first_shape = arr.shape
+                    first_dtype = arr.dtype
+                lazy_frames.append(da.from_zarr(str(arr_path)))
+            data = da.stack(lazy_frames, axis=0)
+            print(f"  Per-timepoint zarrs: {len(sub_keys)} timepoints, "
+                  f"spatial={first_shape}, dtype={first_dtype}")
 
         ds = self._downsample_factor
 
@@ -3022,16 +3068,16 @@ class EmbryoViewer:
                                 pass
 
                 # ── 1b. Swap raw vispy texture (instant) ──
-                raw_frames = self._raw_frames
-                if raw_frames is not None and 0 <= t < len(raw_frames):
-                    raw_vol = self._vispy_raw_volume
-                    if raw_vol is not None:
-                        raw_vol.set_data(raw_frames[t])
+                processed_frames = self._processed_frames
+                if processed_frames is not None and 0 <= t < len(processed_frames):
+                    processed_vol = self._vispy_processed_volume
+                    if processed_vol is not None:
+                        processed_vol.set_data(processed_frames[t])
                     # Sync raw layer._data reference (same as segments)
-                    raw_lyr = self._raw_layer
-                    if raw_lyr is not None:
+                    processed_lyr = self._processed_layer
+                    if processed_lyr is not None:
                         try:
-                            raw_lyr._data = raw_frames[t]
+                            processed_lyr._data = processed_frames[t]
                         except Exception:
                             pass
 
@@ -3355,6 +3401,7 @@ class EmbryoViewer:
                 except (ValueError, KeyError):
                     pass
                 self._segments_layer = None
+                self._segments_original_colormap = None
             self._load_segments(zarr_dir)
             self.lbl_segments_status.value = (
                 f"Loaded: {self._segments_data.shape}"
@@ -3390,10 +3437,10 @@ class EmbryoViewer:
                 if canv is not None:
                     canv.native.update()
             # ── raw ──
-            raw_frames = self._raw_frames
-            raw_vol = self._vispy_raw_volume
-            if raw_frames is not None and raw_vol is not None and 0 <= t < len(raw_frames):
-                raw_vol.set_data(raw_frames[t])
+            processed_frames = self._processed_frames
+            processed_vol = self._vispy_processed_volume
+            if processed_frames is not None and processed_vol is not None and 0 <= t < len(processed_frames):
+                processed_vol.set_data(processed_frames[t])
                 if canv is not None:
                     canv.native.update()
 
@@ -3401,8 +3448,8 @@ class EmbryoViewer:
 
     # ── Raw image loading ─────────────────────────────────────────────
 
-    def _load_raw(self, path: str | Path) -> None:
-        """Load a raw image hyperstack (TIFF or zarr, 4D: T×Z×Y×X).
+    def _load_processed(self, path: str | Path) -> None:
+        """Load a processed image hyperstack (TIFF or zarr, 4D: T×Z×Y×X).
 
         Preloads into RAM and uses the same vispy direct-texture-swap
         approach as segments for instant smooth scrubbing.
@@ -3410,14 +3457,42 @@ class EmbryoViewer:
         import time as _time
 
         path = Path(path).resolve()
-        print(f"Loading raw image: {path}")
+        print(f"Loading processed image: {path}")
 
         if path.suffix in ('.tif', '.tiff'):
             import tifffile
             t0 = _time.time()
-            data_np = tifffile.imread(str(path))
+            # Read pages + ImageJ metadata. Hyperstacks written by
+            # merge_hyperstack.py use bigtiff=True without imagej=True
+            # (the description is set manually), so tifffile returns a
+            # plain 3D (T*Z, Y, X) page stack rather than a true 4D
+            # (T, Z, Y, X) array. We reshape using the ImageJ metadata.
+            with tifffile.TiffFile(str(path)) as tf:
+                data_np = tf.asarray()
+                ij = tf.imagej_metadata or {}
+            n_frames = int(ij.get('frames', 0) or 0)
+            n_slices = int(ij.get('slices', 0) or 0)
+            n_channels = int(ij.get('channels', 1) or 1)
             print(f"  TIFF shape={data_np.shape}, dtype={data_np.dtype}, "
                   f"loaded in {_time.time() - t0:.0f}s")
+            if data_np.ndim == 3 and n_frames > 1 and n_slices > 1:
+                if n_channels != 1:
+                    raise ValueError(
+                        f"Multi-channel hyperstacks not supported "
+                        f"(channels={n_channels}); split channels first."
+                    )
+                expected = n_frames * n_slices
+                if data_np.shape[0] != expected:
+                    raise ValueError(
+                        f"ImageJ metadata says T={n_frames}, Z={n_slices} "
+                        f"(={expected} pages) but TIFF has {data_np.shape[0]} "
+                        f"pages — refusing to reshape."
+                    )
+                data_np = data_np.reshape(
+                    n_frames, n_slices, data_np.shape[1], data_np.shape[2]
+                )
+                print(f"  Reshaped to 4D (T,Z,Y,X)={data_np.shape} "
+                      f"using ImageJ metadata")
         elif path.is_dir() or path.suffix == '.zarr':
             import dask.array as da
             import zarr
@@ -3442,7 +3517,7 @@ class EmbryoViewer:
             del data
         else:
             raise ValueError(
-                f"Unsupported raw format: {path.suffix}  "
+                f"Unsupported processed format: {path.suffix}  "
                 "(expected .tif, .tiff, or .zarr)"
             )
 
@@ -3451,10 +3526,10 @@ class EmbryoViewer:
             data_np = data_np[np.newaxis]  # single timepoint
         if data_np.ndim != 4:
             raise ValueError(
-                f"Raw image must be 4D (T,Z,Y,X), got {data_np.ndim}D"
+                f"Processed image must be 4D (T,Z,Y,X), got {data_np.ndim}D"
             )
 
-        self._raw_data = data_np
+        self._processed_data = data_np
         n_tp = data_np.shape[0]
 
         # Build per-frame contiguous arrays for vispy texture swap.
@@ -3472,15 +3547,15 @@ class EmbryoViewer:
         scale_factor = 255.0 / max(p_high - p_low, 1e-10)
         print(f"contrast range [{p_low:.0f}, {p_high:.0f}] ", end="")
 
-        self._raw_frames = []
+        self._processed_frames = []
         for i in range(n_tp):
             frame = data_np[i]
             # Convert to uint8 with percentile-based contrast
             f8 = np.clip((frame.astype(np.float32) - p_low) * scale_factor,
                          0, 255).astype(np.uint8)
-            self._raw_frames.append(np.ascontiguousarray(f8))
+            self._processed_frames.append(np.ascontiguousarray(f8))
 
-        frame_mb = self._raw_frames[0].nbytes / 1e6
+        frame_mb = self._processed_frames[0].nbytes / 1e6
         total_gb = n_tp * frame_mb / 1e3
         print(f"{n_tp} × {frame_mb:.1f} MB = {total_gb:.1f} GB "
               f"({_time.time() - t0:.1f}s)")
@@ -3490,9 +3565,9 @@ class EmbryoViewer:
         scale_3d = (ds, ds, ds)
 
         # Add as 3D Image layer (grayscale, additive for overlay with segments)
-        self._raw_layer = self.viewer.add_image(
-            self._raw_frames[0],
-            name="Raw",
+        self._processed_layer = self.viewer.add_image(
+            self._processed_frames[0],
+            name="Processed",
             scale=scale_3d,
             opacity=0.7,
             rendering="mip",
@@ -3501,55 +3576,55 @@ class EmbryoViewer:
             blending="additive",
             gamma=0.7,
         )
-        self._raw_layer._update_thumbnail = lambda: None
-        self._raw_layer._clear_extent = lambda: None
+        self._processed_layer._update_thumbnail = lambda: None
+        self._processed_layer._clear_extent = lambda: None
 
         # Find vispy Volume node for direct GPU texture swap
-        self._vispy_raw_volume = None
+        self._vispy_processed_volume = None
         try:
             qt_viewer = self.viewer.window._qt_viewer
             canvas = qt_viewer.canvas
             if hasattr(canvas, 'layer_to_visual'):
-                vl = canvas.layer_to_visual.get(self._raw_layer)
+                vl = canvas.layer_to_visual.get(self._processed_layer)
                 if vl is not None and hasattr(vl, 'node'):
                     if hasattr(vl.node, 'set_data'):
-                        self._vispy_raw_volume = vl.node
-                        print("  ✓ Raw vispy direct texture path active")
+                        self._vispy_processed_volume = vl.node
+                        print("  ✓ Processed vispy direct texture path active")
         except Exception as exc:
-            print(f"  ⚠ Raw vispy path unavailable ({exc})")
+            print(f"  ⚠ Processed vispy path unavailable ({exc})")
 
         print(f"  Ready: {n_tp} tp  |  shape {data_np.shape[1:]}  |  "
-              f"{data_np.nbytes / 1e9:.1f} GB raw → "
+              f"{data_np.nbytes / 1e9:.1f} GB processed → "
               f"{total_gb:.1f} GB display (uint8)")
 
-    def _load_raw_from_ui(self):
-        """Open file dialog to load a raw image hyperstack."""
+    def _load_processed_from_ui(self):
+        """Open file dialog to load a processed image hyperstack."""
         from qtpy.QtWidgets import QFileDialog
         path, _ = QFileDialog.getOpenFileName(
-            None, "Open Raw Hyperstack",
+            None, "Open Processed Hyperstack",
             "", "Image files (*.tif *.tiff *.zarr);;All (*)",
         )
         if not path:
             return
         try:
-            if self._raw_layer is not None:
+            if self._processed_layer is not None:
                 try:
-                    self.viewer.layers.remove(self._raw_layer)
+                    self.viewer.layers.remove(self._processed_layer)
                 except (ValueError, KeyError):
                     pass
-                self._raw_layer = None
-            self._load_raw(path)
-            self.lbl_raw_status.value = f"Loaded: {self._raw_data.shape}"
+                self._processed_layer = None
+            self._load_processed(path)
+            self.lbl_processed_status.value = f"Loaded: {self._processed_data.shape}"
         except Exception as e:
-            self.lbl_raw_status.value = f"Error: {e}"
+            self.lbl_processed_status.value = f"Error: {e}"
 
-    def _on_raw_opacity_changed(self, value: float) -> None:
-        if self._raw_layer is not None:
-            self._raw_layer.opacity = value / 100.0
+    def _on_processed_opacity_changed(self, value: float) -> None:
+        if self._processed_layer is not None:
+            self._processed_layer.opacity = value / 100.0
 
-    def _on_raw_visible_changed(self, value: bool) -> None:
-        if self._raw_layer is not None:
-            self._raw_layer.visible = value
+    def _on_processed_visible_changed(self, value: bool) -> None:
+        if self._processed_layer is not None:
+            self._processed_layer.visible = value
 
     def _add_spots_layer(self):
         """Add the main nuclei points layer."""
@@ -4228,19 +4303,19 @@ class EmbryoViewer:
         self.segments_opacity_slider.changed.connect(self._on_segments_opacity_changed)
 
         # ── Raw image controls ──
-        btn_load_raw = PushButton(text="Load Raw Image")
-        btn_load_raw.changed.connect(self._load_raw_from_ui)
-        self.lbl_raw_status = Label(
-            value=f"Loaded: {self._raw_data.shape}"
-            if self._raw_data is not None
-            else "No raw image loaded"
+        btn_load_processed = PushButton(text="Load Processed Image")
+        btn_load_processed.changed.connect(self._load_processed_from_ui)
+        self.lbl_processed_status = Label(
+            value=f"Loaded: {self._processed_data.shape}"
+            if self._processed_data is not None
+            else "No processed image loaded"
         )
-        self.raw_visible_cb = CheckBox(value=True, text="Show raw image")
-        self.raw_visible_cb.changed.connect(self._on_raw_visible_changed)
-        self.raw_opacity_slider = FloatSlider(
-            value=30, min=0, max=100, step=5, label="Raw opacity %"
+        self.processed_visible_cb = CheckBox(value=True, text="Show processed image")
+        self.processed_visible_cb.changed.connect(self._on_processed_visible_changed)
+        self.processed_opacity_slider = FloatSlider(
+            value=30, min=0, max=100, step=5, label="Processed opacity %"
         )
-        self.raw_opacity_slider.changed.connect(self._on_raw_opacity_changed)
+        self.processed_opacity_slider.changed.connect(self._on_processed_opacity_changed)
 
         # ── Display controls ──
         self.display_pct_slider = FloatSlider(
@@ -4298,12 +4373,19 @@ class EmbryoViewer:
         btn_random_sample_reset = PushButton(text="↻ Reset random pool")
         btn_random_sample_reset.changed.connect(self._reset_random_sample_pool)
 
-        # Filter segments volume by selection (expensive; OFF by default)
+        # Filter segments volume by selection (colormap swap — fast)
         self.filter_segments_cb = CheckBox(
-            value=False, text="Filter segments by selection (slow)"
+            value=True, text="Colour only selected nuclei in segments"
         )
         self.filter_segments_cb.changed.connect(
             self._on_filter_segments_changed)
+
+        # Jump to a selected track's starting frame
+        from magicgui.widgets import ComboBox
+        self.jump_track_combo = ComboBox(
+            choices=[("— none —", -1)], label="Jump to track"
+        )
+        self.jump_track_combo.changed.connect(self._on_jump_track_changed)
 
         # ── Landmark picking ──
         self._pick_mode = "none"
@@ -4428,10 +4510,10 @@ class EmbryoViewer:
                 self.lbl_segments_status,
                 self.segments_visible_cb,
                 self.segments_opacity_slider,
-                btn_load_raw,
-                self.lbl_raw_status,
-                self.raw_visible_cb,
-                self.raw_opacity_slider,
+                btn_load_processed,
+                self.lbl_processed_status,
+                self.processed_visible_cb,
+                self.processed_opacity_slider,
                 Label(value="━━ TRACK FRAME RANGE ━━"),
                 self.track_frame_start,
                 self.track_frame_end,
@@ -4449,6 +4531,7 @@ class EmbryoViewer:
                 btn_random_sample,
                 btn_random_sample_reset,
                 self.filter_segments_cb,
+                self.jump_track_combo,
                 Label(value="── Landmarks ──"),
                 btn_ap,
                 self.lbl_ap,
@@ -4802,6 +4885,7 @@ class EmbryoViewer:
             lbl.value = f"Selected: {', '.join(str(i) for i in ids)}"
         else:
             lbl.value = f"Selected: {n} tracks"
+        self._refresh_jump_choices()
 
     def _handle_track_selection_click(self, tid: int):
         """Toggle track *tid* in/out of the selection and update display."""
@@ -4986,81 +5070,60 @@ class EmbryoViewer:
             )
 
     def _rebuild_selection_segments(self):
-        """Build a lightweight selection LUT for segment display.
-
-        Instead of prebuilding ALL frames (slow, uses lots of RAM),
-        we just build a tiny label→uint8 lookup table.  The per-frame
-        time callback applies it on-the-fly to the current frame only
-        (~5 ms for a single 3D volume — instant for scrubbing).
-        """
-        if not self._preload:
-            self._rebuild_selection_segments_lazy()
-            return
-
-        if not hasattr(self, '_display_labels') or self._display_labels is None:
-            return
-
-        if not self._selection_active:
-            # Restore original display by clearing the selection LUT
-            if self._selection_lut is not None:
-                self._selection_lut = None
-            # Refresh current frame from the original frames
-            t = int(self.viewer.dims.current_step[0])
-            self._swap_segment_frame(t)
-            return
-
-        display_labels = self._display_labels
-        max_label = int(display_labels.max())
-        lut = np.zeros(max_label + 1, dtype=np.uint8)
-
-        # Only selected labels get a visible color (Knuth hash)
-        for tid in self._selected_track_ids:
-            if 0 < tid <= max_label:
-                lut[tid] = int(
-                    ((np.uint64(tid) * np.uint64(2654435761))
-                     % np.uint64(251)) + np.uint64(5)
-                )
-
-        self._selection_lut = lut
-
-        # Immediately show the current frame
-        t = int(self.viewer.dims.current_step[0])
-        self._swap_segment_frame(t)
+        """Filter segments by label colormap (fast, no data rewrite)."""
+        # Colormap approach works for both preload and lazy mode.
+        self._rebuild_selection_segments_lazy()
 
     def _rebuild_selection_segments_lazy(self):
-        """Lazy-mode: filter segments via dask map_blocks.
+        """Filter segments by swapping the Labels *colormap* only.
 
-        Labels layer `.data` is swapped for a new filtered dask array
-        that zeroes out non-selected labels.  Much cheaper than
-        removing and re-adding the layer.
+        Much faster than rewriting `.data`: the volume stays intact and
+        napari only re-renders with a new label-to-RGBA map.  Non-selected
+        labels become transparent; selected labels keep their original
+        per-track colour from the cyclic colormap.
         """
-        if self._segments_layer is None or self._segments_data is None:
+        seg_layer = self._segments_layer
+        if seg_layer is None:
             return
 
-        import dask.array as da
-        seg_data = self._segments_data
+        # Remember the original (unfiltered) cyclic colormap once
+        if getattr(self, "_segments_original_colormap", None) is None:
+            self._segments_original_colormap = seg_layer.colormap
 
+        # ── Restore ───────────────────────────────────────────────────
         if not self._selection_active or not self._selected_track_ids:
-            # Restore original
-            if self._segments_layer.data is not seg_data:
-                self._segments_layer.data = seg_data
-                self._segments_layer.refresh()
+            try:
+                seg_layer.colormap = self._segments_original_colormap
+            except Exception:
+                pass
             return
 
-        selected = sorted(self._selected_track_ids)
-        max_id = int(max(selected))
-        lut = np.zeros(max_id + 2, dtype=seg_data.dtype)
-        for tid in selected:
-            if 0 < tid <= max_id:
-                lut[tid] = tid
+        # ── Filter via DirectLabelColormap ────────────────────────────
+        try:
+            from napari.utils.colormaps import DirectLabelColormap
+        except ImportError:
+            return
 
-        def _apply_lut(block, block_info=None):
-            safe = np.where((block >= 0) & (block <= max_id), block, 0)
-            return lut[safe]
+        orig_cmap = self._segments_original_colormap
+        # Pull the per-label colour from the original cyclic map so
+        # selected nuclei keep their familiar hue.
+        sel = np.fromiter(self._selected_track_ids, dtype=np.int64,
+                          count=len(self._selected_track_ids))
+        try:
+            colors = orig_cmap.map(sel)  # (N, 4) rgba 0–1
+        except Exception:
+            # Fallback: uniform gold
+            colors = np.tile(np.array([1.0, 0.84, 0.0, 1.0]),
+                             (len(sel), 1))
 
-        filtered = da.map_blocks(_apply_lut, seg_data, dtype=seg_data.dtype)
-        self._segments_layer.data = filtered
-        self._segments_layer.refresh()
+        color_dict: dict = {int(t): tuple(c) for t, c in zip(sel, colors)}
+        # Default (None ↦ transparent) — hides all non-selected labels
+        color_dict[None] = (0.0, 0.0, 0.0, 0.0)
+
+        try:
+            seg_layer.colormap = DirectLabelColormap(color_dict=color_dict)
+        except Exception:
+            traceback.print_exc()
 
     def _swap_segment_frame(self, t: int):
         """Swap the displayed segment frame, respecting selection state."""
@@ -5135,6 +5198,69 @@ class EmbryoViewer:
             return
         self._center_on_selection()
         self.viewer.status = f"Camera centered on {len(self._selected_track_ids)} selected track(s)"
+
+    def _refresh_jump_choices(self):
+        """Rebuild the Jump-to-track dropdown from the current selection."""
+        combo = getattr(self, "jump_track_combo", None)
+        if combo is None:
+            return
+        ids = sorted(self._selected_track_ids)
+        if not ids:
+            choices = [("— none —", -1)]
+        else:
+            choices = [("— pick a track —", -1)] + [
+                (f"Track {t}", int(t)) for t in ids
+            ]
+        try:
+            combo.changed.disconnect(self._on_jump_track_changed)
+        except Exception:
+            pass
+        combo.choices = choices
+        combo.value = -1
+        combo.changed.connect(self._on_jump_track_changed)
+
+    def _on_jump_track_changed(self, value):
+        """Jump to the first frame of the chosen track and centre on it."""
+        try:
+            tid = int(value)
+        except (TypeError, ValueError):
+            return
+        if tid < 0 or self.spots is None:
+            return
+        idx_map = getattr(self, "_track_id_index", None)
+        if idx_map is None or tid not in idx_map:
+            self.viewer.status = f"Track {tid} not in index"
+            return
+        rows = idx_map[tid]
+        frames = self.spots["FRAME"].values[rows].astype(np.int64)
+        xs = self.spots["POSITION_X"].values[rows].astype(float)
+        ys = self.spots["POSITION_Y"].values[rows].astype(float)
+        zs = self.spots["POSITION_Z"].values[rows].astype(float)
+        k = int(np.argmin(frames))
+        t0, x0, y0, z0 = int(frames[k]), float(xs[k]), float(ys[k]), float(zs[k])
+
+        # Jump in time
+        try:
+            step = list(self.viewer.dims.current_step)
+            step[0] = t0
+            self.viewer.dims.current_step = tuple(step)
+        except Exception:
+            pass
+
+        # Centre camera on the first spot (z, y, x)
+        try:
+            self.viewer.camera.center = (t0, z0, y0, x0)
+        except Exception:
+            # Some napari versions expect 3-vector
+            try:
+                self.viewer.camera.center = (z0, y0, x0)
+            except Exception:
+                pass
+
+        self.viewer.status = (
+            f"Jumped to track {tid} — first frame t={t0} "
+            f"at ({x0:.1f}, {y0:.1f}, {z0:.1f})"
+        )
 
     def _on_follow_selection_changed(self, value: bool):
         """Toggle follow-selection camera mode."""
@@ -5532,8 +5658,8 @@ class EmbryoViewer:
         self._segments_layer.affine = affine_4x4
 
         # Apply same affine to raw image layer if present
-        if self._raw_layer is not None:
-            self._raw_layer.affine = affine_4x4
+        if self._processed_layer is not None:
+            self._processed_layer.affine = affine_4x4
 
         print(f"  ✓ Nuclei 3D segments reoriented via GPU affine")
 
@@ -5927,10 +6053,10 @@ class EmbryoViewer:
         if self._segments_layer is not None:
             self._seg_was_visible = self._segments_layer.visible
             self._segments_layer.visible = False
-        self._raw_was_visible = False
-        if self._raw_layer is not None:
-            self._raw_was_visible = self._raw_layer.visible
-            self._raw_layer.visible = False
+        self._processed_was_visible = False
+        if self._processed_layer is not None:
+            self._processed_was_visible = self._processed_layer.visible
+            self._processed_layer.visible = False
 
         if self._was_3d:
             self.viewer.dims.ndisplay = 2
@@ -6018,10 +6144,10 @@ class EmbryoViewer:
                 self, '_seg_was_visible', False
             ):
                 self._segments_layer.visible = True
-            if self._raw_layer is not None and getattr(
-                self, '_raw_was_visible', False
+            if self._processed_layer is not None and getattr(
+                self, '_processed_was_visible', False
             ):
-                self._raw_layer.visible = True
+                self._processed_layer.visible = True
             self._draw_roi_box()
 
             self.viewer.status = (
@@ -6557,8 +6683,8 @@ def main():
              "Use 2 or 4 on machines with limited GPU memory.",
     )
     parser.add_argument(
-        "--raw", "-r", default=None,
-        help="Path to raw image hyperstack (TIFF or zarr, 4D: T×Z×Y×X). "
+        "--processed", "-p", default=None,
+        help="Path to processed image hyperstack (TIFF or zarr, 4D: T×Z×Y×X). "
              "Displayed as a grayscale volume alongside segments and tracks.",
     )
     parser.add_argument(
@@ -6604,7 +6730,7 @@ def main():
     viewer = EmbryoViewer(
         spots_df, tracks_df,
         segments_zarr_path=args.segments,
-        raw_path=args.raw,
+        processed_path=args.processed,
         voxel_size=tuple(args.voxel_size),
         downsample=args.downsample,
         preload=args.preload,

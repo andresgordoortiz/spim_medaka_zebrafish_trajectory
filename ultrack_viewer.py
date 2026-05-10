@@ -957,6 +957,14 @@ class CrossSectionViewer:
         self._show_tracks = True
         self._points_visible = True  # track user's nuclei visibility preference
         self._tracks_visible_state = True  # track user's tracks visibility
+        # ── User-tweakable Tracks display props (persist across rebuilds) ──
+        # napari resets these whenever we add a fresh Tracks layer, so we
+        # cache them here and re-apply on every rebuild + recording frame.
+        self._track_tail_length = 40
+        self._track_head_length = 0
+        self._track_display_id = False
+        self._track_display_graph = True
+        self._track_opacity = 1.0
 
         # ── Pre-cache numpy arrays from DF (avoids repeated .values calls) ──
         df = self.df
@@ -1122,6 +1130,14 @@ class CrossSectionViewer:
         self.frame_step_slider = FloatSlider(
             value=1, min=1, max=10, step=1, label="Frame step"
         )
+        self.render_scale_slider = FloatSlider(
+            value=2.0, min=1.0, max=4.0, step=0.5,
+            label="Render scale (×)",
+        )
+        self.duration_slider = FloatSlider(
+            value=0, min=0, max=120, step=1,
+            label="Duration (s, 0=auto)",
+        )
         btn_record = PushButton(text="\U0001f3ac Record Time-lapse Video")
         btn_record.changed.connect(self._record_video)
         btn_screenshot = PushButton(text="\U0001f4f7 Screenshot")
@@ -1172,6 +1188,8 @@ class CrossSectionViewer:
                 self.frame_start_slider,
                 self.frame_end_slider,
                 self.frame_step_slider,
+                self.render_scale_slider,
+                self.duration_slider,
                 btn_record,
                 btn_screenshot,
                 self.lbl_record,
@@ -1681,11 +1699,20 @@ class CrossSectionViewer:
                 "visible": layer.visible,
                 "opacity": layer.opacity,
             }
-            # Tracks-specific settings
-            if hasattr(layer, "tail_length"):
-                props["tail_length"] = layer.tail_length
-            if hasattr(layer, "tail_width"):
-                props["tail_width"] = layer.tail_width
+            # Tracks-specific settings — capture every common knob from
+            # napari's layer-controls panel so the user's clarity tweaks
+            # survive the rebuild that happens during recording.
+            for tkey in (
+                "tail_length", "tail_width", "head_length",
+                "display_id", "display_graph",
+                "color_by", "colormap", "colormaps_dict",
+                "blending",
+            ):
+                if hasattr(layer, tkey):
+                    try:
+                        props[tkey] = getattr(layer, tkey)
+                    except Exception:
+                        pass
             # Points-specific settings
             if hasattr(layer, "size") and not callable(layer.size):
                 try:
@@ -1841,7 +1868,8 @@ class CrossSectionViewer:
         kw = dict(
             name="Tracks",
             tail_width=self._track_width,
-            tail_length=40,
+            tail_length=self._track_tail_length,
+            head_length=self._track_head_length,
             color_by=color_by,
             colormap=cmap,
             visible=self._tracks_visible_state,
@@ -1852,7 +1880,45 @@ class CrossSectionViewer:
         try:
             self.tracks_layer = self.viewer.add_tracks(tracks_arr, **kw)
         except Exception:
-            pass  # tracks can fail if too few points; not critical
+            return  # tracks can fail if too few points; not critical
+
+        # Apply remaining cached display knobs that aren't constructor args
+        try:
+            self.tracks_layer.display_id = self._track_display_id
+            self.tracks_layer.display_graph = self._track_display_graph
+            self.tracks_layer.opacity = self._track_opacity
+        except Exception:
+            pass
+
+        # Hook napari layer events so the user's panel adjustments are
+        # remembered across rebuilds (axis/position changes) AND across
+        # recording (which removes & re-creates the Tracks layer).
+        self._bind_tracks_events(self.tracks_layer)
+
+    def _bind_tracks_events(self, layer):
+        """Mirror user-driven Tracks property changes into cached attrs."""
+        try:
+            evs = layer.events
+        except Exception:
+            return
+
+        def _mk(attr):
+            def _cb(_e=None, _attr=attr, _layer=layer):
+                try:
+                    setattr(self, f"_track_{_attr}", getattr(_layer, _attr))
+                except Exception:
+                    pass
+            return _cb
+
+        for attr in ("tail_length", "head_length", "display_id",
+                     "display_graph", "opacity"):
+            ev = getattr(evs, attr, None)
+            if ev is None:
+                continue
+            try:
+                ev.connect(_mk(attr))
+            except Exception:
+                pass
 
     def _add_sphere_intersection(self):
         """Draw the sphere's intersection circle with the cutting plane."""
@@ -2410,7 +2476,11 @@ class CrossSectionViewer:
         frame = int(self.frame_slider.value)
         fname = f"cross_section_{axis}_{pos}_f{frame}.png"
         path = out_dir / fname
-        img = self.viewer.screenshot(canvas_only=True)
+        scale = float(self.render_scale_slider.value)
+        img = _grab_canvas_screenshot(self.viewer, scale=scale)
+        if img is None:
+            self.lbl_record.value = "Screenshot failed"
+            return
         try:
             import imageio
 
@@ -2421,17 +2491,28 @@ class CrossSectionViewer:
             self.lbl_record.value = f"Error: {e}"
 
     def _record_video(self):
-        """Record a time-lapse video by iterating frames in 2D mode.
+        """Record a time-lapse video — uses the LIVE 2D rendering path.
 
-        For each frame: update images + points, restore camera, screenshot.
-        Points and tracks are set up as 3D (time, v, h) so napari's dims
-        slider auto-filters them; images are swapped per-frame via vispy.
+        For each frame we drive the existing ``_rebuild()`` machinery
+        (the same code path your manual slider drag triggers) and then
+        screenshot the canvas.  No layer rebuild into 3D, no view-state
+        snapshot/restore, so the recorded frames look *exactly* like the
+        live cross-section: same opacity, same tail-fade, same colours.
         """
         from qtpy.QtCore import QTimer
 
-        f_start = int(self.frame_start_slider.value)
-        f_end = int(self.frame_end_slider.value)
-        f_step = max(1, int(self.frame_step_slider.value))
+        # Guard against slider widgets that may have been destroyed if
+        # the dock was closed/reopened or a previous recording crashed.
+        try:
+            f_start = int(self.frame_start_slider.value)
+            f_end = int(self.frame_end_slider.value)
+            f_step = max(1, int(self.frame_step_slider.value))
+        except RuntimeError:
+            self.viewer.status = (
+                "Cross-section controls were destroyed — reopen the "
+                "Cross-Section View and try again."
+            )
+            return
 
         all_frames = sorted(self.df["FRAME"].unique())
         frames = [int(f) for f in all_frames if f_start <= f <= f_end][::f_step]
@@ -2439,113 +2520,34 @@ class CrossSectionViewer:
             self.viewer.status = "No frames in selected range!"
             return
 
-        # ── Snapshot current state ──
-        self._snapshot_view_state()
-        self._recording = True
+        # ── Resolve fps from either the duration field or auto ──
+        try:
+            duration_s = float(self.duration_slider.value)
+        except Exception:
+            duration_s = 0.0
+        if duration_s > 0:
+            fps = max(1, min(60, int(round(len(frames) / duration_s))))
+        else:
+            fps = max(1, min(30, len(frames) // 10 or 10))
 
-        # ── Remove all existing managed layers ──
-        for attr in (
-            "points_layer",
-            "tracks_layer",
-            "_sphere_layer",
-            "_landmarks_layer",
-            "_center_layer",
-            "_processed_image_layer",
-            "_seg_image_layer",
-        ):
-            layer = getattr(self, attr, None)
-            if layer is not None:
+        # ── Persist the user's track-display tweaks BEFORE we touch
+        #     anything, so even if napari reloads the Tracks layer mid
+        #     loop those values get re-applied via _add_slab_tracks. ──
+        if self.tracks_layer is not None:
+            for attr in ("opacity", "tail_length", "tail_width", "head_length",
+                         "display_id", "display_graph"):
                 try:
-                    self.viewer.layers.remove(layer)
-                except (ValueError, KeyError):
+                    val = getattr(self.tracks_layer, attr)
+                    cache_attr = "_track_" + attr if attr != "opacity" \
+                        else "_track_opacity"
+                    setattr(self, cache_attr, val)
+                except Exception:
                     pass
-                setattr(self, attr, None)
-
-        # ── Build 3D (time, v, h) points for ALL slab frames ──
-        df = self.df
-        axis_arr = {"X": self._pos_x, "Y": self._pos_y, "Z": self._pos_z}[self._axis]
-        pos = self.pos_slider.value
-        half = self._thickness / 2.0
-        slab_mask = (axis_arr >= pos - half) & (axis_arr <= pos + half)
-
-        v_col, h_col = self._AXES_MAP[self._axis]
-        _col_arr = {"POSITION_X": self._pos_x, "POSITION_Y": self._pos_y, "POSITION_Z": self._pos_z}
-        slab_idx = np.where(slab_mask)[0]
-
-        # Display % subsampling per frame
-        if self._display_pct < 100 and len(slab_idx) > 0:
-            keep = np.zeros(len(df), dtype=bool)
-            for f in frames:
-                fm = slab_mask & (self._frames == f)
-                fidx = np.where(fm)[0]
-                n_show = max(100, int(len(fidx) * self._display_pct / 100))
-                if n_show < len(fidx):
-                    rng = np.random.default_rng(0)
-                    fidx = rng.choice(fidx, n_show, replace=False)
-                keep[fidx] = True
-            slab_idx = np.where(slab_mask & keep)[0]
-
-        saved = self._saved_view_state or {}
-        saved_layers = saved.get("layers", {})
-        nuclei_visible = saved_layers.get("Nuclei", {}).get(
-            "visible", self._points_visible
-        )
-        tracks_visible = saved_layers.get("Tracks", {}).get(
-            "visible", self._tracks_visible_state
-        )
-
-        if nuclei_visible and len(slab_idx) > 0:
-            data_3d = np.column_stack(
-                [
-                    self._frames[slab_idx],
-                    _col_arr[v_col][slab_idx],
-                    _col_arr[h_col][slab_idx],
-                ]
-            )
-            colors = self._get_colors(slab_idx)
-            pt_size = saved_layers.get("Nuclei", {}).get(
-                "size", self.point_size_slider.value
-            )
-            try:
-                pt_size = float(pt_size)
-            except Exception:
-                pt_size = self.point_size_slider.value
-            self.points_layer = self.viewer.add_points(
-                data_3d,
-                name="Nuclei",
-                size=pt_size,
-                face_color=colors,
-                border_width=0,
-                ndim=3,
-            )
-
-        # ── Build tracks (already has time column — works with 3D) ──
-        if tracks_visible and self._show_tracks and "TRACK_ID" in df.columns:
-            self._add_slab_tracks(slab_mask)
-            if self.tracks_layer is not None:
-                tprops = saved_layers.get("Tracks", {})
-                for key in ("tail_length", "tail_width", "opacity"):
-                    if key in tprops:
-                        try:
-                            setattr(self.tracks_layer, key, tprops[key])
-                        except Exception:
-                            pass
-
-        # ── Re-add annotations as 3D (visible at all times) ──
-        if self.show_sphere_check.value:
-            self._add_sphere_intersection()
-        if self.show_center_check.value:
-            self._add_center_marker()
-        if self.show_landmarks_check.value:
-            self._add_landmark_markers()
-
-        # ── Restore camera (adding 3D layers may have changed it) ──
-        self._restore_view_state()
 
         out_dir = Path("analysis_output")
         out_dir.mkdir(exist_ok=True)
         axis = self._axis
-        slab_pos = int(pos)
+        slab_pos = int(self.pos_slider.value)
         vid_path = out_dir / f"cross_section_{axis}_{slab_pos}.mp4"
 
         self._vid_frames = frames
@@ -2553,8 +2555,14 @@ class CrossSectionViewer:
         self._vid_idx = 0
         self._vid_total = len(frames)
         self._vid_path = vid_path
-        self.lbl_record.value = f"Recording: 0/{self._vid_total}..."
-        self.viewer.status = "Recording cross-section video — please wait..."
+        self._vid_fps = fps
+        self._vid_scale = float(self.render_scale_slider.value)
+        self._vid_orig_frame = int(self.frame_slider.value)
+        self._recording = True
+        self.lbl_record.value = f"Recording: 0/{self._vid_total} @ {fps} fps..."
+        self.viewer.status = (
+            f"Recording cross-section video ({len(frames)} frames @ {fps} fps)"
+        )
 
         def _capture_next():
             if self._vid_idx >= self._vid_total:
@@ -2563,97 +2571,72 @@ class CrossSectionViewer:
 
             frame = self._vid_frames[self._vid_idx]
 
-            # Update image slices for this frame (raw + seg)
-            self.frame_slider.value = frame
-            self._update_image_slices()
-
-            # Step dims so points/tracks auto-filter to this frame
+            # Drive the SAME code path as a manual slider drag so the
+            # recorded frame is byte-identical to the live view.
             try:
-                dims = list(self.viewer.dims.current_step)
-                if len(dims) >= 3:
-                    dims[0] = frame
-                    self.viewer.dims.current_step = tuple(dims)
+                # set_value bypasses any signal coalescing; use the magicgui
+                # property directly but guarded against widget deletion.
+                self.frame_slider.value = frame
+            except RuntimeError:
+                # Slider widget was deleted (dock closed) — bail cleanly.
+                self.viewer.status = "Recording aborted: dock closed."
+                self._recording = False
+                self._finish_video()
+                return
+            except ValueError:
+                pass  # value out of range; skip this frame
+            # _rebuild() is the same call _on_frame_changed makes — runs
+            # the full 2D pipeline (image slices, points, tracks, marks).
+            try:
+                self._rebuild()
             except Exception:
                 pass
 
-            # Restore camera + layer settings
-            self._restore_view_state()
-
             def _screenshot():
-                try:
-                    img = self.viewer.screenshot(canvas_only=True)
-                except (RuntimeError, AttributeError):
+                img = _grab_canvas_screenshot(self.viewer, scale=self._vid_scale)
+                if img is None:
+                    self._vid_idx += 1
+                    QTimer.singleShot(30, _capture_next)
                     return
-                if img.ndim == 3 and img.shape[2] == 4:
-                    img = img[:, :, :3]
-                h, w = img.shape[:2]
-                if h % 2 or w % 2:
-                    img = img[: h - h % 2, : w - w % 2]
                 self._vid_images.append(img)
                 self._vid_idx += 1
                 if self._vid_idx % 10 == 0 or self._vid_idx == self._vid_total:
                     self.lbl_record.value = (
-                        f"Recording: {self._vid_idx}/{self._vid_total}..."
+                        f"Recording: {self._vid_idx}/{self._vid_total} "
+                        f"@ {self._vid_fps} fps..."
                     )
-                QTimer.singleShot(30, _capture_next)
+                QTimer.singleShot(20, _capture_next)
 
-            QTimer.singleShot(150, _screenshot)
+            # Long-enough delay for _rebuild to actually finish painting
+            # before we read the framebuffer.
+            QTimer.singleShot(250, _screenshot)
 
-        QTimer.singleShot(200, _capture_next)
+        QTimer.singleShot(300, _capture_next)
 
     def _finish_video(self):
-        """Write captured frames to mp4 (or fallback to PNGs), then restore 2D view."""
-        fps = max(1, min(30, self._vid_total // 10))
-        out_dir = Path("analysis_output")
-        try:
-            import imageio
-
-            writer = imageio.get_writer(
-                str(self._vid_path),
-                fps=fps,
-                codec="libx264",
-                quality=8,
-                macro_block_size=1,
-            )
-            for img in self._vid_images:
-                writer.append_data(img)
-            writer.close()
+        """Write captured frames to mp4 (or fallback to PNGs), then restore view."""
+        fps = getattr(self, "_vid_fps", 10)
+        ok, msg = _write_video(self._vid_path, self._vid_images, fps)
+        if ok:
             self.lbl_record.value = f"Video: {self._vid_path}"
-            self.viewer.status = (
-                f"Video saved to {self._vid_path} ({self._vid_total} frames, {fps} fps)"
-            )
-        except Exception:
+            self.viewer.status = f"Video saved to {self._vid_path} ({msg})"
+        else:
+            self.lbl_record.value = f"Video failed: {msg}"
+            self.viewer.status = msg
+
+        # Restore frame slider to its pre-recording position.
+        orig = getattr(self, "_vid_orig_frame", None)
+        if orig is not None:
             try:
-                import imageio
-
-                writer = imageio.get_writer(
-                    str(self._vid_path),
-                    fps=fps,
-                    macro_block_size=1,
-                )
-                for img in self._vid_images:
-                    writer.append_data(img)
-                writer.close()
-                self.lbl_record.value = f"Video: {self._vid_path}"
-                self.viewer.status = f"Video saved to {self._vid_path}"
-            except Exception as e2:
-                png_dir = out_dir / "cross_section_frames"
-                png_dir.mkdir(exist_ok=True)
-                import imageio
-
-                for i, img in enumerate(self._vid_images):
-                    imageio.imwrite(str(png_dir / f"frame_{i:04d}.png"), img)
-                self.lbl_record.value = f"Saved {len(self._vid_images)} PNGs"
-                self.viewer.status = f"mp4 failed ({e2}), saved PNGs to {png_dir}/"
-
-        # Restore 2D view: set frame slider to last recorded frame,
-        # exit recording mode, do a normal 2D rebuild.
-        if self._vid_frames:
-            last_frame = self._vid_frames[-1]
-            self.frame_slider.value = last_frame
+                self.frame_slider.value = orig
+            except Exception:
+                pass
         self._recording = False
         self._saved_view_state = None
-        self._rebuild()
+        try:
+            self._rebuild()
+        except Exception:
+            pass
 
     def _compute_speed(self, idx: np.ndarray) -> np.ndarray:
         """Per-spot displacement speed for selected indices."""
@@ -4492,6 +4475,14 @@ class EmbryoViewer:
         btn_export = PushButton(text="Export Enriched CSV")
         btn_export.changed.connect(self._export)
         self.lbl_export = Label(value="")
+        self.render_scale_slider = FloatSlider(
+            value=2.0, min=1.0, max=4.0, step=0.5,
+            label="Render scale (×)",
+        )
+        self.duration_slider = FloatSlider(
+            value=0, min=0, max=120, step=1,
+            label="Duration (s, 0=auto)",
+        )
         btn_record_video = PushButton(text="🎬 Record Time-lapse Video")
         btn_record_video.changed.connect(self._record_video)
 
@@ -4574,6 +4565,8 @@ class EmbryoViewer:
                 btn_color_roi,
                 Label(value="── Export & Video ──"),
                 btn_export,
+                self.render_scale_slider,
+                self.duration_slider,
                 btn_record_video,
                 btn_cross_section,
                 self.lbl_export,
@@ -6531,60 +6524,37 @@ class EmbryoViewer:
             self.viewer.status = "No frames in selected range!"
             return
 
+        try:
+            duration_s = float(self.duration_slider.value)
+        except Exception:
+            duration_s = 0.0
+        if duration_s > 0:
+            fps = max(1, min(60, int(round(len(frames) / duration_s))))
+        else:
+            fps = max(1, min(30, len(frames) // 10 or 10))
+
         self._vid_frames_list = frames
         self._vid_images = []
         self._vid_idx = 0
         self._vid_total = len(frames)
         self._vid_path = out_dir / "embryo_timelapse.mp4"
-        self.lbl_export.value = f"Recording: 0/{self._vid_total}..."
-        self.viewer.status = "Recording video \u2014 please wait..."
+        self._vid_scale = float(self.render_scale_slider.value)
+        self._vid_fps = fps
+        self.lbl_export.value = f"Recording: 0/{self._vid_total} @ {fps} fps..."
+        self.viewer.status = (
+            f"Recording video ({len(frames)} frames @ {fps} fps)"
+        )
 
         def _capture_next():
             if self._vid_idx >= self._vid_total:
-                # --- write video ---
-                fps = max(1, min(30, self._vid_total // 10))
-                try:
-                    import imageio
-
-                    writer = imageio.get_writer(
-                        str(self._vid_path),
-                        fps=fps,
-                        codec="libx264",
-                        quality=8,
-                        macro_block_size=1,
-                    )
-                    for img in self._vid_images:
-                        writer.append_data(img)
-                    writer.close()
-                except Exception:
-                    try:
-                        import imageio
-
-                        writer = imageio.get_writer(
-                            str(self._vid_path),
-                            fps=fps,
-                            macro_block_size=1,
-                        )
-                        for img in self._vid_images:
-                            writer.append_data(img)
-                        writer.close()
-                    except Exception as e2:
-                        # Fallback: save PNGs
-                        png_dir = out_dir / "video_frames"
-                        png_dir.mkdir(exist_ok=True)
-                        import imageio
-
-                        for i, img in enumerate(self._vid_images):
-                            imageio.imwrite(str(png_dir / f"frame_{i:04d}.png"), img)
-                        self.lbl_export.value = f"Saved {len(self._vid_images)} PNGs"
-                        self.viewer.status = (
-                            f"mp4 failed ({e2}), saved PNGs to {png_dir}/"
-                        )
-                        return
-                self.lbl_export.value = f"Video: {self._vid_path}"
-                self.viewer.status = (
-                    f"Video saved to {self._vid_path} ({self._vid_total} frames)"
-                )
+                ok, msg = _write_video(self._vid_path, self._vid_images,
+                                        self._vid_fps)
+                if ok:
+                    self.lbl_export.value = f"Video: {self._vid_path}"
+                    self.viewer.status = f"Video saved to {self._vid_path} ({msg})"
+                else:
+                    self.lbl_export.value = f"Video failed: {msg}"
+                    self.viewer.status = msg
                 return
 
             frame = self._vid_frames_list[self._vid_idx]
@@ -6593,24 +6563,288 @@ class EmbryoViewer:
             self.viewer.dims.current_step = tuple(dims)
 
             def _screenshot():
-                img = self.viewer.screenshot(canvas_only=True)
-                # Convert RGBA → RGB and ensure even dimensions for libx264
-                if img.ndim == 3 and img.shape[2] == 4:
-                    img = img[:, :, :3]
-                h, w = img.shape[:2]
-                if h % 2 or w % 2:
-                    img = img[: h - h % 2, : w - w % 2]
+                img = _grab_canvas_screenshot(self.viewer, scale=self._vid_scale)
+                if img is None:
+                    # Skip silently but advance so the chain can finish.
+                    self._vid_idx += 1
+                    QTimer.singleShot(50, _capture_next)
+                    return
                 self._vid_images.append(img)
                 self._vid_idx += 1
-                if self._vid_idx % 10 == 0:
+                if self._vid_idx % 10 == 0 or self._vid_idx == self._vid_total:
                     self.lbl_export.value = (
-                        f"Recording: {self._vid_idx}/{self._vid_total}..."
+                        f"Recording: {self._vid_idx}/{self._vid_total} "
+                        f"@ {self._vid_fps} fps..."
                     )
                 QTimer.singleShot(50, _capture_next)
 
-            QTimer.singleShot(150, _screenshot)
+            # Slightly longer delay so the dim change has time to render
+            # the new time-step (points/tracks/segments) before we grab.
+            QTimer.singleShot(350, _screenshot)
 
-        QTimer.singleShot(200, _capture_next)
+        QTimer.singleShot(400, _capture_next)
+
+
+# ############################################################################
+#                          VIDEO WRITER HELPER
+# ############################################################################
+
+
+def _grab_canvas_screenshot(viewer, scale: float = 1.0) -> "np.ndarray | None":
+    """Return an RGB uint8 screenshot of the napari canvas with even dims.
+
+    Forces a Qt event-loop flush + canvas redraw so the captured frame
+    actually reflects the current dims/layer state.  ``scale`` upsamples
+    the rendered canvas (e.g. ``scale=2`` doubles each axis → 4× pixels)
+    via napari's built-in ``scale`` argument.  Returns ``None`` if the
+    canvas is not yet available or the resulting image is empty.
+    """
+    try:
+        from qtpy.QtWidgets import QApplication
+    except Exception:
+        QApplication = None
+
+    # Make sure pending paint/dim events have run before grabbing pixels.
+    if QApplication is not None and QApplication.instance() is not None:
+        try:
+            QApplication.processEvents()
+            QApplication.processEvents()
+        except Exception:
+            pass
+
+    # Ask napari's vispy canvas to repaint synchronously, if possible.
+    try:
+        canvas = viewer.window._qt_viewer.canvas  # napari ≥0.5
+    except Exception:
+        canvas = None
+    if canvas is not None:
+        for meth in ("update", "_draw_event", "render"):
+            fn = getattr(canvas, meth, None)
+            if callable(fn):
+                try:
+                    fn() if meth != "_draw_event" else fn(None)
+                except Exception:
+                    pass
+                break
+    if QApplication is not None and QApplication.instance() is not None:
+        try:
+            # Drain a few more event-loop iterations so vispy actually
+            # paints the new frame (track tail-fade uniforms etc.) before
+            # we read pixels — otherwise screenshots can capture stale
+            # GPU state and tracks/points appear dim or wrong.
+            for _ in range(4):
+                QApplication.processEvents()
+        except Exception:
+            pass
+
+    try:
+        img = viewer.screenshot(canvas_only=True, flash=False, scale=scale)
+    except TypeError:
+        # Older napari versions without the ``flash`` / ``scale`` kwargs.
+        try:
+            img = viewer.screenshot(canvas_only=True, scale=scale)
+        except TypeError:
+            try:
+                img = viewer.screenshot(canvas_only=True)
+            except Exception:
+                return None
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+    if img is None or not hasattr(img, "shape") or img.size == 0:
+        return None
+    if img.ndim != 3:
+        return None
+
+    # RGBA → RGB by alpha-compositing onto the canvas background.
+    # Naively dropping the alpha channel (img[:,:,:3]) makes
+    # semi-transparent layers (tracks with tail-fade, points with
+    # opacity<1) look much dimmer in the saved frame than they do in
+    # the live canvas, because napari returns un-premultiplied RGBA
+    # against a transparent canvas background.
+    if img.shape[2] == 4:
+        bg = (0.0, 0.0, 0.0)  # default
+        try:
+            bgc = viewer.window._qt_viewer.canvas.bgcolor.rgb
+            bg = (float(bgc[0]), float(bgc[1]), float(bgc[2]))
+        except Exception:
+            try:
+                # napari ≥0.5 also exposes background through the camera
+                bg_arr = np.asarray(viewer.window._qt_viewer.canvas.bgcolor.rgba)
+                bg = tuple(float(c) for c in bg_arr[:3])
+            except Exception:
+                pass
+        rgb = img[:, :, :3].astype(np.float32)
+        a = img[:, :, 3:4].astype(np.float32) / 255.0
+        bg_arr = np.array(bg, dtype=np.float32) * 255.0
+        composed = rgb * a + bg_arr * (1.0 - a)
+        img = np.clip(composed, 0, 255).astype(np.uint8)
+    elif img.shape[2] != 3:
+        return None
+
+    # libx264 + yuv420p requires even dimensions.
+    h, w = img.shape[:2]
+    if h < 2 or w < 2:
+        return None
+    if h % 2 or w % 2:
+        img = img[: h - h % 2, : w - w % 2]
+    if img.shape[0] < 2 or img.shape[1] < 2:
+        return None
+
+    return np.ascontiguousarray(img)
+
+
+def _resolve_ffmpeg_exe() -> "str | None":
+    """Locate an ffmpeg binary.
+
+    Order: ``imageio_ffmpeg`` (bundled, preferred) → ``$IMAGEIO_FFMPEG_EXE``
+    → system ``ffmpeg`` on ``PATH``.  Returns ``None`` if nothing is found.
+    """
+    try:
+        import imageio_ffmpeg as iioff
+        exe = iioff.get_ffmpeg_exe()
+        if exe and Path(exe).exists():
+            return exe
+    except Exception:
+        pass
+
+    env_exe = os.environ.get("IMAGEIO_FFMPEG_EXE")
+    if env_exe and Path(env_exe).exists():
+        return env_exe
+
+    import shutil
+    return shutil.which("ffmpeg")
+
+
+def _write_video(path: "Path", images: list, fps: int) -> "tuple[bool, str]":
+    """Encode ``images`` to ``path`` (mp4) by piping raw RGB to ffmpeg.
+
+    Uses ``imageio_ffmpeg`` if installed (bundled binary), otherwise a
+    system ``ffmpeg`` on ``PATH``.  Avoids ``imageio.get_writer``'s
+    plugin auto-detection, which can misroute ``.mp4`` to the TIFF
+    writer in some environments.
+
+    Returns ``(success, message)``.  Frames whose shape differs from the
+    first valid frame are padded/cropped to match (libx264 needs a fixed
+    frame size).
+    """
+    valid = [im for im in images if im is not None and getattr(im, "size", 0) > 0]
+    if not valid:
+        return False, "no valid frames captured"
+
+    # Lock to the first frame's shape; pad/crop any others to match.
+    h0, w0 = valid[0].shape[:2]
+    fixed = []
+    for im in valid:
+        h, w = im.shape[:2]
+        if (h, w) != (h0, w0):
+            new = np.zeros((h0, w0, 3), dtype=im.dtype)
+            ch, cw = min(h, h0), min(w, w0)
+            new[:ch, :cw] = im[:ch, :cw]
+            im = new
+        if im.dtype != np.uint8:
+            im = np.clip(im, 0, 255).astype(np.uint8)
+        fixed.append(np.ascontiguousarray(im))
+
+    ffmpeg_exe = _resolve_ffmpeg_exe()
+    if ffmpeg_exe is None:
+        return _write_video_pngs(
+            path, fixed,
+            "no ffmpeg found — install with `mamba install -c conda-forge "
+            "imageio-ffmpeg ffmpeg` or `pip install imageio-ffmpeg`"
+        )
+
+    # ── Primary path: pipe raw RGB to ffmpeg → libx264 + yuv420p ──
+    ok, reason = _ffmpeg_encode(
+        ffmpeg_exe, path, fixed, fps,
+        codec="libx264", pix_fmt_out="yuv420p",
+        extra=["-preset", "medium", "-crf", "20"],
+    )
+    if ok:
+        return True, reason
+
+    # Fallback codec: mpeg4 (works without libx264 in minimal ffmpeg builds)
+    ok2, reason2 = _ffmpeg_encode(
+        ffmpeg_exe, path, fixed, fps,
+        codec="mpeg4", pix_fmt_out="yuv420p",
+        extra=["-q:v", "5"],
+    )
+    if ok2:
+        return True, f"{reason2} (mpeg4 fallback after: {reason})"
+
+    return _write_video_pngs(path, fixed, f"{reason}; mpeg4 also failed: {reason2}")
+
+
+def _ffmpeg_encode(ffmpeg_exe: str, path: "Path", fixed: list, fps: int,
+                   codec: str, pix_fmt_out: str,
+                   extra: list) -> "tuple[bool, str]":
+    """Spawn ffmpeg, pipe raw RGB frames, capture stderr on failure."""
+    import subprocess
+
+    h0, w0 = fixed[0].shape[:2]
+    cmd = [
+        ffmpeg_exe,
+        "-y",                            # overwrite output
+        "-loglevel", "error",
+        "-f", "rawvideo",
+        "-vcodec", "rawvideo",
+        "-pix_fmt", "rgb24",
+        "-s", f"{w0}x{h0}",
+        "-r", str(fps),
+        "-i", "-",                       # read from stdin
+        "-an",                           # no audio
+        "-vcodec", codec,
+        "-pix_fmt", pix_fmt_out,
+        *extra,
+        str(path),
+    ]
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+    except Exception as e:
+        return False, f"{codec} spawn failed: {e}"
+
+    try:
+        for im in fixed:
+            proc.stdin.write(im.tobytes())
+        proc.stdin.close()
+    except BrokenPipeError:
+        pass
+    except Exception as e:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return False, f"{codec} pipe error: {e}"
+
+    err = proc.stderr.read().decode("utf-8", errors="replace").strip()
+    rc = proc.wait()
+    if rc != 0:
+        return False, f"{codec} ffmpeg rc={rc}: {err[:200]}"
+
+    if not path.exists() or path.stat().st_size <= 4096:
+        return False, f"{codec} produced empty file ({err[:200]})"
+
+    return True, f"wrote {len(fixed)} frames @ {fps} fps with {codec}"
+
+
+def _write_video_pngs(path: "Path", fixed: list, reason: str) -> "tuple[bool, str]":
+    """Last-resort fallback: dump frames as PNGs next to the target."""
+    png_dir = path.parent / (path.stem + "_frames")
+    png_dir.mkdir(exist_ok=True)
+    try:
+        import imageio.v2 as iio
+    except Exception:
+        import imageio as iio
+    for i, im in enumerate(fixed):
+        iio.imwrite(str(png_dir / f"frame_{i:04d}.png"), im)
+    return False, f"mp4 failed ({reason}); saved {len(fixed)} PNGs to {png_dir}/"
 
 
 # ############################################################################

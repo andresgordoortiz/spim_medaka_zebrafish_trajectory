@@ -2678,6 +2678,7 @@ class EmbryoViewer:
         processed_path: str | Path | None = None,
         voxel_size: tuple[float, float, float] = (1.0, 1.0, 1.0),
         downsample: int = 1,
+        load_downsample: int = 1,
         preload: bool = False,
     ):
         napari, magicgui = _import_napari()
@@ -2736,6 +2737,7 @@ class EmbryoViewer:
         self._segments_original_colormap = None  # baseline cyclic LUT
         self._voxel_size = voxel_size  # (Z, Y, X) in µm
         self._downsample_factor = downsample
+        self._load_downsample_factor = load_downsample
         self._preload = preload
 
         # Raw image state
@@ -2882,16 +2884,22 @@ class EmbryoViewer:
             import multiprocessing as mp
             from concurrent.futures import ThreadPoolExecutor
             n_cores = mp.cpu_count() or 1
+            lds = self._load_downsample_factor
+            if lds > 1:
+                # Downsample spatially before pulling into RAM so the
+                # full-resolution array is never materialised.
+                data = data[:, ::lds, ::lds, ::lds]
             nbytes_raw = data.nbytes
+            lds_note = f", {lds}× load-downsample" if lds > 1 else ""
             print(f"  Preloading {nbytes_raw / 1e9:.1f} GB into RAM "
-                  f"({n_cores} cores) ...")
+                  f"({n_cores} cores{lds_note}) ...")
             t0 = _time.time()
             data_np = data.compute(scheduler="threads",
                                    num_workers=n_cores)
             print(f"  Loaded in {_time.time() - t0:.0f}s")
             del data
 
-            # Keep full-resolution data for analysis
+            # Store (possibly load-downsampled) data for analysis
             self._segments_data = data_np
 
             # ── Build display frames ─────────────────────────────────
@@ -6917,6 +6925,18 @@ def main():
              "Use 2 or 4 on machines with limited GPU memory.",
     )
     parser.add_argument(
+        "--load-downsample",
+        type=int,
+        default=1,
+        metavar="N",
+        dest="load_downsample",
+        help="Spatial downsample factor applied when loading segments into RAM "
+             "with --preload (e.g. 2 = half-res → 8× less RAM, 4 = quarter-res → "
+             "64× less RAM). Unlike --downsample (display only), this reduces the "
+             "array actually stored in memory. Analysis resolution is reduced "
+             "accordingly. Default: 1 (full resolution).",
+    )
+    parser.add_argument(
         "--processed", "-p", default=None,
         help="Path to processed image hyperstack (TIFF or zarr, 4D: T×Z×Y×X). "
              "Displayed as a grayscale volume alongside segments and tracks.",
@@ -6967,6 +6987,7 @@ def main():
         processed_path=args.processed,
         voxel_size=tuple(args.voxel_size),
         downsample=args.downsample,
+        load_downsample=args.load_downsample,
         preload=args.preload,
     )
 

@@ -5589,6 +5589,22 @@ class EmbryoViewer:
         pos = self.spots[["POSITION_X", "POSITION_Y", "POSITION_Z"]].values
         pos_new, params = orient_embryo(pos, self.animal_pole, self.dorsal_mark)
 
+        # Pivot used by orient_embryo (centroid of the spots).
+        mid = params["center"]
+        R1, R2 = params["R1"], params["R2"]
+        R = R2 @ R1
+
+        # If a sphere has been fitted, transform its centre with the same
+        # rotation+pivot used by orient_embryo so the cap mesh and
+        # spherical coordinates stay aligned with the rotated nuclei.
+        if self.sphere_fit_result is not None:
+            sphere_c_old = np.asarray(
+                self.sphere_fit_result["center"], dtype=float
+            )
+            sphere_c_new = R @ (sphere_c_old - mid)
+            self.sphere_fit_result = dict(self.sphere_fit_result)
+            self.sphere_fit_result["center"] = sphere_c_new
+
         self.spots["POSITION_X"] = pos_new[:, 0]
         self.spots["POSITION_Y"] = pos_new[:, 1]
         self.spots["POSITION_Z"] = pos_new[:, 2]
@@ -5596,12 +5612,10 @@ class EmbryoViewer:
         self.oriented = True
 
         # Transform landmark positions into the new coordinate system
-        mid = params["center"]
-        R1, R2 = params["R1"], params["R2"]
         if self.animal_pole is not None:
-            self.animal_pole = R2 @ (R1 @ (self.animal_pole - mid))
+            self.animal_pole = R @ (self.animal_pole - mid)
         if self.dorsal_mark is not None:
-            self.dorsal_mark = R2 @ (R1 @ (self.dorsal_mark - mid))
+            self.dorsal_mark = R @ (self.dorsal_mark - mid)
 
         # Update layers
         self._refresh_points()
@@ -5611,7 +5625,35 @@ class EmbryoViewer:
         # Reorient nuclei 3D segments layer via GPU affine (no data copy)
         self._orient_segments(params)
 
-        # Reset camera to centre on the reoriented data
+        # Recompute spherical coords and rebuild the cap mesh so the
+        # sphere overlay matches the rotated nuclei.
+        if self.sphere_fit_result is not None:
+            sph = compute_spherical_coords(
+                self.spots[["POSITION_X", "POSITION_Y", "POSITION_Z"]].values,
+                self.sphere_fit_result["center"],
+                self.sphere_fit_result["radius"],
+            )
+            for key, vals in sph.items():
+                self.spots[key] = vals
+            self._add_sphere_overlay()
+
+        # Reset camera to centre on the reoriented data.
+        # NOTE: when the Nuclei-3D layer is loaded, its performance hack
+        # monkey-patches `_clear_extent = lambda: None` on every other
+        # layer (see _load_segments).  That freezes the cached extent, so
+        # `reset_view()` would otherwise read the *pre-rotation* extent
+        # and centre the camera on the old location.  Bypass that by
+        # calling the original unbound method on each layer before
+        # resetting the view.
+        try:
+            from napari.layers import Layer as _NapariLayer
+            for _lyr in list(self.viewer.layers):
+                try:
+                    _NapariLayer._clear_extent(_lyr)
+                except Exception:
+                    pass
+        except Exception:
+            pass
         self.viewer.reset_view()
         self.viewer.status = (
             "Oriented: AP → top (-Y), Dorsal → right (+X). Camera reset."

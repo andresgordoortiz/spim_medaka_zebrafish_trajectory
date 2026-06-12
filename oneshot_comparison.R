@@ -8,8 +8,8 @@
 #       per-step type composition)
 #   (3) thickness in same plot (both species)
 #   (4) flow fields per hour, both species, + majority movement type per hour
-#   (5) matched-track comparison (>=20 µm displacement, 10-60 min duration):
-#       straightness, mean turning angle, MSD
+#   (5) track comparison (20-60 min duration, >=20 um net displacement):
+#       straightness, mean turning angle, MSD + HTML QC viewer
 #
 # Uses the same oriented-track inputs as gastrulation_dynamics_comparison.R
 # but writes to a separate output folder so existing PDFs are untouched.
@@ -63,6 +63,18 @@ ZEB_SMOOTH_K      <- 3L
 
 MARGIN_WIDTH_DEG  <- 5     # band ±5° around margin landmark
 
+FIG1_ZEB_STRIP_MIN_START_CELLS   <- 200L
+FIG1_ZEB_STRIP_MIN_STABLE_RATIO  <- 0.90
+FIG1_ZEB_STRIP_SEARCH_PAD_DEG    <- 8L
+FIG1_COMPARE_BIN_MIN             <- 2
+
+FIG5_MIN_DURATION_MIN            <- 20
+FIG5_MAX_DURATION_MIN            <- 60
+FIG5_MIN_NET_DISP_UM             <- 20
+FIG5_QC_SAMPLE_TRACKS            <- 250L
+FIG5_QC_SEED                     <- 1L
+FIG5_QC_TRAIL_STEPS              <- 6L
+
 FLOW_BIN_UM       <- 30
 FLOW_MIN_N        <- 10
 ARROW_SCALE       <- 60
@@ -70,11 +82,11 @@ ARROW_HEAD        <- 0.14
 ARROW_LW          <- 0.7
 VORT_SWIRL_THRESH <- 0.3
 
-species_colors <- c("Medaka" = "#D73027", "Zebrafish" = "#4575B4")
-step_type_cols <- c("Epiboly"     = "#EF8A62",
-                    "Convergence" = "#1B7837",
-                    "Animalward"  = "#FDDBC7",
-                    "Ingression"  = "#2166AC")
+species_colors <- c("Medaka" = "#E69F00", "Zebrafish" = "#0072B2")
+step_type_cols <- c("Epiboly"     = "#D95A4E",
+                    "Convergence" = "#4B9A68",
+                    "Animalward"  = "#4C7FB8",
+                    "Ingression"  = "#8A5FA8")
 STEP_TYPE_LEVELS <- c("Epiboly", "Convergence", "Animalward", "Ingression")
 flow_cols <- c("Upward (AP)" = "#2166AC", "Circular" = "#1A9850",
                "Downward (VP)" = "#B2182B")
@@ -85,6 +97,7 @@ FIG1_TIME_META <- data.table(
   fi_sec = c(MEDAKA_FI, ZEB_FI)
 )
 FIG1_TIME_META[, ingression_time_min := ingression_frame * fi_sec / 60]
+FIG1_BASELINE_FROM_INGR_MIN <- -30
 
 theme_pub <- function(bs = 11) {
   theme_minimal(base_size = bs) +
@@ -100,18 +113,22 @@ theme_pub <- function(bs = 11) {
 
 save_pdf <- function(p, name, w = 12, h = 8) {
   path <- file.path(OUT_DIR, name)
-  ok <- tryCatch({
-    ggsave(path, p, width = w, height = h, device = cairo_pdf)
-    TRUE
-  }, error = function(e) {
-    message("  cairo_pdf failed (", conditionMessage(e), "); falling back to pdf")
-    ggsave(path, p, width = w, height = h, device = "pdf")
-    FALSE
-  })
-  if (!file.exists(path)) {
-    message("  WARNING: file not written, retrying with base pdf device")
-    ggsave(path, p, width = w, height = h, device = "pdf")
+  tmp <- tempfile(pattern = "plot_", fileext = ".pdf")
+  on.exit(unlink(tmp), add = TRUE)
+  ggsave(tmp, p, width = w, height = h, device = "pdf")
+  if (!file.exists(tmp)) {
+    stop("pdf device did not write output: ", tmp)
   }
+  ok <- file.copy(tmp, path, overwrite = TRUE)
+  if (!ok) {
+    stop("failed to overwrite output pdf: ", path)
+  }
+  cat(sprintf("  saved %s\n", path))
+}
+
+save_html_file <- function(html_lines, name) {
+  path <- file.path(OUT_DIR, name)
+  writeLines(enc2utf8(html_lines), path, useBytes = TRUE)
   cat(sprintf("  saved %s\n", path))
 }
 
@@ -228,6 +245,62 @@ cat(sprintf("  Bulge medaka:    θ=%.1f° φ=%.1f° radius=%.1f°  (%d deep trac
 cat(sprintf("  Bulge zebrafish: θ=%.1f° φ=%.1f° radius=%.1f°  (%d deep tracks, depth ≥ %.1f µm, %s)\n",
             BULGE_Z$theta, BULGE_Z$phi, BULGE_Z$radius,
             BULGE_Z$n_cand, BULGE_Z$depth_thresh, BULGE_Z$source))
+
+select_stable_zeb_strip <- function(sp, bulge_theta, landmark_theta,
+                                    width = MARGIN_WIDTH_DEG,
+                                    ing_frame = ZEB_INGRESSION_FRAME,
+                                    min_start_cells = FIG1_ZEB_STRIP_MIN_START_CELLS,
+                                    min_stable_ratio = FIG1_ZEB_STRIP_MIN_STABLE_RATIO,
+                                    search_pad_deg = FIG1_ZEB_STRIP_SEARCH_PAD_DEG) {
+  start_frame <- min(sp$FRAME, na.rm = TRUE)
+  centers <- seq(floor(bulge_theta) - search_pad_deg,
+                 floor(landmark_theta), by = 1)
+  cand <- rbindlist(lapply(centers, function(center) {
+    lo <- center - width
+    hi <- center + width
+    by_frame <- sp[, .(
+      n_total = .N,
+      n_band = sum(THETA_DEG >= lo & THETA_DEG <= hi)
+    ), by = FRAME]
+    start_row <- by_frame[FRAME == start_frame]
+    ing_row   <- by_frame[FRAME == ing_frame]
+    if (!nrow(start_row) || !nrow(ing_row) || ing_row$n_band[1] == 0) {
+      return(NULL)
+    }
+    frac_start <- start_row$n_band[1] / start_row$n_total[1]
+    frac_ing   <- ing_row$n_band[1]   / ing_row$n_total[1]
+    data.table(
+      center = center,
+      n_start = start_row$n_band[1],
+      n_ing = ing_row$n_band[1],
+      frac_start = frac_start,
+      frac_ing = frac_ing,
+      stable_ratio = frac_start / frac_ing
+    )
+  }), fill = TRUE)
+
+  keep <- cand[n_start >= min_start_cells & stable_ratio >= min_stable_ratio]
+  if (nrow(keep)) {
+    best <- keep[which.max(center)]
+    best[, selection_rule := sprintf(
+      "most vegetal stable center (start frac >= %.0f%% of ingression frac; start n >= %d)",
+      min_stable_ratio * 100, min_start_cells)]
+  } else {
+    best <- cand[which.max(frac_start)]
+    best[, selection_rule := "fallback: highest starting occupancy fraction"]
+  }
+  best[, width := width]
+  best[]
+}
+
+FIG1_ZEB_STRIP <- select_stable_zeb_strip(sp_z, BULGE_Z$theta, MARGIN_Z)
+FIG1_ZEB_STRIP_CENTER <- FIG1_ZEB_STRIP$center[1]
+cat(sprintf(
+  "  Figure 1 zebrafish comparison strip: θ=%.1f° ± %d°  (start %d cells / %.1f%% of field, ingression %d cells / %.1f%%, ratio %.3f; %s)\n",
+  FIG1_ZEB_STRIP_CENTER, MARGIN_WIDTH_DEG,
+  FIG1_ZEB_STRIP$n_start[1], 100 * FIG1_ZEB_STRIP$frac_start[1],
+  FIG1_ZEB_STRIP$n_ing[1], 100 * FIG1_ZEB_STRIP$frac_ing[1],
+  FIG1_ZEB_STRIP$stable_ratio[1], FIG1_ZEB_STRIP$selection_rule[1]))
 
 # Bulge disc outlines (used by both Fig 1 and Fig 3 heatmap overlays)
 bulge_circle_poly <- function(b, species_label, n = 80) {
@@ -468,7 +541,7 @@ margin_density <- function(dt, R, margin_theta, phi_rng, fi_sec,
         area_um2 = area_um2)]
 }
 md_m <- margin_density(sp_m, R_M, MARGIN_M, PHI_RNG_M, MEDAKA_FI)
-md_z <- margin_density(sp_z, R_Z, MARGIN_Z, PHI_RNG_Z, ZEB_FI)
+md_z <- margin_density(sp_z, R_Z, FIG1_ZEB_STRIP_CENTER, PHI_RNG_Z, ZEB_FI)
 md_m[, species := "Medaka"];  md_z[, species := "Zebrafish"]
 
 # ---- Areas ---------------------------------------------------------------
@@ -538,13 +611,13 @@ per_frame_density <- function(cells, A, fi, sp_lbl, reg_lbl) {
   cells[, .(n = .N), by = FRAME][,
         .(species = sp_lbl, region = reg_lbl, FRAME,
           time_min = FRAME * fi / 60,
+          n_cells = n,
+          area_um2 = A,
           density_per_1000um2 = n / A * 1000)]
 }
-REGION_LVL <- c("Bulge disc", "Control disc (same latitude)", "Margin strip",
-                "Global (whole imaged surface)")
+REGION_LVL <- c("Bulge disc", "Comparison strip", "Global (whole imaged surface)")
 REGION_COL <- c("Bulge disc"                    = "#E31A1C",
-                "Control disc (same latitude)"  = "#1F78B4",
-                "Margin strip"                  = "#FDAE61",
+                "Comparison strip"              = "#5AB4AC",
                 "Global (whole imaged surface)" = "grey40")
 SNAP_NMAX <- 30000
 PHI_SLICE_W <- 8
@@ -585,10 +658,8 @@ build_fig1 <- function(fname,
   d_ts <- rbind(
     per_frame_density(in_disc(sp_m_t, BULGE_M), A_BULGE_M, MEDAKA_FI, "Medaka",    "Bulge disc"),
     per_frame_density(in_disc(sp_z_t, BULGE_Z), A_BULGE_Z, ZEB_FI,    "Zebrafish", "Bulge disc"),
-    per_frame_density(in_disc(sp_m_t, CTRL_M),  A_CTRL_M,  MEDAKA_FI, "Medaka",    "Control disc (same latitude)"),
-    per_frame_density(in_disc(sp_z_t, CTRL_Z),  A_CTRL_Z,  ZEB_FI,    "Zebrafish", "Control disc (same latitude)"),
-    per_frame_density(in_strip(sp_m_t, MARGIN_M), A_STRIP_M, MEDAKA_FI, "Medaka",    "Margin strip"),
-    per_frame_density(in_strip(sp_z_t, MARGIN_Z), A_STRIP_Z, ZEB_FI,    "Zebrafish", "Margin strip"),
+    per_frame_density(in_strip(sp_m_t, MARGIN_M), A_STRIP_M, MEDAKA_FI, "Medaka",    "Comparison strip"),
+    per_frame_density(in_strip(sp_z_t, FIG1_ZEB_STRIP_CENTER), A_STRIP_Z, ZEB_FI,    "Zebrafish", "Comparison strip"),
     per_frame_density(sp_m_t, A_GLOBAL_M, MEDAKA_FI, "Medaka",    "Global (whole imaged surface)"),
     per_frame_density(sp_z_t, A_GLOBAL_Z, ZEB_FI,    "Zebrafish", "Global (whole imaged surface)"))
   d_ts <- merge(d_ts,
@@ -609,6 +680,15 @@ build_fig1 <- function(fname,
     d_ts <- d_ts[!bad, on = c("species", "FRAME")]
   }
 
+  density_qc <- d_ts[, .(
+    area_um2 = first(area_um2),
+    max_formula_error = max(abs(density_per_1000um2 - n_cells / area_um2 * 1000),
+                            na.rm = TRUE),
+    median_n_cells = as.numeric(median(n_cells))
+  ), by = .(species, region)]
+  cat("     density QC (density = n_cells / area_um2 * 1000):\n")
+  print(density_qc)
+
   # Panel A: top view, last 10 min of the (capped) window
   snap_m <- late_snap(sp_m, MEDAKA_FI, cap_m)
   snap_z <- late_snap(sp_z, ZEB_FI,    cap_z)
@@ -619,31 +699,29 @@ build_fig1 <- function(fname,
   snap[, species := factor(species, levels = c("Medaka", "Zebrafish"))]
   outlines <- rbind(
     disc_outline(BULGE_M, "Medaka",    "Bulge"),
-    disc_outline(CTRL_M,  "Medaka",    "Control"),
-    disc_outline(BULGE_Z, "Zebrafish", "Bulge"),
-    disc_outline(CTRL_Z,  "Zebrafish", "Control"))
+    disc_outline(BULGE_Z, "Zebrafish", "Bulge"))
   outlines[, species := factor(species, levels = c("Medaka", "Zebrafish"))]
   band_rect_p1 <- data.table(
     species = factor(c("Medaka", "Zebrafish"), levels = c("Medaka", "Zebrafish")),
-    ymin    = c(MARGIN_M - MARGIN_WIDTH_DEG, MARGIN_Z - MARGIN_WIDTH_DEG),
-    ymax    = c(MARGIN_M + MARGIN_WIDTH_DEG, MARGIN_Z + MARGIN_WIDTH_DEG))
+    ymin    = c(MARGIN_M - MARGIN_WIDTH_DEG,
+                FIG1_ZEB_STRIP_CENTER - MARGIN_WIDTH_DEG),
+    ymax    = c(MARGIN_M + MARGIN_WIDTH_DEG,
+                FIG1_ZEB_STRIP_CENTER + MARGIN_WIDTH_DEG))
 
   pA <- ggplot(snap, aes(PHI_DEG, THETA_DEG)) +
     geom_rect(data = band_rect_p1, inherit.aes = FALSE,
               aes(xmin = -Inf, xmax = Inf, ymin = ymin, ymax = ymax),
-              fill = "#FDAE61", alpha = 0.18) +
+          fill = REGION_COL[["Comparison strip"]], alpha = 0.18) +
     geom_point(aes(color = SPHERICAL_DEPTH), size = 0.25, alpha = 0.55) +
     geom_polygon(data = outlines[kind == "Bulge"], inherit.aes = FALSE,
                  aes(phi, theta), fill = NA, color = "#E31A1C", linewidth = 0.9) +
-    geom_polygon(data = outlines[kind == "Control"], inherit.aes = FALSE,
-                 aes(phi, theta), fill = NA, color = "#1F78B4",
-                 linewidth = 0.9, linetype = "22") +
     facet_wrap(~ species, scales = "free") +
     scale_y_reverse() +
     scale_color_viridis_c(option = "inferno", name = expression("depth ("*mu*"m)")) +
     labs(title = sprintf("A. Top view of the embryo surface (snapshot: medaka %.0f-%.0f min, zebrafish %.0f-%.0f min)",
                           tA_m - 10, tA_m, tA_z - 10, tA_z),
-         subtitle = "Dot colour = depth (yellow = deep).  Red = bulge disc, cyan dashed = control disc (same area, same theta), orange band = margin strip.",
+        subtitle = sprintf("Dot colour = depth (yellow = deep).  Red = head-mesoderm / bulge disc.  Teal band = comparison strip (medaka landmark margin; zebrafish stable strip at theta %.0f°).",
+                 FIG1_ZEB_STRIP_CENTER),
          x = expression(varphi*" (deg)"), y = expression(theta*" (deg, animal pole up)")) +
     theme_pub() +
     theme(plot.subtitle = element_text(size = 9, color = "grey25"))
@@ -651,36 +729,28 @@ build_fig1 <- function(fname,
   # Panel B: longitudinal cross-section through bulge centre
   slice_m <- late_snap(sp_m[abs(PHI_DEG - BULGE_M$phi) <= PHI_SLICE_W], MEDAKA_FI, cap_m)
   slice_z <- late_snap(sp_z[abs(PHI_DEG - BULGE_Z$phi) <= PHI_SLICE_W], ZEB_FI,    cap_z)
-  classify_xs <- function(d, bulge, ctrl) {
+  classify_xs <- function(d, bulge) {
     d[, ang_b := sqrt((THETA_DEG - bulge$theta)^2 + (PHI_DEG - bulge$phi)^2)]
-    d[, ang_c := sqrt((THETA_DEG - ctrl$theta)^2  + (PHI_DEG - ctrl$phi)^2)]
-    d[, xs_region := fifelse(ang_b < bulge$radius, "Bulge column",
-                      fifelse(ang_c < ctrl$radius,  "Control column", "Elsewhere"))]
+    d[, xs_region := fifelse(ang_b < bulge$radius, "Bulge column", "Elsewhere")]
   }
-  classify_xs(slice_m, BULGE_M, CTRL_M)
-  classify_xs(slice_z, BULGE_Z, CTRL_Z)
+  classify_xs(slice_m, BULGE_M)
+  classify_xs(slice_z, BULGE_Z)
   xs <- rbind(
     sample_n(slice_m, SNAP_NMAX)[, .(species = "Medaka",    THETA_DEG, SPHERICAL_DEPTH, xs_region)],
     sample_n(slice_z, SNAP_NMAX)[, .(species = "Zebrafish", THETA_DEG, SPHERICAL_DEPTH, xs_region)])
   xs[, species   := factor(species,   levels = c("Medaka", "Zebrafish"))]
-  xs[, xs_region := factor(xs_region, levels = c("Elsewhere", "Control column", "Bulge column"))]
+  xs[, xs_region := factor(xs_region, levels = c("Elsewhere", "Bulge column"))]
   xs_bands <- rbind(
-    data.table(species = "Medaka",    kind = "Bulge",   xmin = BULGE_M$theta - BULGE_M$radius, xmax = BULGE_M$theta + BULGE_M$radius),
-    data.table(species = "Medaka",    kind = "Control", xmin = CTRL_M$theta  - CTRL_M$radius,  xmax = CTRL_M$theta  + CTRL_M$radius),
-    data.table(species = "Zebrafish", kind = "Bulge",   xmin = BULGE_Z$theta - BULGE_Z$radius, xmax = BULGE_Z$theta + BULGE_Z$radius),
-    data.table(species = "Zebrafish", kind = "Control", xmin = CTRL_Z$theta  - CTRL_Z$radius,  xmax = CTRL_Z$theta  + CTRL_Z$radius))
+    data.table(species = "Medaka",    kind = "Bulge", xmin = BULGE_M$theta - BULGE_M$radius, xmax = BULGE_M$theta + BULGE_M$radius),
+    data.table(species = "Zebrafish", kind = "Bulge", xmin = BULGE_Z$theta - BULGE_Z$radius, xmax = BULGE_Z$theta + BULGE_Z$radius))
   xs_bands[, species := factor(species, levels = c("Medaka", "Zebrafish"))]
 
   pB <- ggplot(xs, aes(THETA_DEG, SPHERICAL_DEPTH)) +
     geom_rect(data = xs_bands[kind == "Bulge"], inherit.aes = FALSE,
               aes(xmin = xmin, xmax = xmax, ymin = -Inf, ymax = Inf),
               fill = "#E31A1C", alpha = 0.10) +
-    geom_rect(data = xs_bands[kind == "Control"], inherit.aes = FALSE,
-              aes(xmin = xmin, xmax = xmax, ymin = -Inf, ymax = Inf),
-              fill = "#1F78B4", alpha = 0.10) +
     geom_point(aes(color = xs_region), size = 0.25, alpha = 0.55) +
     scale_color_manual(values = c("Elsewhere" = "grey60",
-                                  "Control column" = "#1F78B4",
                                   "Bulge column"   = "#E31A1C"), name = NULL) +
     facet_wrap(~ species, scales = "free") +
     scale_y_reverse() +
@@ -690,35 +760,111 @@ build_fig1 <- function(fname,
     theme_pub() +
     theme(plot.subtitle = element_text(size = 9, color = "grey25"))
 
-  # Panel C: density vs time, aligned to ingression per species
-  pC <- ggplot(d_ts, aes(time_from_ingression_min, density_per_1000um2,
+    # Panel C: density vs real acquisition time
+    pC <- ggplot(d_ts, aes(time_min, density_per_1000um2,
                          color = region)) +
-    geom_vline(xintercept = 0, linetype = "dashed", color = "grey65") +
     geom_point(alpha = 0.15, size = 0.4) +
     geom_smooth(method = "loess", span = 0.3, se = TRUE, linewidth = 1) +
     facet_wrap(~ species, nrow = 1, scales = "free_x") +
     scale_color_manual(values = REGION_COL, name = NULL) +
-    labs(title = "C. Regional nuclei density trajectories aligned to ingression",
-         subtitle = "0 min = ingression (medaka frame 199; zebrafish frame 40).  Bulge above control = true density excess.",
-         x = "time from ingression (min)",
+      labs(title = "C. Regional nuclei density trajectories over real time",
+        subtitle = sprintf("Raw acquisition time in minutes.  Zebrafish comparison strip is the most vegetal band already in view before ingression (theta %.0f° ± %d°); panel D handles ingression alignment.",
+                 FIG1_ZEB_STRIP_CENTER, MARGIN_WIDTH_DEG),
+        x = "time (min)",
          y = expression("nuclei / 1000 "*mu*"m"^2)) +
     theme_pub() +
     theme(plot.subtitle = element_text(size = 9, color = "grey25"),
           legend.position = "bottom")
 
-  bulge_ts <- d_ts[region == "Bulge disc"]
-  pD <- ggplot(bulge_ts,
-               aes(time_from_ingression_min, density_per_1000um2,
+  ratio_spec <- data.table(
+    species = c("Medaka", "Zebrafish"),
+      numerator_region = c("Bulge disc", "Bulge disc"),
+      ratio_label = c("Head mesoderm disc / global",
+              "Head mesoderm disc / global")
+  )
+  baseline_dt <- d_ts[, {
+    dens <- density_per_1000um2[
+      time_from_ingression_min >= FIG1_BASELINE_FROM_INGR_MIN &
+      time_from_ingression_min < 0
+    ]
+    if (!length(dens)) dens <- density_per_1000um2[time_from_ingression_min < 0]
+    if (!length(dens)) dens <- head(density_per_1000um2, 5)
+    .(baseline_density = mean(dens, na.rm = TRUE))
+  }, by = .(species, region)]
+  numerator_dt <- merge(
+    d_ts,
+    ratio_spec,
+    by.x = c("species", "region"),
+    by.y = c("species", "numerator_region"),
+    all = FALSE
+  )
+  numerator_dt <- merge(
+    numerator_dt,
+    baseline_dt,
+    by = c("species", "region"),
+    all.x = TRUE
+  )
+  setnames(numerator_dt,
+           c("n_cells", "area_um2", "density_per_1000um2", "baseline_density"),
+           c("numerator_n_cells", "numerator_area_um2",
+             "numerator_density_per_1000um2", "numerator_baseline_density"))
+  global_dt <- d_ts[region == "Global (whole imaged surface)",
+                    .(species, FRAME, time_min, time_from_ingression_min,
+                      global_n_cells = n_cells,
+                      global_area_um2 = area_um2,
+                      global_density_per_1000um2 = density_per_1000um2)]
+  global_base <- baseline_dt[region == "Global (whole imaged surface)",
+                             .(species, global_baseline_density = baseline_density)]
+  ratio_ts <- merge(
+    numerator_dt[, .(species, region, ratio_label, FRAME, time_min,
+                     time_from_ingression_min,
+                     numerator_n_cells, numerator_area_um2,
+                     numerator_density_per_1000um2,
+                     numerator_baseline_density)],
+    global_dt,
+    by = c("species", "FRAME", "time_min", "time_from_ingression_min"),
+    all = FALSE
+  )
+  ratio_ts <- merge(ratio_ts, global_base, by = "species", all.x = TRUE)
+  ratio_ts[, numerator_fold := numerator_density_per_1000um2 / numerator_baseline_density]
+  ratio_ts[, global_fold := global_density_per_1000um2 / global_baseline_density]
+  ratio_ts[, fold_change_over_global := numerator_fold / global_fold]
+
+  ratio_plot_dt <- ratio_ts[, .(
+    fold_change_over_global = mean(fold_change_over_global, na.rm = TRUE),
+    numerator_density_per_1000um2 = mean(numerator_density_per_1000um2,
+                                         na.rm = TRUE),
+    global_density_per_1000um2 = mean(global_density_per_1000um2,
+                                      na.rm = TRUE),
+    n_obs = .N
+  ), by = .(
+    species,
+    ratio_label,
+    time_plot_min = floor(time_from_ingression_min / FIG1_COMPARE_BIN_MIN) *
+      FIG1_COMPARE_BIN_MIN
+  )]
+
+  ratio_summary <- ratio_plot_dt[, .(
+    baseline_window = sprintf("[%d, 0) min", FIG1_BASELINE_FROM_INGR_MIN),
+    peak_ratio = round(max(fold_change_over_global, na.rm = TRUE), 3),
+    peak_time_from_ingression = time_plot_min[which.max(fold_change_over_global)]
+  ), by = .(species, ratio_label)]
+  cat("     aligned fold-change / global summary:\n")
+  print(ratio_summary)
+
+  pD <- ggplot(ratio_plot_dt,
+               aes(time_plot_min, fold_change_over_global,
                    color = species)) +
     geom_vline(xintercept = 0, linetype = "dashed", color = "grey65") +
-    geom_point(alpha = 0.18, size = 0.5) +
-    geom_smooth(method = "loess", span = 0.3, se = TRUE, linewidth = 1.1) +
+    geom_hline(yintercept = 1, linetype = "dotted", color = "grey55") +
+    geom_line(linewidth = 0.9, alpha = 0.95) +
+    geom_point(size = 1.3, alpha = 0.85) +
     scale_color_manual(values = species_colors, name = NULL) +
-    labs(title = "D. Direct head-mesoderm / bulge comparison",
-         subtitle = sprintf("Same biological region in both species (data-driven bulge disc, area-normalized).  Zebrafish capped at %.0f min raw time.",
-                            cap_z),
+    labs(title = "D. Same head-mesoderm disc in both species",
+         subtitle = sprintf("Both curves use the same red disc definition per species, normalized as local fold change / global fold change.  2-min aligned bins remove the sampling-rate mismatch; values > 1 mean disc-specific enrichment beyond embryo-wide densification.  Baseline window = [%d, 0) min.",
+                            FIG1_BASELINE_FROM_INGR_MIN),
          x = "time from ingression (min)",
-         y = expression("nuclei / 1000 "*mu*"m"^2)) +
+         y = "head-mesoderm fold change / global fold change") +
     theme_pub() +
     theme(plot.subtitle = element_text(size = 9, color = "grey25"))
 
@@ -727,12 +873,12 @@ build_fig1 <- function(fname,
     plot_annotation(
       title = sprintf("Figure 1 -- Head-mesoderm / bulge nuclei density (depth-integrated)%s", title_suffix),
       subtitle = sprintf(
-        "Same region definition in both species: the data-driven head-mesoderm / bulge disc.  0 min = ingression (medaka frame %d = %.1f min; zebrafish frame %d = %.1f min).  Bulge disc: medaka r=%.1f deg, zebrafish r=%.1f deg.",
+        "Red contour = the data-driven head-mesoderm / bulge disc in each species.  Teal strip = context band used in panel C only (medaka landmark margin; zebrafish stable strip at theta %.0f° ± %d°).  0 min = ingression (medaka frame %d = %.1f min; zebrafish frame %d = %.1f min).  Density is always n_cells / area_um2 * 1000.",
+        FIG1_ZEB_STRIP_CENTER, MARGIN_WIDTH_DEG,
         MEDAKA_INGRESSION_FRAME,
         FIG1_TIME_META[species == "Medaka", ingression_time_min],
         ZEB_INGRESSION_FRAME,
-        FIG1_TIME_META[species == "Zebrafish", ingression_time_min],
-        BULGE_M$radius, BULGE_Z$radius),
+        FIG1_TIME_META[species == "Zebrafish", ingression_time_min]),
       theme = theme(plot.title = element_text(face = "bold", size = 14),
                     plot.subtitle = element_text(size = 9, color = "grey25")))
   save_pdf(fig, fname, w = 15, h = 21)
@@ -742,22 +888,26 @@ build_fig1 <- function(fname,
     pk_raw <- peak_window_mean(time_min, density_per_1000um2)
     pk_align <- peak_window_mean(time_from_ingression_min,
                                  density_per_1000um2)
-    .(early_mean = round(mean(density_per_1000um2[time_min <= 30]), 2),
+    dens_pre <- density_per_1000um2[
+      time_from_ingression_min >= FIG1_BASELINE_FROM_INGR_MIN &
+      time_from_ingression_min < 0
+    ]
+    if (!length(dens_pre)) dens_pre <- density_per_1000um2[time_from_ingression_min < 0]
+    if (!length(dens_pre)) dens_pre <- head(density_per_1000um2, 5)
+    .(pre_ingression_mean = round(mean(dens_pre, na.rm = TRUE), 2),
       peak_mean  = round(pk_raw$peak_mean, 2),
       peak_time  = round(pk_raw$peak_time),
       peak_time_from_ingression = round(pk_align$peak_time))
   }, by = .(species, region)]
-  summary_dt[, peak_vs_early := round(peak_mean / early_mean, 2)]
-  bulge_pk <- summary_dt[region == "Bulge disc",                    .(species, bulge_peak = peak_mean)]
-  ctrl_pk  <- summary_dt[region == "Control disc (same latitude)",  .(species, ctrl_peak  = peak_mean)]
-  ratio_dt <- merge(bulge_pk, ctrl_pk, by = "species")
-  ratio_dt[, bulge_over_control := round(bulge_peak / ctrl_peak, 2)]
-  cat("     bulge/control peak-density ratio (same area, same theta):\n")
-  print(ratio_dt)
+  summary_dt[, peak_vs_pre_ingression := round(peak_mean / pre_ingression_mean, 2)]
   print(summary_dt)
   fwrite(d_ts, file.path(OUT_DIR,
                           sub("\\.pdf$", "_per_frame.csv", fname)))
-  list(summary = summary_dt, ratio = ratio_dt)
+  fwrite(ratio_ts, file.path(OUT_DIR,
+                             sub("\\.pdf$", "_aligned_ratio.csv", fname)))
+  fwrite(ratio_plot_dt, file.path(OUT_DIR,
+                                  sub("\\.pdf$", "_aligned_ratio_binned.csv", fname)))
+  list(summary = summary_dt, ratio = ratio_summary, density_qc = density_qc)
 }
 
 fig1_full <- build_fig1(
@@ -1320,18 +1470,18 @@ fwrite(rbind(ihl_m[, species := "Medaka"], ihl_z[, species := "Zebrafish"],
        file.path(OUT_DIR, "ingression_tracks_per_hour.csv"))
 
 # =============================================================================
-# FIGURE 5: MATCHED-TRACK COMPARISON (FAIR SAMPLING)
+# FIGURE 5: TRACK COMPARISON (FAIR SAMPLING)
 # =============================================================================
-# Filter: 10 <= duration <= 60 min  AND  net displacement >= 20 µm.
+# Filter: 20 <= duration <= 60 min, full-track net displacement >= 20 um.
 # To compare two species sampled at different rates (medaka 30 s, zebrafish
 # 120 s), we ALWAYS use a common 120-s, non-overlapping step interval here.
-# Net displacement is from the endpoints of the full track (sampling-
-# invariant); path length, turning, and MSD all use the 120-s steps so
-# neither species accumulates extra jitter.  This gives one definitive
-# answer for straightness, mean turning angle, and MSD.
+# Track duration is measured on the full track (sampling-invariant); path
+# length, turning, and MSD all use the 120-s steps so neither species
+# accumulates extra jitter.  The QC output is a lightweight HTML animation of a
+# fair-sampled subset of these tracks over real time.
 # =============================================================================
 
-banner("FIGURE 5 — matched-track comparison (fair 120-s sampling)")
+banner("FIGURE 5 — track comparison (fair 120-s sampling)")
 
 # Endpoint-based per-track summary (sampling-invariant)
 endpoint_per_track <- function(sp, fi_sec, sp_label) {
@@ -1350,12 +1500,17 @@ ep_m <- endpoint_per_track(sp_m, MEDAKA_FI, "Medaka")
 ep_z <- endpoint_per_track(sp_z, ZEB_FI,    "Zebrafish")
 ep_all <- rbind(ep_m, ep_z)
 
-matched_endpoint <- ep_all[duration_min >= 10 & duration_min <= 60 &
-                              net_disp_um  >= 20]
+matched_endpoint <- ep_all[duration_min >= FIG5_MIN_DURATION_MIN &
+    duration_min <= FIG5_MAX_DURATION_MIN &
+    net_disp_um >= FIG5_MIN_NET_DISP_UM]
 ids_m <- matched_endpoint[species == "Medaka",    TRACK_ID]
 ids_z <- matched_endpoint[species == "Zebrafish", TRACK_ID]
-cat(sprintf("  Endpoint-matched tracks: Medaka n=%d, Zebrafish n=%d\n",
-            length(ids_m), length(ids_z)))
+cat(sprintf("  Duration-filtered tracks (%d-%d min, >= %d um endpoint displacement): Medaka n=%d, Zebrafish n=%d\n",
+       FIG5_MIN_DURATION_MIN, FIG5_MAX_DURATION_MIN,
+  FIG5_MIN_NET_DISP_UM,
+       length(ids_m), length(ids_z)))
+fwrite(matched_endpoint,
+  file.path(OUT_DIR, "duration_filtered_track_endpoints.csv"))
 
 # Fair-sampling: keep only frames at multiples of `retain_mod` so both species
 # share a 120-s sampling grid.  Then derive BOTH path length and endpoint
@@ -1416,6 +1571,10 @@ matched <- matched[!is.na(straightness) & straightness <= 1.0001]
 matched[, straightness := pmin(straightness, 1)]
 matched[, species := factor(species, levels = c("Medaka", "Zebrafish"))]
 fwrite(matched, file.path(OUT_DIR, "matched_tracks.csv"))
+fwrite(matched, file.path(OUT_DIR, "duration_filtered_tracks_20to60min.csv"))
+
+metric_ids_m <- matched[species == "Medaka", TRACK_ID]
+metric_ids_z <- matched[species == "Zebrafish", TRACK_ID]
 
 cat("  Per-track metrics (fair 120-s sampling):\n")
 print(matched[, .(n              = .N,
@@ -1433,6 +1592,321 @@ cat(sprintf("  Welch t  straightness: t=%+.2f, p=%.2e\n",
             ws_s$statistic, ws_s$p.value))
 cat(sprintf("  Welch t  mean turning: t=%+.2f, p=%.2e\n",
             ws_t$statistic, ws_t$p.value))
+
+track_surface_qc <- function(sp, ids, sp_label) {
+  if (!length(ids)) return(data.table())
+  d <- copy(sp[TRACK_ID %in% ids])
+  setorder(d, TRACK_ID, FRAME)
+  d[, .(
+    start_phi = PHI_DEG[1],
+    start_theta = THETA_DEG[1],
+    end_phi = PHI_DEG[.N],
+    end_theta = THETA_DEG[.N]
+  ), by = TRACK_ID][, species := sp_label][]
+}
+
+track_path_qc <- function(sub, ids, sp_label,
+                          fi_sec,
+                          max_tracks = FIG5_QC_SAMPLE_TRACKS,
+                          seed = FIG5_QC_SEED) {
+  if (!length(ids)) {
+    return(list(paths = data.table(), starts = data.table(), ends = data.table()))
+  }
+  keep_ids <- ids
+  if (length(keep_ids) > max_tracks) {
+    set.seed(seed)
+    keep_ids <- sample(keep_ids, max_tracks)
+  }
+  d <- copy(sub[TRACK_ID %in% keep_ids,
+                .(TRACK_ID, FRAME, POSITION_X, POSITION_Y)])
+  setorder(d, TRACK_ID, FRAME)
+  d[, `:=`(species = sp_label,
+           time_min = FRAME * fi_sec / 60)]
+  se <- d[, .(
+    start_x = POSITION_X[1],
+    start_y = POSITION_Y[1],
+    end_x   = POSITION_X[.N],
+    end_y   = POSITION_Y[.N]
+  ), by = TRACK_ID]
+  se[, species := sp_label]
+  list(
+    paths = d,
+    starts = se[, .(species, TRACK_ID, x = start_x, y = start_y)],
+    ends = se[, .(species, TRACK_ID, x = end_x, y = end_y)]
+  )
+}
+
+build_track_qc_payload <- function(path_dt) {
+  d <- copy(path_dt)
+  d[, species := as.character(species)]
+  setorder(d, species, TRACK_ID, time_min)
+  time_values <- sort(unique(d$time_min))
+  species_payload <- setNames(vector("list", 2L), c("Medaka", "Zebrafish"))
+  for (sp_label in c("Medaka", "Zebrafish")) {
+    sp <- d[species == sp_label]
+    if (!nrow(sp)) {
+      species_payload[[sp_label]] <- list(
+        label = sp_label,
+        color = unname(species_colors[sp_label]),
+        n_tracks = 0L,
+        xmin = 0,
+        xmax = 1,
+        ymin = 0,
+        ymax = 1,
+        tracks = list()
+      )
+      next
+    }
+    track_list <- sp[, .(
+      track = list(list(
+        id = as.character(TRACK_ID[1]),
+        time_min = time_min,
+        x = POSITION_X,
+        y = POSITION_Y
+      ))
+    ), by = TRACK_ID]$track
+    x_rng <- range(sp$POSITION_X, na.rm = TRUE)
+    y_rng <- range(sp$POSITION_Y, na.rm = TRUE)
+    species_payload[[sp_label]] <- list(
+      label = sp_label,
+      color = unname(species_colors[sp_label]),
+      n_tracks = length(track_list),
+      xmin = x_rng[1],
+      xmax = x_rng[2],
+      ymin = y_rng[1],
+      ymax = y_rng[2],
+      tracks = track_list
+    )
+  }
+  list(
+    times = time_values,
+    trail_steps = FIG5_QC_TRAIL_STEPS,
+    species = species_payload
+  )
+}
+
+build_track_qc_html <- function(payload) {
+  payload_json <- jsonlite::toJSON(payload, auto_unbox = TRUE,
+                                   digits = 7, null = "null")
+  subtitle <- sprintf(
+    "Tracks: %d-%d min and >= %d um full-track endpoint displacement. Random sample <= %d tracks per species. Each dot is the current position and each tail shows the last %d fair-sampled steps.",
+    FIG5_MIN_DURATION_MIN,
+    FIG5_MAX_DURATION_MIN,
+    FIG5_MIN_NET_DISP_UM,
+    FIG5_QC_SAMPLE_TRACKS,
+    FIG5_QC_TRAIL_STEPS
+  )
+  c(
+    "<!DOCTYPE html>",
+    "<html lang=\"en\">",
+    "<head>",
+    "  <meta charset=\"utf-8\">",
+    "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">",
+    "  <title>Duration-filtered track QC viewer</title>",
+    "  <style>",
+    "    :root { color-scheme: light; font-family: Helvetica, Arial, sans-serif; }",
+    "    body { margin: 0; background: #f6f3eb; color: #1f1f1f; }",
+    "    .page { max-width: 1500px; margin: 0 auto; padding: 24px; }",
+    "    h1 { margin: 0 0 8px; font-size: 28px; }",
+    "    .subtitle { margin: 0 0 20px; max-width: 1050px; line-height: 1.45; color: #4b4b4b; }",
+    "    .controls { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 18px; }",
+    "    button { border: 0; border-radius: 999px; background: #1f1f1f; color: #ffffff; padding: 10px 18px; font-size: 15px; cursor: pointer; }",
+    "    input[type=range] { flex: 1 1 380px; accent-color: #1f1f1f; }",
+    "    .time-label { min-width: 108px; font-variant-numeric: tabular-nums; }",
+    "    .grid { display: grid; grid-template-columns: repeat(2, minmax(320px, 1fr)); gap: 18px; }",
+    "    .panel { background: #fffdf8; border: 1px solid #ddd4c6; border-radius: 18px; padding: 16px; box-shadow: 0 12px 28px rgba(43, 32, 17, 0.08); }",
+    "    .panel h2 { margin: 0 0 8px; font-size: 18px; }",
+    "    .meta { margin: 0 0 10px; color: #6a6256; font-size: 14px; }",
+    "    canvas { width: 100%; height: auto; display: block; background: #fffdf8; border-radius: 12px; }",
+    "    .footer { margin-top: 12px; color: #6a6256; font-size: 13px; }",
+    "    @media (max-width: 960px) { .grid { grid-template-columns: 1fr; } }",
+    "  </style>",
+    "</head>",
+    "<body>",
+    "  <div class=\"page\">",
+    "    <h1>Figure 5 QC viewer</h1>",
+    paste0("    <p class=\"subtitle\">", subtitle, "</p>"),
+    "    <div class=\"controls\">",
+    "      <button id=\"playButton\" type=\"button\">Play</button>",
+    "      <input id=\"timeSlider\" type=\"range\" min=\"0\" max=\"0\" step=\"1\" value=\"0\">",
+    "      <div id=\"timeLabel\" class=\"time-label\">Time: 0 min</div>",
+    "    </div>",
+    "    <div class=\"grid\">",
+    "      <section class=\"panel\">",
+    "        <h2>Medaka</h2>",
+    "        <p id=\"metaMedaka\" class=\"meta\"></p>",
+    "        <canvas id=\"canvasMedaka\" width=\"900\" height=\"900\"></canvas>",
+    "      </section>",
+    "      <section class=\"panel\">",
+    "        <h2>Zebrafish</h2>",
+    "        <p id=\"metaZebrafish\" class=\"meta\"></p>",
+    "        <canvas id=\"canvasZebrafish\" width=\"900\" height=\"900\"></canvas>",
+    "      </section>",
+    "    </div>",
+    "    <p class=\"footer\">The viewer uses the same 120 s fair-sampled tracks used for straightness, turning angle, and MSD.</p>",
+    "  </div>",
+    "  <script>",
+    paste0("    const qcData = ", payload_json, ";"),
+    "    const slider = document.getElementById('timeSlider');",
+    "    const playButton = document.getElementById('playButton');",
+    "    const timeLabel = document.getElementById('timeLabel');",
+    "    const panelNames = ['Medaka', 'Zebrafish'];",
+    "    const canvasIds = { Medaka: 'canvasMedaka', Zebrafish: 'canvasZebrafish' };",
+    "    const metaIds = { Medaka: 'metaMedaka', Zebrafish: 'metaZebrafish' };",
+    "    const padding = { left: 58, right: 18, top: 18, bottom: 52 };",
+    "    let frameIndex = 0;",
+    "    let timerId = null;",
+    "    const states = {};",
+    "",
+    "    function init() {",
+    "      panelNames.forEach((name) => {",
+    "        const panel = qcData.species[name];",
+    "        const canvas = document.getElementById(canvasIds[name]);",
+    "        states[name] = { panel, canvas, ctx: canvas.getContext('2d') };",
+    "        document.getElementById(metaIds[name]).textContent = `${panel.n_tracks} sampled tracks`;",
+    "      });",
+    "      slider.max = Math.max(qcData.times.length - 1, 0);",
+    "      slider.addEventListener('input', (event) => {",
+    "        frameIndex = Number(event.target.value);",
+    "        render();",
+    "      });",
+    "      playButton.addEventListener('click', () => {",
+    "        if (timerId === null) {",
+    "          if (frameIndex >= qcData.times.length - 1) frameIndex = 0;",
+    "          play();",
+    "        } else {",
+    "          pause();",
+    "        }",
+    "      });",
+    "      render();",
+    "    }",
+    "",
+    "    function play() {",
+    "      playButton.textContent = 'Pause';",
+    "      timerId = window.setInterval(() => {",
+    "        if (frameIndex >= qcData.times.length - 1) {",
+    "          pause();",
+    "          return;",
+    "        }",
+    "        frameIndex += 1;",
+    "        render();",
+    "      }, 360);",
+    "    }",
+    "",
+    "    function pause() {",
+    "      if (timerId !== null) {",
+    "        window.clearInterval(timerId);",
+    "        timerId = null;",
+    "      }",
+    "      playButton.textContent = 'Play';",
+    "    }",
+    "",
+    "    function xToCanvas(state, x) {",
+    "      const innerWidth = state.canvas.width - padding.left - padding.right;",
+    "      const span = Math.max(state.panel.xmax - state.panel.xmin, 1e-6);",
+    "      return padding.left + ((x - state.panel.xmin) / span) * innerWidth;",
+    "    }",
+    "",
+    "    function yToCanvas(state, y) {",
+    "      const innerHeight = state.canvas.height - padding.top - padding.bottom;",
+    "      const span = Math.max(state.panel.ymax - state.panel.ymin, 1e-6);",
+    "      return padding.top + ((y - state.panel.ymin) / span) * innerHeight;",
+    "    }",
+    "",
+    "    function lastVisibleIndex(track, currentTime) {",
+    "      for (let i = track.time_min.length - 1; i >= 0; i -= 1) {",
+    "        if (track.time_min[i] <= currentTime + 1e-9) return i;",
+    "      }",
+    "      return -1;",
+    "    }",
+    "",
+    "    function drawAxes(state) {",
+    "      const ctx = state.ctx;",
+    "      const width = state.canvas.width;",
+    "      const height = state.canvas.height;",
+    "      ctx.fillStyle = '#fffdf8';",
+    "      ctx.fillRect(0, 0, width, height);",
+    "      ctx.strokeStyle = '#ddd4c6';",
+    "      ctx.lineWidth = 1.5;",
+    "      ctx.strokeRect(padding.left, padding.top, width - padding.left - padding.right, height - padding.top - padding.bottom);",
+    "      ctx.fillStyle = '#6a6256';",
+    "      ctx.font = '24px Helvetica, Arial, sans-serif';",
+    "      ctx.fillText('X (um)', width / 2 - 34, height - 12);",
+    "      ctx.save();",
+    "      ctx.translate(18, height / 2 + 34);",
+    "      ctx.rotate(-Math.PI / 2);",
+    "      ctx.fillText('Y (um)', 0, 0);",
+    "      ctx.restore();",
+    "    }",
+    "",
+    "    function drawTracks(state, currentTime) {",
+    "      const ctx = state.ctx;",
+    "      const color = state.panel.color;",
+    "      state.panel.tracks.forEach((track) => {",
+    "        const idx = lastVisibleIndex(track, currentTime);",
+    "        if (idx < 0) return;",
+    "        const firstIdx = Math.max(0, idx - qcData.trail_steps + 1);",
+    "        ctx.beginPath();",
+    "        for (let i = firstIdx; i <= idx; i += 1) {",
+    "          const px = xToCanvas(state, track.x[i]);",
+    "          const py = yToCanvas(state, track.y[i]);",
+    "          if (i === firstIdx) ctx.moveTo(px, py);",
+    "          else ctx.lineTo(px, py);",
+    "        }",
+    "        ctx.strokeStyle = color;",
+    "        ctx.lineWidth = 1.25;",
+    "        ctx.globalAlpha = 0.28;",
+    "        ctx.stroke();",
+    "        const cx = xToCanvas(state, track.x[idx]);",
+    "        const cy = yToCanvas(state, track.y[idx]);",
+    "        ctx.globalAlpha = 0.95;",
+    "        ctx.fillStyle = color;",
+    "        ctx.beginPath();",
+    "        ctx.arc(cx, cy, 4.0, 0, Math.PI * 2);",
+    "        ctx.fill();",
+    "        ctx.strokeStyle = '#111111';",
+    "        ctx.lineWidth = 0.8;",
+    "        ctx.stroke();",
+    "      });",
+    "      ctx.globalAlpha = 1;",
+    "    }",
+    "",
+    "    function render() {",
+    "      if (!qcData.times.length) return;",
+    "      const currentTime = qcData.times[frameIndex];",
+    "      timeLabel.textContent = `Time: ${currentTime.toFixed(0)} min`;",
+    "      slider.value = frameIndex;",
+    "      panelNames.forEach((name) => {",
+    "        drawAxes(states[name]);",
+    "        drawTracks(states[name], currentTime);",
+    "      });",
+    "    }",
+    "",
+    "    init();",
+    "  </script>",
+    "</body>",
+    "</html>"
+  )
+}
+
+surface_qc <- rbind(
+  track_surface_qc(sp_m, metric_ids_m, "Medaka"),
+  track_surface_qc(sp_z, metric_ids_z, "Zebrafish")
+)
+surface_qc[, species := factor(species, levels = c("Medaka", "Zebrafish"))]
+
+path_qc_m <- track_path_qc(sub_m, metric_ids_m, "Medaka", MEDAKA_FI)
+path_qc_z <- track_path_qc(sub_z, metric_ids_z, "Zebrafish", ZEB_FI)
+paths_qc <- rbindlist(list(path_qc_m$paths, path_qc_z$paths), fill = TRUE)
+paths_qc[, species := factor(species, levels = c("Medaka", "Zebrafish"))]
+
+fwrite(surface_qc, file.path(OUT_DIR, "duration_filtered_track_starts.csv"))
+fwrite(paths_qc, file.path(OUT_DIR, "duration_filtered_track_sample_paths.csv"))
+old_qc_pdf <- file.path(OUT_DIR, "05a_duration_filtered_track_qc.pdf")
+if (file.exists(old_qc_pdf)) unlink(old_qc_pdf)
+qc_payload <- build_track_qc_payload(paths_qc)
+qc_html <- build_track_qc_html(qc_payload)
+save_html_file(qc_html, "05a_duration_filtered_track_qc.html")
 
 p5a <- ggplot(matched, aes(species, straightness, fill = species)) +
   geom_violin(alpha = 0.6, color = NA) +
@@ -1484,10 +1958,11 @@ msd_matched_fair <- function(dt_sp, ids, fi_sec, frames_per_120s, max_k) {
   rbindlist(out)
 }
 max_k <- 30L   # 60 min
-msd_m <- msd_matched_fair(sp_m, ids_m, MEDAKA_FI, 4L, max_k)[, species := "Medaka"]
-msd_z <- msd_matched_fair(sp_z, ids_z, ZEB_FI,    1L, max_k)[, species := "Zebrafish"]
+msd_m <- msd_matched_fair(sp_m, metric_ids_m, MEDAKA_FI, 4L, max_k)[, species := "Medaka"]
+msd_z <- msd_matched_fair(sp_z, metric_ids_z, ZEB_FI,    1L, max_k)[, species := "Zebrafish"]
 msd <- rbind(msd_m, msd_z)
 fwrite(msd, file.path(OUT_DIR, "matched_msd.csv"))
+fwrite(msd, file.path(OUT_DIR, "duration_filtered_msd_20to60min.csv"))
 
 # Power-law slope (alpha) of MSD vs lag, 2..30 min: alpha=2 ballistic, alpha=1 diffusive
 msd_fit <- msd[lag_min >= 2 & lag_min <= 30,
@@ -1506,8 +1981,8 @@ p5c <- ggplot(msd[lag_min <= 60],
                 color = species),
             inherit.aes = FALSE, hjust = 0, size = 4, show.legend = FALSE) +
   labs(title = "MSD vs lag (log-log)",
-       subtitle = sprintf("matched tracks (Medaka n=%d, Zebrafish n=%d) | common 120-s lags",
-                          length(ids_m), length(ids_z)),
+      subtitle = sprintf("20-60 min duration, >=20 um endpoint displacement, with valid fair-sampled metrics (Medaka n=%d, Zebrafish n=%d) | common 120-s lags",
+             length(metric_ids_m), length(metric_ids_z)),
        x = "lag (min)", y = expression("MSD (" * mu * "m" ^ 2 * ")"),
        color = NULL) +
   theme_pub()
@@ -1523,8 +1998,10 @@ p5d <- ggplot(msd[lag_min <= 60],
 
 fig5 <- (p5a + p5b) / (p5c + p5d) +
   plot_annotation(
-    title = "Matched-track comparison (fair 120-s sampling)",
-    subtitle = "Tracks: 10-60 min duration AND >=20 um net displacement; path length, turning, MSD all at common 120-s steps",
+    title = "Track comparison (fair 120-s sampling)",
+    subtitle = sprintf("Tracks: %d-%d min full-track duration and >= %d um endpoint displacement. Path length, turning, and MSD all use common 120-s steps.",
+                       FIG5_MIN_DURATION_MIN, FIG5_MAX_DURATION_MIN,
+                       FIG5_MIN_NET_DISP_UM),
     theme = theme(plot.title = element_text(face = "bold", size = 14)))
 save_pdf(fig5, "05_matched_tracks.pdf", w = 13, h = 11)
 

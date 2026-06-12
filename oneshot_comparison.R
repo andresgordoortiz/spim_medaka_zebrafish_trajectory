@@ -2,7 +2,8 @@
 # ONE-SHOT MEDAKA vs ZEBRAFISH COMPARISON
 # =============================================================================
 # Generates the plot set requested:
-#   (1) margin cell density over time + fold difference (medaka/zebrafish)
+#   (1) head-mesoderm / bulge cell density over time (medaka/zebrafish,
+#       aligned to ingression)
 #   (2) movement direction over time (epiboly fraction, mean v_epiboly,
 #       per-step type composition)
 #   (3) thickness in same plot (both species)
@@ -45,6 +46,10 @@ ZEB_OUT_NEW       <- "analysis_output_zebrafish_05112025"
 MEDAKA_FI  <- 30   # frame interval (s)
 ZEB_FI     <- 120
 
+MEDAKA_INGRESSION_FRAME <- 199L
+ZEB_INGRESSION_FRAME    <- 40L
+FIG1_ZEB_TCAP_MIN       <- 170
+
 MEDAKA_VOXEL_UM <- 1.05152
 ZEB_VOXEL_UM    <- 1.24785
 
@@ -66,10 +71,20 @@ ARROW_LW          <- 0.7
 VORT_SWIRL_THRESH <- 0.3
 
 species_colors <- c("Medaka" = "#D73027", "Zebrafish" = "#4575B4")
-step_type_cols <- c("Epiboly" = "#B2182B", "Animalward" = "#2166AC",
-                    "Convergence" = "#7B3294")
+step_type_cols <- c("Epiboly"     = "#EF8A62",
+                    "Convergence" = "#1B7837",
+                    "Animalward"  = "#FDDBC7",
+                    "Ingression"  = "#2166AC")
+STEP_TYPE_LEVELS <- c("Epiboly", "Convergence", "Animalward", "Ingression")
 flow_cols <- c("Upward (AP)" = "#2166AC", "Circular" = "#1A9850",
                "Downward (VP)" = "#B2182B")
+
+FIG1_TIME_META <- data.table(
+  species = c("Medaka", "Zebrafish"),
+  ingression_frame = c(MEDAKA_INGRESSION_FRAME, ZEB_INGRESSION_FRAME),
+  fi_sec = c(MEDAKA_FI, ZEB_FI)
+)
+FIG1_TIME_META[, ingression_time_min := ingression_frame * fi_sec / 60]
 
 theme_pub <- function(bs = 11) {
   theme_minimal(base_size = bs) +
@@ -154,13 +169,75 @@ R_M <- read_sphere(MEDAKA_INPUT, MEDAKA_VOXEL_UM)
 R_Z <- read_sphere(ZEBRAFISH_INPUT, ZEB_VOXEL_UM)
 cat(sprintf("  Sphere radius: medaka %.1f µm, zebrafish %.1f µm\n", R_M, R_Z))
 
-read_margin <- function(dir) {
+read_landmark <- function(dir, name) {
   d <- fread(file.path(dir, "gastrulation_landmarks.csv"))
-  as.numeric(d[landmark == "margin", theta])
+  row <- d[landmark == name]
+  if (nrow(row) == 0) return(c(theta = NA_real_, phi = NA_real_))
+  c(theta = as.numeric(row$theta[1]), phi = as.numeric(row$phi[1]))
 }
-MARGIN_M <- read_margin(MEDAKA_INPUT)
-MARGIN_Z <- read_margin(ZEBRAFISH_INPUT)
-cat(sprintf("  Margin θ: medaka %.2f°, zebrafish %.2f°\n", MARGIN_M, MARGIN_Z))
+lm_m_margin <- read_landmark(MEDAKA_INPUT, "margin")
+lm_z_margin <- read_landmark(ZEBRAFISH_INPUT, "margin")
+MARGIN_M <- lm_m_margin["theta"]
+MARGIN_Z <- lm_z_margin["theta"]
+lm_m_ingr <- read_landmark(MEDAKA_INPUT, "ingression_center")
+lm_z_ingr <- read_landmark(ZEBRAFISH_INPUT, "ingression_center")
+cat(sprintf("  Margin θ:           medaka %.2f°, zebrafish %.2f°\n", MARGIN_M, MARGIN_Z))
+
+# Data-driven bulge / ingression-cluster detection (same algorithm as
+# gastrulation_dynamics_medaka.R step 2): tracks whose max depth is in the top
+# 5 % live in the cluster; centre = mean (θ,φ) of those tracks; radius =
+# 2·sd(angular distance) + 2°, capped at 15°.  Zebrafish "shield" and medaka
+# "ingression bulge" are biologically the same structure (site of cell
+# internalisation at the dorsal margin).
+INGR_DEPTH_PCTILE <- 0.95
+detect_bulge <- function(sp, fallback_theta, fallback_phi) {
+  # Where does the deep tissue ACCUMULATE late in the recording?  Use only
+  # frames from the second half of the recording (after t_max/2) and pick the
+  # deepest 5% of cells in that window; the centre is the spatial mean of
+  # those observations.  This avoids the bias from tracks that dive early and
+  # then drift away \u2014 we want the position where the bulge actually sits at
+  # the end of the recording.
+  t_max <- max(sp$FRAME, na.rm = TRUE)
+  late  <- sp[FRAME >= t_max / 2 & is.finite(SPHERICAL_DEPTH)]
+  thr <- as.numeric(quantile(late$SPHERICAL_DEPTH, INGR_DEPTH_PCTILE,
+                              na.rm = TRUE))
+  cand <- late[SPHERICAL_DEPTH >= thr]
+  if (nrow(cand) >= 50) {
+    ct <- mean(cand$THETA_DEG, na.rm = TRUE)
+    cp <- mean(cand$PHI_DEG,   na.rm = TRUE)
+    cand[, ang_dist := sqrt((THETA_DEG - ct)^2 + (PHI_DEG - cp)^2)]
+    # Tight disc: 75th percentile of angular distance from the centre, capped
+    # at 7 deg.  Earlier we used 2*sd + 2 deg (cap 15) which produced a disc
+    # large enough to engulf normal-density tissue around the deep core and
+    # diluted the bulge-density signal.
+    rad <- min(as.numeric(quantile(cand$ang_dist, 0.75, na.rm = TRUE)), 7)
+    list(theta = ct, phi = cp, radius = rad, n_cand = nrow(cand),
+         depth_thresh = thr,
+         source = "data-driven (deepest 5% in late half of recording)")
+  } else {
+    list(theta = fallback_theta, phi = fallback_phi, radius = 10,
+         n_cand = nrow(cand), depth_thresh = thr,
+         source = "landmark fallback")
+  }
+}
+BULGE_M <- detect_bulge(sp_m, lm_m_ingr["theta"], lm_m_ingr["phi"])
+BULGE_Z <- detect_bulge(sp_z, lm_z_ingr["theta"], lm_z_ingr["phi"])
+cat(sprintf("  Bulge medaka:    θ=%.1f° φ=%.1f° radius=%.1f°  (%d deep tracks, depth ≥ %.1f µm, %s)\n",
+            BULGE_M$theta, BULGE_M$phi, BULGE_M$radius,
+            BULGE_M$n_cand, BULGE_M$depth_thresh, BULGE_M$source))
+cat(sprintf("  Bulge zebrafish: θ=%.1f° φ=%.1f° radius=%.1f°  (%d deep tracks, depth ≥ %.1f µm, %s)\n",
+            BULGE_Z$theta, BULGE_Z$phi, BULGE_Z$radius,
+            BULGE_Z$n_cand, BULGE_Z$depth_thresh, BULGE_Z$source))
+
+# Bulge disc outlines (used by both Fig 1 and Fig 3 heatmap overlays)
+bulge_circle_poly <- function(b, species_label, n = 80) {
+  ang <- seq(0, 2 * pi, length.out = n)
+  data.table(species = factor(species_label, levels = c("Medaka", "Zebrafish")),
+             phi   = b$phi   + b$radius * cos(ang),
+             theta = b$theta + b$radius * sin(ang))
+}
+bulge_poly <- rbind(bulge_circle_poly(BULGE_M, "Medaka"),
+                    bulge_circle_poly(BULGE_Z, "Zebrafish"))
 
 # Estimate covered phi range (azimuth coverage of the imaged half) per species
 phi_range <- function(dt) {
@@ -182,7 +259,8 @@ compute_vel <- function(df, fi_sec, vel_lag, smooth_k) {
   fi_min <- fi_sec / 60
   dt <- copy(df); setkey(dt, TRACK_ID, FRAME)
   for (col in c("POSITION_X", "POSITION_Y", "POSITION_Z",
-                "RADIAL_DIST", "THETA_DEG", "PHI_DEG")) {
+                "RADIAL_DIST", "THETA_DEG", "PHI_DEG",
+                "SPHERICAL_DEPTH")) {
     sm <- paste0(col, "_SM")
     dt[, (sm) := frollmean(get(col), n = smooth_k, align = "center"),
        by = TRACK_ID]
@@ -207,13 +285,16 @@ compute_vel <- function(df, fi_sec, vel_lag, smooth_k) {
     disp_3d   = sqrt(dx^2 + dy^2 + dz^2),
     theta_rad = THETA_DEG * pi / 180
   )]
+  dt[, dDepth := SPHERICAL_DEPTH_SM - shift(SPHERICAL_DEPTH_SM, vel_lag),
+     by = TRACK_ID]
   dt[, `:=`(
     inst_speed    = disp_3d / (dt_f * fi_min),
     vx_um_min     = dx / (dt_f * fi_min),
     vy_um_min     = dy / (dt_f * fi_min),
     v_epiboly     = RADIAL_DIST * (dTheta * pi / 180) / (dt_f * fi_min),
     v_convergence = RADIAL_DIST * sin(theta_rad) *
-                    (dPhi * pi / 180) / (dt_f * fi_min)
+                    (dPhi * pi / 180) / (dt_f * fi_min),
+    v_depth       = dDepth / (dt_f * fi_min)  # positive = deepening (inward)
   )]
   # turning angle vs previous step
   dt[, `:=`(
@@ -230,16 +311,23 @@ compute_vel <- function(df, fi_sec, vel_lag, smooth_k) {
 vel_m <- compute_vel(sp_m, MEDAKA_FI, MEDAKA_VEL_LAG, MEDAKA_SMOOTH_K)
 vel_z <- compute_vel(sp_z, ZEB_FI,    ZEB_VEL_LAG,    ZEB_SMOOTH_K)
 
-vel_m[, step_type := fcase(
-  abs(v_convergence) > abs(v_epiboly), "Convergence",
-  v_epiboly > 0, "Epiboly",
-  default = "Animalward"
-)]
-vel_z[, step_type := fcase(
-  abs(v_convergence) > abs(v_epiboly), "Convergence",
-  v_epiboly > 0, "Epiboly",
-  default = "Animalward"
-)]
+# Per-step direction classification (3 categories — Convergence / Epiboly /
+# Animalward).  Ingression cannot be defined per step robustly (single inward
+# steps are noisy); we use the per-track classifier below for the composition
+# stack so it matches the previous gastrulation_dynamics_05 plot.
+classify_steps <- function(dt) {
+  dt[, step_type := fcase(
+    abs(v_convergence) > abs(v_epiboly), "Convergence",
+    v_epiboly > 0,                       "Epiboly",
+    default                            = "Animalward"
+  )]
+  dt[, step_type := factor(step_type,
+                            levels = c("Epiboly", "Convergence", "Animalward"))]
+  dt[]
+}
+
+vel_m <- classify_steps(vel_m)
+vel_z <- classify_steps(vel_z)
 vel_m[, species := "Medaka"];  vel_z[, species := "Zebrafish"]
 vel_m[, time_min := FRAME * MEDAKA_FI / 60]
 vel_z[, time_min := FRAME * ZEB_FI    / 60]
@@ -248,14 +336,124 @@ cat(sprintf("  velocity steps: medaka %s, zebrafish %s\n",
             format(nrow(vel_m), big.mark = ","),
             format(nrow(vel_z), big.mark = ",")))
 
+# -----------------------------------------------------------------------------
+# Per-TRACK movement_type — verbatim port of gastrulation_dynamics_medaka.R
+# (the classifier that produced medaka_dynamics_05_spatial_flow).  Two key
+# pieces of physics:
+#
+#   * v_epiboly      = R · (Δθ/Δt) in µm/min along the meridian — positive
+#                      means the cell moves vegetal-ward (toward the equator,
+#                      i.e. the epiboly direction).
+#   * v_convergence  = R · sin(θ) · (Δφ/Δt) in µm/min along the equator — its
+#                      sign on its own is meaningless because cells on the two
+#                      flanks converge from opposite sides.
+#   * v_conv_dorsal  = −v_convergence · sign(φ − φ_bulge): positive whenever
+#                      the step shortens the equatorial gap to the dorsal
+#                      bulge / shield axis.  THIS is the convergence signal.
+#   * v_depth        = Δ(spherical depth)/Δt; positive = moving inward.
+#
+# Categories (in priority order):
+#   Ingression  : track ENDS in the ingression region AND has gained more depth
+#                 than the global P90 of (last-first) depth change.
+#                 Region differs by species — see ingr_region_* below.
+#   Convergence : |mean_v_conv_dorsal| > |mean_v_epiboly|  AND  > 0.
+#   Epiboly     : mean_v_epiboly > 0.
+#   Animalward  : otherwise (rare; mostly noise / animal-pole drift).
+# -----------------------------------------------------------------------------
+INGR_DEPTH_CHANGE_PCTILE <- 0.90
+
+# Ingression spatial region per species:
+#  - Medaka  : a localized DISC = the data-driven bulge cluster.
+#              Cells internalise at one spot (the germ-ring bulge).
+#  - Zebrafish: the whole MARGIN STRIP (no localized bulge); cells involute
+#              all around the ring.  The shield is the dorsal hot spot but
+#              ingression is not restricted to it.
+INGR_REGION_M <- list(type = "disc",  theta = BULGE_M$theta, phi = BULGE_M$phi,
+                       radius = BULGE_M$radius)
+# Half-width for the zebrafish margin strip used in ingression classification
+# (slightly wider than the thickness-zone margin so we catch involution that
+# already passed the strict band).
+INGR_STRIP_HALFW_Z <- 12
+INGR_REGION_Z <- list(type = "strip", margin_theta = MARGIN_Z,
+                       half_width = INGR_STRIP_HALFW_Z)
+
+in_ingr_region <- function(theta, phi, r) {
+  if (r$type == "disc") {
+    sqrt((theta - r$theta)^2 + (phi - r$phi)^2) < r$radius
+  } else {
+    abs(theta - r$margin_theta) <= r$half_width
+  }
+}
+
+classify_tracks <- function(vel, region, dorsal_phi) {
+  # per-step dorsal-directed convergence (positive = toward the dorsal axis)
+  vel[, conv_dorsal_step := -v_convergence * sign(PHI_DEG - dorsal_phi)]
+  tm <- vel[!is.na(v_epiboly), .(
+    mean_v_epiboly     = mean(v_epiboly,        na.rm = TRUE),
+    mean_conv_dorsal   = mean(conv_dorsal_step, na.rm = TRUE),
+    mean_v_depth       = mean(v_depth,          na.rm = TRUE),
+    end_theta          = last(THETA_DEG),
+    end_phi            = last(PHI_DEG),
+    depth_change       = last(SPHERICAL_DEPTH) - first(SPHERICAL_DEPTH),
+    max_depth          = max(SPHERICAL_DEPTH,   na.rm = TRUE),
+    n_steps            = .N
+  ), by = TRACK_ID]
+  thr_depth <- as.numeric(quantile(tm$depth_change,
+                                    INGR_DEPTH_CHANGE_PCTILE, na.rm = TRUE))
+  if (!is.finite(thr_depth) || thr_depth <= 0) thr_depth <- 5
+  tm[, in_ingr_end := in_ingr_region(end_theta, end_phi, region)]
+  tm[, movement_type := fcase(
+    in_ingr_end & depth_change > thr_depth,                             "Ingression",
+    abs(mean_conv_dorsal) > abs(mean_v_epiboly) & mean_conv_dorsal > 0, "Convergence",
+    mean_v_epiboly > 0,                                                 "Epiboly",
+    default                                                             = "Animalward"
+  )]
+  vel[, conv_dorsal_step := NULL]
+  list(track_class = tm[, .(TRACK_ID, movement_type, depth_change,
+                             mean_v_depth, in_ingr_end)],
+       depth_thresh = thr_depth)
+}
+
+trk_m <- classify_tracks(vel_m, INGR_REGION_M, BULGE_M$phi)
+trk_z <- classify_tracks(vel_z, INGR_REGION_Z, BULGE_Z$phi)
+cat(sprintf("  Track-level ingression depth threshold: medaka %.1f µm, zebrafish %.1f µm\n",
+            trk_m$depth_thresh, trk_z$depth_thresh))
+cat("  Track counts (Medaka): \n");    print(trk_m$track_class[, .N, by = movement_type])
+cat("  Track counts (Zebrafish): \n"); print(trk_z$track_class[, .N, by = movement_type])
+
+vel_m <- merge(vel_m, trk_m$track_class[, .(TRACK_ID, movement_type)],
+                by = "TRACK_ID", all.x = TRUE)
+vel_z <- merge(vel_z, trk_z$track_class[, .(TRACK_ID, movement_type)],
+                by = "TRACK_ID", all.x = TRUE)
+vel_m[, movement_type := factor(movement_type, levels = STEP_TYPE_LEVELS)]
+vel_z[, movement_type := factor(movement_type, levels = STEP_TYPE_LEVELS)]
+
 # =============================================================================
-# FIGURE 1: MARGIN CELL DENSITY OVER TIME + FOLD DIFFERENCE
+# FIGURE 1: BULGE NUCLEI DENSITY  ---  is the bulge a high-density region?
+# =============================================================================
+#
+# We answer ONE question: does the bulge column contain more nuclei (per unit
+# embryo-surface area) than other regions, and does this rise over time?
+#
+# What "bulge disc" means here:
+#   For each species we define a small disc on the EMBRYO SURFACE around the
+#   data-driven bulge centre.  The density measurement counts ALL nuclei whose
+#   (theta, phi) falls inside that disc, AT ANY DEPTH (= the full radial
+#   column under the disc, from outer surface to inner edge of the tracked
+#   tissue).  We then divide that count by the disc's surface area on the
+#   sphere.  So the units are "nuclei per 1000 um^2 of embryo surface" and
+#   the metric is depth-INTEGRATED -- if the column has more cells stacked
+#   inward, the number goes up.
+#
+# To make this concrete, panel A shows the disc on the embryo surface, and
+# panel B shows a CROSS-SECTION (theta vs depth, longitudinal slice through
+# the bulge centre) so the radial column under the disc is visible.  Panel C
+# is the time series.
 # =============================================================================
 
-banner("FIGURE 1 — margin cell density over time")
+banner("FIGURE 1 - head mesoderm / bulge nuclei density")
 
-# Surface density at the margin band [margin - W, margin + W]
-# area_band = R² * Δθ * sin(θ_mid) * Δφ  (Δφ from observed phi coverage)
+# ---- Margin-strip per-frame density (kept for the CSV record only) ---------
 margin_density <- function(dt, R, margin_theta, phi_rng, fi_sec,
                             width = MARGIN_WIDTH_DEG) {
   lo <- margin_theta - width; hi <- margin_theta + width
@@ -269,74 +467,307 @@ margin_density <- function(dt, R, margin_theta, phi_rng, fi_sec,
         density_per_1000um2 = n / area_um2 * 1000,
         area_um2 = area_um2)]
 }
-
 md_m <- margin_density(sp_m, R_M, MARGIN_M, PHI_RNG_M, MEDAKA_FI)
 md_z <- margin_density(sp_z, R_Z, MARGIN_Z, PHI_RNG_Z, ZEB_FI)
 md_m[, species := "Medaka"];  md_z[, species := "Zebrafish"]
 
-# Bin by 30 min and compute fold difference medaka/zebrafish
-BIN_MIN <- 30
-md_m[, time_bin := floor(time_min / BIN_MIN) * BIN_MIN + BIN_MIN / 2]
-md_z[, time_bin := floor(time_min / BIN_MIN) * BIN_MIN + BIN_MIN / 2]
-binned <- rbind(md_m, md_z)[, .(
-  density = mean(density_per_1000um2, na.rm = TRUE),
-  n_frames = .N
-), by = .(species, time_bin)]
+# ---- Areas ---------------------------------------------------------------
+imaged_area_um2 <- function(dt, R) {
+  th_q <- as.numeric(quantile(dt$THETA_DEG, c(0.02, 0.98), na.rm = TRUE)) * pi / 180
+  ph_q <- as.numeric(quantile(dt$PHI_DEG,   c(0.02, 0.98), na.rm = TRUE)) * pi / 180
+  R^2 * (th_q[2] - th_q[1]) * sin(mean(th_q)) * (ph_q[2] - ph_q[1])
+}
+A_GLOBAL_M <- imaged_area_um2(sp_m, R_M)
+A_GLOBAL_Z <- imaged_area_um2(sp_z, R_Z)
+# Disc area: the in_disc selector uses Euclidean (theta,phi) distance, so the
+# selected region is an ellipse on the sphere with semi-axes R*r_rad (theta)
+# and R*sin(theta0)*r_rad (phi).  Area = pi * R^2 * r_rad^2 * sin(theta0).
+# This is consistent with the selector (NOT the spherical-cap area, which
+# would be pi*R^2*r_rad^2 -- 0.5-2% larger here).
+ellipse_disc_area <- function(R, b)
+  pi * R^2 * (b$radius * pi / 180)^2 * sin(b$theta * pi / 180)
+A_BULGE_M  <- ellipse_disc_area(R_M, BULGE_M)
+A_BULGE_Z  <- ellipse_disc_area(R_Z, BULGE_Z)
+A_STRIP_M  <- md_m$area_um2[1]
+A_STRIP_Z  <- md_z$area_um2[1]
 
-fold <- dcast(binned, time_bin ~ species, value.var = "density")
-setnames(fold, c("Medaka", "Zebrafish"), c("med", "zeb"), skip_absent = TRUE)
-fold[, fold_med_over_zeb := med / zeb]
+# Control disc -- SAME LATITUDE (theta) as the bulge so we are NOT comparing
+# the marginal band against the animal cap (which would be unfair: the imaged
+# region barely reaches theta<65 deg).  We slide along phi to find an azimuth
+# inside the imaged window, at least 2*radius away from the bulge, that
+# carries the largest cell count over time at the bulge's theta -- that is,
+# the most data-rich non-bulge location on the same latitude.  Same disc
+# radius, so identical spherical-cap area, so densities are directly
+# comparable nuclei-per-unit-area numbers.
+pick_ctrl_phi <- function(sp, b, sep = NULL) {
+  if (is.null(sep)) sep <- 2 * b$radius
+  ring <- sp[!is.na(PHI_DEG) & abs(THETA_DEG - b$theta) < b$radius]
+  if (!nrow(ring)) return(b$phi + 60)
+  phi_lo <- as.numeric(quantile(ring$PHI_DEG, 0.02, na.rm = TRUE)) + b$radius
+  phi_hi <- as.numeric(quantile(ring$PHI_DEG, 0.98, na.rm = TRUE)) - b$radius
+  cand_phi <- seq(phi_lo, phi_hi, by = 2)
+  cand_phi <- cand_phi[abs(cand_phi - b$phi) >= sep]
+  if (!length(cand_phi)) return(b$phi + 60)
+  counts <- vapply(cand_phi, function(p) sum(
+    sqrt((ring$THETA_DEG - b$theta)^2 + (ring$PHI_DEG - p)^2) < b$radius),
+    integer(1))
+  cand_phi[which.max(counts)]
+}
+CTRL_M <- list(theta = BULGE_M$theta, phi = pick_ctrl_phi(sp_m, BULGE_M),
+               radius = BULGE_M$radius)
+CTRL_Z <- list(theta = BULGE_Z$theta, phi = pick_ctrl_phi(sp_z, BULGE_Z),
+               radius = BULGE_Z$radius)
+A_CTRL_M <- ellipse_disc_area(R_M, CTRL_M)   # = A_BULGE_M (same theta, same r)
+A_CTRL_Z <- ellipse_disc_area(R_Z, CTRL_Z)   # = A_BULGE_Z (same theta, same r)
 
-cat("  Margin band density summary (per 1000 µm²):\n")
-print(rbind(md_m, md_z)[, .(min = min(density_per_1000um2),
-                              median = median(density_per_1000um2),
-                              max = max(density_per_1000um2)),
-                          by = species])
-cat(sprintf("  Mean fold (Medaka / Zebrafish) over time: %.2f×\n",
-            mean(fold$fold_med_over_zeb, na.rm = TRUE)))
+cat(sprintf("  Disc params -- Medaka:    bulge theta=%.1f phi=%.1f r=%.1f deg, A=%.1f x10^3 um^2 ; control theta=%.1f phi=%.1f\n",
+            BULGE_M$theta, BULGE_M$phi, BULGE_M$radius, A_BULGE_M/1000, CTRL_M$theta, CTRL_M$phi))
+cat(sprintf("  Disc params -- Zebrafish: bulge theta=%.1f phi=%.1f r=%.1f deg, A=%.1f x10^3 um^2 ; control theta=%.1f phi=%.1f\n",
+            BULGE_Z$theta, BULGE_Z$phi, BULGE_Z$radius, A_BULGE_Z/1000, CTRL_Z$theta, CTRL_Z$phi))
+cat(sprintf("  Margin strip area: medaka %.1f x10^3 um^2 ; zebrafish %.1f x10^3 um^2\n",
+            A_STRIP_M/1000, A_STRIP_Z/1000))
+cat(sprintf("  Imaged surface:    medaka %.1f x10^3 um^2 ; zebrafish %.1f x10^3 um^2\n",
+            A_GLOBAL_M/1000, A_GLOBAL_Z/1000))
 
-# Save tidy CSV
-fwrite(rbind(md_m, md_z), file.path(OUT_DIR, "margin_density_per_frame.csv"))
-fwrite(binned, file.path(OUT_DIR, "margin_density_binned.csv"))
-fwrite(fold, file.path(OUT_DIR, "margin_density_fold.csv"))
+# ---- Selectors and helpers (time-cap independent) --------------------------
+in_disc <- function(sp, b) sp[!is.na(PHI_DEG) &
+  sqrt((THETA_DEG - b$theta)^2 + (PHI_DEG - b$phi)^2) < b$radius]
+in_strip <- function(sp, m) sp[THETA_DEG >= m - MARGIN_WIDTH_DEG &
+                                THETA_DEG <= m + MARGIN_WIDTH_DEG]
+per_frame_density <- function(cells, A, fi, sp_lbl, reg_lbl) {
+  cells[, .(n = .N), by = FRAME][,
+        .(species = sp_lbl, region = reg_lbl, FRAME,
+          time_min = FRAME * fi / 60,
+          density_per_1000um2 = n / A * 1000)]
+}
+REGION_LVL <- c("Bulge disc", "Control disc (same latitude)", "Margin strip",
+                "Global (whole imaged surface)")
+REGION_COL <- c("Bulge disc"                    = "#E31A1C",
+                "Control disc (same latitude)"  = "#1F78B4",
+                "Margin strip"                  = "#FDAE61",
+                "Global (whole imaged surface)" = "grey40")
+SNAP_NMAX <- 30000
+PHI_SLICE_W <- 8
+sample_n <- function(d, n) if (nrow(d) > n) d[sample(.N, n)] else d
+late_snap <- function(sp, fi, t_cap, w = 10) {
+  d <- sp[FRAME * fi / 60 <= t_cap]
+  tmax <- max(d$FRAME) * fi / 60
+  d[FRAME * fi / 60 >= tmax - w]
+}
+disc_outline <- function(b, sp_lbl, kind, n = 80) {
+  ang <- seq(0, 2 * pi, length.out = n)
+  data.table(species = sp_lbl, kind = kind,
+             phi   = b$phi   + b$radius * cos(ang),
+             theta = b$theta + b$radius * sin(ang))
+}
+peak_window_mean <- function(t, y, w = 30) {
+  ord <- order(t); t <- t[ord]; y <- y[ord]
+  y_smooth <- vapply(t, function(tc) mean(y[t >= tc - w/2 & t <= tc + w/2]),
+                     numeric(1))
+  i <- which.max(y_smooth)
+  list(peak_mean = mean(y[t >= t[i] - w/2 & t <= t[i] + w/2]),
+       peak_time = t[i])
+}
 
-p1a <- ggplot(rbind(md_m, md_z),
-              aes(time_min, density_per_1000um2, color = species)) +
-  geom_point(alpha = 0.25, size = 0.6) +
-  geom_smooth(se = TRUE, method = "loess", span = 0.3, linewidth = 1) +
-  scale_color_manual(values = species_colors) +
-  labs(title = "Cell density in margin band (±5° θ) over time",
-       subtitle = sprintf("Margin θ: medaka %.1f°, zebrafish %.1f° — surface density",
-                          MARGIN_M, MARGIN_Z),
-       x = "Time (min)", y = expression("nuclei / 1000 " * mu * "m" ^ 2),
-       color = NULL) +
-  theme_pub()
+# ---- Fig 1 builder.  Uses species-specific caps and aligns time to ingression.
+build_fig1 <- function(fname,
+                       time_caps = c(Medaka = Inf, Zebrafish = FIG1_ZEB_TCAP_MIN),
+                       title_suffix = "") {
+  cap_m <- unname(time_caps[["Medaka"]])
+  cap_z <- unname(time_caps[["Zebrafish"]])
+  cat(sprintf("\n  -- build_fig1(medaka=%s, zebrafish=%s) -> %s\n",
+              if (is.finite(cap_m)) sprintf("%.0f min", cap_m) else "full",
+              if (is.finite(cap_z)) sprintf("%.0f min", cap_z) else "full",
+              fname))
+  # Per-frame densities (filtered by species-specific caps)
+  sp_m_t <- sp_m[time_min <= cap_m]
+  sp_z_t <- sp_z[time_min <= cap_z]
+  d_ts <- rbind(
+    per_frame_density(in_disc(sp_m_t, BULGE_M), A_BULGE_M, MEDAKA_FI, "Medaka",    "Bulge disc"),
+    per_frame_density(in_disc(sp_z_t, BULGE_Z), A_BULGE_Z, ZEB_FI,    "Zebrafish", "Bulge disc"),
+    per_frame_density(in_disc(sp_m_t, CTRL_M),  A_CTRL_M,  MEDAKA_FI, "Medaka",    "Control disc (same latitude)"),
+    per_frame_density(in_disc(sp_z_t, CTRL_Z),  A_CTRL_Z,  ZEB_FI,    "Zebrafish", "Control disc (same latitude)"),
+    per_frame_density(in_strip(sp_m_t, MARGIN_M), A_STRIP_M, MEDAKA_FI, "Medaka",    "Margin strip"),
+    per_frame_density(in_strip(sp_z_t, MARGIN_Z), A_STRIP_Z, ZEB_FI,    "Zebrafish", "Margin strip"),
+    per_frame_density(sp_m_t, A_GLOBAL_M, MEDAKA_FI, "Medaka",    "Global (whole imaged surface)"),
+    per_frame_density(sp_z_t, A_GLOBAL_Z, ZEB_FI,    "Zebrafish", "Global (whole imaged surface)"))
+  d_ts <- merge(d_ts,
+                FIG1_TIME_META[, .(species, ingression_frame,
+                                   ingression_time_min)],
+                by = "species", all.x = TRUE)
+  d_ts[, time_from_ingression_min := time_min - ingression_time_min]
+  d_ts[, species := factor(species, levels = c("Medaka", "Zebrafish"))]
+  d_ts[, region := factor(region, levels = REGION_LVL)]
 
-p1b <- ggplot(binned, aes(time_bin, density, color = species)) +
-  geom_line(linewidth = 1) + geom_point(size = 2) +
-  scale_color_manual(values = species_colors) +
-  labs(title = sprintf("Mean margin density (binned %d-min)", BIN_MIN),
-       x = "Time (min)", y = expression("nuclei / 1000 " * mu * "m" ^ 2),
-       color = NULL) +
-  theme_pub()
+  # QC: drop frames where global density < 50% of species median
+  global_qc <- d_ts[region == "Global (whole imaged surface)",
+                    .(thr = 0.5 * median(density_per_1000um2)), by = species]
+  bad <- d_ts[region == "Global (whole imaged surface)"][
+    global_qc, on = "species"][density_per_1000um2 < thr, .(species, FRAME)]
+  if (nrow(bad)) {
+    cat(sprintf("     dropped %d broken frames (global < 50%% of median)\n", nrow(bad)))
+    d_ts <- d_ts[!bad, on = c("species", "FRAME")]
+  }
 
-p1c <- ggplot(fold[!is.na(fold_med_over_zeb)],
-              aes(time_bin, fold_med_over_zeb)) +
-  geom_hline(yintercept = 1, linetype = "dashed", color = "grey60") +
-  geom_line(linewidth = 1, color = "#444444") +
-  geom_point(size = 2, color = "#444444") +
-  geom_text(aes(label = sprintf("%.2f×", fold_med_over_zeb)),
-            vjust = -0.6, size = 3) +
-  labs(title = "Fold difference (Medaka / Zebrafish)",
-       subtitle = "Ratio of mean margin densities in 30-min bins",
-       x = "Time (min)", y = "Medaka density ÷ Zebrafish density") +
-  theme_pub()
+  # Panel A: top view, last 10 min of the (capped) window
+  snap_m <- late_snap(sp_m, MEDAKA_FI, cap_m)
+  snap_z <- late_snap(sp_z, ZEB_FI,    cap_z)
+  tA_m <- max(snap_m$time_min); tA_z <- max(snap_z$time_min)
+  snap <- rbind(
+    sample_n(snap_m, SNAP_NMAX)[, .(species = "Medaka",    PHI_DEG, THETA_DEG, SPHERICAL_DEPTH)],
+    sample_n(snap_z, SNAP_NMAX)[, .(species = "Zebrafish", PHI_DEG, THETA_DEG, SPHERICAL_DEPTH)])
+  snap[, species := factor(species, levels = c("Medaka", "Zebrafish"))]
+  outlines <- rbind(
+    disc_outline(BULGE_M, "Medaka",    "Bulge"),
+    disc_outline(CTRL_M,  "Medaka",    "Control"),
+    disc_outline(BULGE_Z, "Zebrafish", "Bulge"),
+    disc_outline(CTRL_Z,  "Zebrafish", "Control"))
+  outlines[, species := factor(species, levels = c("Medaka", "Zebrafish"))]
+  band_rect_p1 <- data.table(
+    species = factor(c("Medaka", "Zebrafish"), levels = c("Medaka", "Zebrafish")),
+    ymin    = c(MARGIN_M - MARGIN_WIDTH_DEG, MARGIN_Z - MARGIN_WIDTH_DEG),
+    ymax    = c(MARGIN_M + MARGIN_WIDTH_DEG, MARGIN_Z + MARGIN_WIDTH_DEG))
 
-fig1 <- (p1a / p1b / p1c) +
-  plot_annotation(
-    title = "Margin cell density over time — Medaka vs Zebrafish",
-    theme = theme(plot.title = element_text(face = "bold", size = 14)))
-save_pdf(fig1, "01_margin_density.pdf", w = 12, h = 14)
+  pA <- ggplot(snap, aes(PHI_DEG, THETA_DEG)) +
+    geom_rect(data = band_rect_p1, inherit.aes = FALSE,
+              aes(xmin = -Inf, xmax = Inf, ymin = ymin, ymax = ymax),
+              fill = "#FDAE61", alpha = 0.18) +
+    geom_point(aes(color = SPHERICAL_DEPTH), size = 0.25, alpha = 0.55) +
+    geom_polygon(data = outlines[kind == "Bulge"], inherit.aes = FALSE,
+                 aes(phi, theta), fill = NA, color = "#E31A1C", linewidth = 0.9) +
+    geom_polygon(data = outlines[kind == "Control"], inherit.aes = FALSE,
+                 aes(phi, theta), fill = NA, color = "#1F78B4",
+                 linewidth = 0.9, linetype = "22") +
+    facet_wrap(~ species, scales = "free") +
+    scale_y_reverse() +
+    scale_color_viridis_c(option = "inferno", name = expression("depth ("*mu*"m)")) +
+    labs(title = sprintf("A. Top view of the embryo surface (snapshot: medaka %.0f-%.0f min, zebrafish %.0f-%.0f min)",
+                          tA_m - 10, tA_m, tA_z - 10, tA_z),
+         subtitle = "Dot colour = depth (yellow = deep).  Red = bulge disc, cyan dashed = control disc (same area, same theta), orange band = margin strip.",
+         x = expression(varphi*" (deg)"), y = expression(theta*" (deg, animal pole up)")) +
+    theme_pub() +
+    theme(plot.subtitle = element_text(size = 9, color = "grey25"))
+
+  # Panel B: longitudinal cross-section through bulge centre
+  slice_m <- late_snap(sp_m[abs(PHI_DEG - BULGE_M$phi) <= PHI_SLICE_W], MEDAKA_FI, cap_m)
+  slice_z <- late_snap(sp_z[abs(PHI_DEG - BULGE_Z$phi) <= PHI_SLICE_W], ZEB_FI,    cap_z)
+  classify_xs <- function(d, bulge, ctrl) {
+    d[, ang_b := sqrt((THETA_DEG - bulge$theta)^2 + (PHI_DEG - bulge$phi)^2)]
+    d[, ang_c := sqrt((THETA_DEG - ctrl$theta)^2  + (PHI_DEG - ctrl$phi)^2)]
+    d[, xs_region := fifelse(ang_b < bulge$radius, "Bulge column",
+                      fifelse(ang_c < ctrl$radius,  "Control column", "Elsewhere"))]
+  }
+  classify_xs(slice_m, BULGE_M, CTRL_M)
+  classify_xs(slice_z, BULGE_Z, CTRL_Z)
+  xs <- rbind(
+    sample_n(slice_m, SNAP_NMAX)[, .(species = "Medaka",    THETA_DEG, SPHERICAL_DEPTH, xs_region)],
+    sample_n(slice_z, SNAP_NMAX)[, .(species = "Zebrafish", THETA_DEG, SPHERICAL_DEPTH, xs_region)])
+  xs[, species   := factor(species,   levels = c("Medaka", "Zebrafish"))]
+  xs[, xs_region := factor(xs_region, levels = c("Elsewhere", "Control column", "Bulge column"))]
+  xs_bands <- rbind(
+    data.table(species = "Medaka",    kind = "Bulge",   xmin = BULGE_M$theta - BULGE_M$radius, xmax = BULGE_M$theta + BULGE_M$radius),
+    data.table(species = "Medaka",    kind = "Control", xmin = CTRL_M$theta  - CTRL_M$radius,  xmax = CTRL_M$theta  + CTRL_M$radius),
+    data.table(species = "Zebrafish", kind = "Bulge",   xmin = BULGE_Z$theta - BULGE_Z$radius, xmax = BULGE_Z$theta + BULGE_Z$radius),
+    data.table(species = "Zebrafish", kind = "Control", xmin = CTRL_Z$theta  - CTRL_Z$radius,  xmax = CTRL_Z$theta  + CTRL_Z$radius))
+  xs_bands[, species := factor(species, levels = c("Medaka", "Zebrafish"))]
+
+  pB <- ggplot(xs, aes(THETA_DEG, SPHERICAL_DEPTH)) +
+    geom_rect(data = xs_bands[kind == "Bulge"], inherit.aes = FALSE,
+              aes(xmin = xmin, xmax = xmax, ymin = -Inf, ymax = Inf),
+              fill = "#E31A1C", alpha = 0.10) +
+    geom_rect(data = xs_bands[kind == "Control"], inherit.aes = FALSE,
+              aes(xmin = xmin, xmax = xmax, ymin = -Inf, ymax = Inf),
+              fill = "#1F78B4", alpha = 0.10) +
+    geom_point(aes(color = xs_region), size = 0.25, alpha = 0.55) +
+    scale_color_manual(values = c("Elsewhere" = "grey60",
+                                  "Control column" = "#1F78B4",
+                                  "Bulge column"   = "#E31A1C"), name = NULL) +
+    facet_wrap(~ species, scales = "free") +
+    scale_y_reverse() +
+    labs(title = sprintf("B. Cross-section through bulge centre (slice |phi-phi_bulge| <= %g deg)", PHI_SLICE_W),
+         subtitle = "Density counts every nucleus in the red column, all depths.  y-axis inverted: deeper = down.",
+         x = expression(theta*" (deg)"), y = expression("spherical depth ("*mu*"m)")) +
+    theme_pub() +
+    theme(plot.subtitle = element_text(size = 9, color = "grey25"))
+
+  # Panel C: density vs time, aligned to ingression per species
+  pC <- ggplot(d_ts, aes(time_from_ingression_min, density_per_1000um2,
+                         color = region)) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey65") +
+    geom_point(alpha = 0.15, size = 0.4) +
+    geom_smooth(method = "loess", span = 0.3, se = TRUE, linewidth = 1) +
+    facet_wrap(~ species, nrow = 1, scales = "free_x") +
+    scale_color_manual(values = REGION_COL, name = NULL) +
+    labs(title = "C. Regional nuclei density trajectories aligned to ingression",
+         subtitle = "0 min = ingression (medaka frame 199; zebrafish frame 40).  Bulge above control = true density excess.",
+         x = "time from ingression (min)",
+         y = expression("nuclei / 1000 "*mu*"m"^2)) +
+    theme_pub() +
+    theme(plot.subtitle = element_text(size = 9, color = "grey25"),
+          legend.position = "bottom")
+
+  bulge_ts <- d_ts[region == "Bulge disc"]
+  pD <- ggplot(bulge_ts,
+               aes(time_from_ingression_min, density_per_1000um2,
+                   color = species)) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey65") +
+    geom_point(alpha = 0.18, size = 0.5) +
+    geom_smooth(method = "loess", span = 0.3, se = TRUE, linewidth = 1.1) +
+    scale_color_manual(values = species_colors, name = NULL) +
+    labs(title = "D. Direct head-mesoderm / bulge comparison",
+         subtitle = sprintf("Same biological region in both species (data-driven bulge disc, area-normalized).  Zebrafish capped at %.0f min raw time.",
+                            cap_z),
+         x = "time from ingression (min)",
+         y = expression("nuclei / 1000 "*mu*"m"^2)) +
+    theme_pub() +
+    theme(plot.subtitle = element_text(size = 9, color = "grey25"))
+
+  fig <- (pA / pB / pC / pD) +
+    plot_layout(heights = c(1.2, 1.3, 1.1, 0.9)) +
+    plot_annotation(
+      title = sprintf("Figure 1 -- Head-mesoderm / bulge nuclei density (depth-integrated)%s", title_suffix),
+      subtitle = sprintf(
+        "Same region definition in both species: the data-driven head-mesoderm / bulge disc.  0 min = ingression (medaka frame %d = %.1f min; zebrafish frame %d = %.1f min).  Bulge disc: medaka r=%.1f deg, zebrafish r=%.1f deg.",
+        MEDAKA_INGRESSION_FRAME,
+        FIG1_TIME_META[species == "Medaka", ingression_time_min],
+        ZEB_INGRESSION_FRAME,
+        FIG1_TIME_META[species == "Zebrafish", ingression_time_min],
+        BULGE_M$radius, BULGE_Z$radius),
+      theme = theme(plot.title = element_text(face = "bold", size = 14),
+                    plot.subtitle = element_text(size = 9, color = "grey25")))
+  save_pdf(fig, fname, w = 15, h = 21)
+
+  # Per-region peak summary
+  summary_dt <- d_ts[, {
+    pk_raw <- peak_window_mean(time_min, density_per_1000um2)
+    pk_align <- peak_window_mean(time_from_ingression_min,
+                                 density_per_1000um2)
+    .(early_mean = round(mean(density_per_1000um2[time_min <= 30]), 2),
+      peak_mean  = round(pk_raw$peak_mean, 2),
+      peak_time  = round(pk_raw$peak_time),
+      peak_time_from_ingression = round(pk_align$peak_time))
+  }, by = .(species, region)]
+  summary_dt[, peak_vs_early := round(peak_mean / early_mean, 2)]
+  bulge_pk <- summary_dt[region == "Bulge disc",                    .(species, bulge_peak = peak_mean)]
+  ctrl_pk  <- summary_dt[region == "Control disc (same latitude)",  .(species, ctrl_peak  = peak_mean)]
+  ratio_dt <- merge(bulge_pk, ctrl_pk, by = "species")
+  ratio_dt[, bulge_over_control := round(bulge_peak / ctrl_peak, 2)]
+  cat("     bulge/control peak-density ratio (same area, same theta):\n")
+  print(ratio_dt)
+  print(summary_dt)
+  fwrite(d_ts, file.path(OUT_DIR,
+                          sub("\\.pdf$", "_per_frame.csv", fname)))
+  list(summary = summary_dt, ratio = ratio_dt)
+}
+
+fig1_full <- build_fig1(
+  "01_margin_density.pdf",
+  time_caps = c(Medaka = Inf, Zebrafish = FIG1_ZEB_TCAP_MIN),
+  title_suffix = sprintf("  (zebrafish t <= %d min)", FIG1_ZEB_TCAP_MIN))
+fig1_t170 <- build_fig1(
+  "01b_margin_density_t170.pdf",
+  time_caps = c(Medaka = FIG1_ZEB_TCAP_MIN, Zebrafish = FIG1_ZEB_TCAP_MIN),
+  title_suffix = sprintf("  (both species t <= %d min)", FIG1_ZEB_TCAP_MIN))
 
 # =============================================================================
 # FIGURE 2: MOVEMENT DIRECTION OVER TIME (both species)
@@ -346,8 +777,10 @@ banner("FIGURE 2 — movement direction over time")
 
 TIME_BIN <- 30
 vel_all <- rbind(
-  vel_m[, .(species, time_min, v_epiboly, v_convergence, step_type)],
-  vel_z[, .(species, time_min, v_epiboly, v_convergence, step_type)]
+  vel_m[, .(species, time_min, v_epiboly, v_convergence, step_type,
+            movement_type)],
+  vel_z[, .(species, time_min, v_epiboly, v_convergence, step_type,
+            movement_type)]
 )
 vel_all[, time_bin := floor(time_min / TIME_BIN) * TIME_BIN + TIME_BIN / 2]
 
@@ -383,26 +816,43 @@ p2c <- ggplot(dir_summary, aes(time_bin, abs_v_conv, color = species)) +
        y = expression("|v"["conv"] * "| (" * mu * "m/min)"), color = NULL) +
   theme_pub()
 
-step_comp <- vel_all[!is.na(step_type),
-  .(n = .N), by = .(species, time_bin, step_type)]
+step_comp <- vel_all[!is.na(movement_type),
+  .(n = .N), by = .(species, time_bin, movement_type)]
 step_comp[, pct := 100 * n / sum(n), by = .(species, time_bin)]
-step_comp[, step_type := factor(step_type,
-                                 levels = c("Epiboly", "Animalward",
-                                            "Convergence"))]
+step_comp[, movement_type := factor(movement_type, levels = STEP_TYPE_LEVELS)]
 
-p2d <- ggplot(step_comp, aes(time_bin, pct, fill = step_type)) +
-  geom_area(alpha = 0.9, color = "white", linewidth = 0.2) +
+p2d <- ggplot(step_comp, aes(time_bin, pct, fill = movement_type)) +
+  geom_area(alpha = 0.95, color = "white", linewidth = 0.2) +
   facet_wrap(~ species, ncol = 1) +
-  scale_fill_manual(values = step_type_cols) +
-  labs(title = "Per-step direction composition (stacked %)",
+  scale_fill_manual(values = step_type_cols, drop = FALSE) +
+  labs(title = "Movement type fraction over time (per-track classification)",
+       subtitle = "Each step inherits its TRACK's movement type (same scheme as medaka_dynamics_05_spatial_flow).",
        x = "Time (min)", y = "% of steps", fill = NULL) +
-  theme_pub()
+  theme_pub() +
+  theme(plot.subtitle = element_text(size = 8, color = "grey25"))
+
+fig2_caption <- paste0(
+  "Step velocities (\u00b5m/min on sphere R):  ",
+  "v_epiboly = R\u00b7d\u03b8/dt (>0 = vegetal-ward / epiboly direction)   |   ",
+  "v_conv = R\u00b7sin\u03b8\u00b7d\u03c6/dt (along the equator; sign depends on flank)   |   ",
+  "v_conv_dor = \u2212v_conv\u00b7sign(\u03c6\u2212\u03c6_bulge) (>0 = moving toward the dorsal axis = convergence)   |   ",
+  "v_depth = d(spherical depth)/dt (>0 = moving inward = ingression).\n",
+  "Per-TRACK classification (priority order):  ",
+  sprintf("Ingression \u2014 track ENDS in ingression region AND total depth gain > P90 (medaka P90=%.1f \u00b5m within %.1f\u00b0 bulge disc; zebrafish P90=%.1f \u00b5m within margin strip \u00b1%g\u00b0).   ",
+          trk_m$depth_thresh, BULGE_M$radius, trk_z$depth_thresh, INGR_STRIP_HALFW_Z),
+  "Convergence \u2014 |mean v_conv_dor| > |mean v_epiboly| AND mean v_conv_dor > 0.   ",
+  "Epiboly \u2014 mean v_epiboly > 0.   Animalward \u2014 otherwise.")
 
 fig2 <- (p2a + p2b) / (p2c + p2d) +
   plot_annotation(title = "Movement direction over time",
+                  caption = fig2_caption,
                   theme = theme(plot.title = element_text(face = "bold",
-                                                          size = 14)))
-save_pdf(fig2, "02_movement_direction.pdf", w = 14, h = 11)
+                                                          size = 14),
+                                plot.caption = element_text(size = 8,
+                                                             hjust = 0,
+                                                             color = "grey25",
+                                                             margin = margin(t = 10))))
+save_pdf(fig2, "02_movement_direction.pdf", w = 16, h = 12)
 
 fwrite(dir_summary, file.path(OUT_DIR, "direction_summary.csv"))
 fwrite(step_comp, file.path(OUT_DIR, "step_type_composition.csv"))
@@ -416,25 +866,38 @@ fwrite(step_comp, file.path(OUT_DIR, "step_type_composition.csv"))
 
 banner("FIGURE 3 — thickness")
 
-# Zone widths (match per-species pipelines)
-ZONE_MARG_W_M  <- 5;  ZONE_PREM_W_M <- 10   # medaka
-ZONE_MARG_W_Z  <- 8;  ZONE_PREM_W_Z <- 15   # zebrafish
+# Simplified zones: only three biologically meaningful tiers --
+#   Animal cap    : tissue above the margin band (cells not yet involuted)
+#   Margin        : whole margin strip (the entire involuting ring)
+#   Head mesoderm : the data-driven deep-cell cluster (called "germ-ring
+#                   bulge" in medaka and "shield" in zebrafish; these are
+#                   biologically the same structure -- the site of cell
+#                   internalisation at the dorsal margin).  Applied to BOTH
+#                   species; the override replaces the local zone wherever
+#                   a cell falls inside the data-driven disc.
+ZONE_MARG_W_M  <- 5    # medaka  margin half-width (deg)
+ZONE_MARG_W_Z  <- 8    # zebrafish margin half-width (deg)
 
-assign_zone <- function(theta, margin_theta, marg_w, prem_w) {
+ZONE_LEVELS <- c("Animal cap", "Margin", "Head mesoderm")
+
+assign_zone <- function(theta, phi, margin_theta, marg_w, bulge) {
   zm_top <- margin_theta - marg_w
-  zp_top <- zm_top       - prem_w
-  factor(fcase(
-    theta > margin_theta, "Sub-marginal",
-    theta > zm_top,       "Margin layer",
-    theta > zp_top,       "Pre-marginal",
-    default               = "Animal cap"),
-    levels = c("Animal cap", "Pre-marginal", "Margin layer", "Sub-marginal"))
+  z <- fcase(
+    theta > zm_top,       "Margin",
+    default               = "Animal cap")
+  in_bulge <- !is.na(phi) &
+    sqrt((theta - bulge$theta)^2 + (phi - bulge$phi)^2) < bulge$radius
+  z[in_bulge] <- "Head mesoderm"   # overrides any local zone
+  factor(z, levels = ZONE_LEVELS)
 }
 
-sp_m[, zone := assign_zone(THETA_DEG, MARGIN_M, ZONE_MARG_W_M, ZONE_PREM_W_M)]
-sp_z[, zone := assign_zone(THETA_DEG, MARGIN_Z, ZONE_MARG_W_Z, ZONE_PREM_W_Z)]
+sp_m[, zone := assign_zone(THETA_DEG, PHI_DEG, MARGIN_M,
+                            ZONE_MARG_W_M, BULGE_M)]
+sp_z[, zone := assign_zone(THETA_DEG, PHI_DEG, MARGIN_Z,
+                            ZONE_MARG_W_Z, BULGE_Z)]
 
-# Per-cell depth distribution in 10-min bins per zone, per species
+# Per-cell depth distribution in 10-min bins per zone, per species.
+# Built ONCE on the full data; the t<=170 variant of Fig 3 just filters this.
 depth_dist <- rbind(
   sp_m[!is.na(zone) & is.finite(SPHERICAL_DEPTH),
        .(time_bin = floor(time_min / 10) * 10,
@@ -445,61 +908,152 @@ depth_dist <- rbind(
 )
 depth_dist[, species := factor(species, levels = c("Medaka", "Zebrafish"))]
 
-depth_summary <- depth_dist[,
-  .(p10 = quantile(depth_um, 0.10),
-    p25 = quantile(depth_um, 0.25),
-    p50 = quantile(depth_um, 0.50),
-    p75 = quantile(depth_um, 0.75),
-    p90 = quantile(depth_um, 0.90),
-    thickness_iqr = IQR(depth_um),
-    n_cells = .N),
-  by = .(species, zone, time_bin)][n_cells >= 20]
+BIN_DEG <- 5
+make_window <- function(sp_dt, sp_label, t_cap = Inf) {
+  d <- sp_dt[time_min <= t_cap]
+  tmax <- max(d$time_min, na.rm = TRUE)
+  wlen <- 30                      # window width in minutes
+  mid_t <- tmax / 2
+  rbind(
+    d[time_min <= min(wlen, tmax),
+      .(species = sp_label,
+        window  = sprintf("Early\n(0\u2013%.0f min)", min(wlen, tmax)),
+        window_order = 1L,
+        THETA_DEG, PHI_DEG, SPHERICAL_DEPTH)],
+    d[time_min >= mid_t - wlen / 2 & time_min <= mid_t + wlen / 2,
+      .(species = sp_label,
+        window  = sprintf("Mid\n(%.0f\u2013%.0f min)",
+                          mid_t - wlen / 2, mid_t + wlen / 2),
+        window_order = 2L,
+        THETA_DEG, PHI_DEG, SPHERICAL_DEPTH)],
+    d[time_min >= max(0, tmax - wlen),
+      .(species = sp_label,
+        window  = sprintf("Late\n(%.0f\u2013%.0f min)", max(0, tmax - wlen), tmax),
+        window_order = 3L,
+        THETA_DEG, PHI_DEG, SPHERICAL_DEPTH)]
+  )
+}
 
-# Top panel — the metric used to track thickness
-p3a <- ggplot(depth_summary, aes(time_bin, thickness_iqr, color = species)) +
-  geom_line(linewidth = 0.9) + geom_point(size = 1.4, alpha = 0.7) +
-  facet_wrap(~ zone, nrow = 1, scales = "free_x") +
-  scale_color_manual(values = species_colors) +
-  labs(title = "Tissue thickness — IQR of cell depth per zone",
-       x = "Time (min)", y = "thickness IQR (µm)", color = NULL) +
-  theme_pub()
+# -----------------------------------------------------------------------------
+# Fig 3 builder.  Two versions are produced:
+#   1) full data  -> 03_thickness.pdf
+#   2) t <= 170 min for both species -> 03b_thickness_t170.pdf
+#
+# Panel A metric is the p10-p90 spherical depth range of the cells in each
+# zone at each time bin (the width of the lighter ribbon in panel B).
+# Panel B shows that p10-p90 ribbon and the IQR (p25-p75) ribbon + median.
+# -----------------------------------------------------------------------------
+build_fig3 <- function(t_cap, fname, title_suffix = "") {
+  dd <- depth_dist[time_bin <= t_cap]
+  ds <- dd[, .(p10 = quantile(depth_um, 0.10),
+               p25 = quantile(depth_um, 0.25),
+               p50 = quantile(depth_um, 0.50),
+               p75 = quantile(depth_um, 0.75),
+               p90 = quantile(depth_um, 0.90),
+               full_range = quantile(depth_um, 0.90) - quantile(depth_um, 0.10),
+               n_cells = .N),
+           by = .(species, zone, time_bin)][n_cells >= 20]
 
-# Bottom panel — the underlying depth distribution that defines the IQR
-p3b <- ggplot(depth_summary, aes(x = time_bin)) +
-  geom_ribbon(aes(ymin = p10, ymax = p90, fill = species), alpha = 0.18) +
-  geom_ribbon(aes(ymin = p25, ymax = p75, fill = species), alpha = 0.40) +
-  geom_line(aes(y = p50, color = species), linewidth = 0.9) +
-  facet_grid(species ~ zone, scales = "free") +
-  scale_fill_manual(values = species_colors, guide = "none") +
-  scale_color_manual(values = species_colors, guide = "none") +
-  scale_y_reverse() +    # depth: 0 = surface, positive = deeper
-  labs(title = "Depth distribution underlying the thickness measurement",
-       subtitle = "outer band = p10–p90, inner band = IQR (p25–p75), line = median; y-axis reversed (surface up)",
-       x = "Time (min)", y = "spherical depth (µm, surface up)") +
-  theme_pub()
+  p3a <- ggplot(ds, aes(time_bin, full_range, color = species)) +
+    geom_line(linewidth = 0.9) + geom_point(size = 1.4, alpha = 0.7) +
+    facet_wrap(~ zone, nrow = 1, scales = "free_x") +
+    scale_color_manual(values = species_colors) +
+    labs(title = "Tissue thickness \u2014 p10\u2013p90 spherical depth range per zone",
+         x = "Time (min)", y = "thickness = p90 \u2212 p10 depth (\u00b5m)",
+         color = NULL) +
+    theme_pub()
 
-fig3 <- (p3a / p3b) +
-  plot_layout(heights = c(1, 1.8)) +
-  plot_annotation(
-    title = "Tissue thickness over time — Medaka vs Zebrafish",
-    subtitle = "Top = the IQR metric; bottom = the cell-depth cloud it summarises",
-    theme = theme(plot.title = element_text(face = "bold", size = 14)))
-save_pdf(fig3, "03_thickness.pdf", w = 16, h = 12)
+  p3b <- ggplot(ds, aes(x = time_bin)) +
+    geom_ribbon(aes(ymin = p10,  ymax = p90,  fill = species), alpha = 0.20) +
+    geom_ribbon(aes(ymin = p25,  ymax = p75,  fill = species), alpha = 0.40) +
+    geom_line(aes(y = p50, color = species), linewidth = 0.9) +
+    facet_grid(species ~ zone, scales = "free") +
+    scale_fill_manual(values = species_colors, guide = "none") +
+    scale_color_manual(values = species_colors, guide = "none") +
+    labs(title = "Depth distribution of cells per zone (the data underlying the thickness above)",
+         subtitle = "Lighter band = p10\u2013p90 (= thickness above).  Darker band = IQR.  Line = median.  y-axis: higher = deeper.",
+         x = "Time (min)", y = expression("spherical depth ("*mu*"m; higher = deeper)")) +
+    theme_pub() +
+    theme(plot.subtitle = element_text(size = 8, color = "grey25"))
 
-fwrite(depth_summary, file.path(OUT_DIR, "thickness_depth_distribution.csv"))
+  heat_raw <- rbind(make_window(sp_m, "Medaka",    t_cap),
+                    make_window(sp_z, "Zebrafish", t_cap))
+  heat_raw[, phi_bin   := floor(PHI_DEG   / BIN_DEG) * BIN_DEG + BIN_DEG / 2]
+  heat_raw[, theta_bin := floor(THETA_DEG / BIN_DEG) * BIN_DEG + BIN_DEG / 2]
+  heat <- heat_raw[is.finite(SPHERICAL_DEPTH),
+    .(deep_p90 = quantile(SPHERICAL_DEPTH, 0.90, na.rm = TRUE), n = .N),
+    by = .(species, window, window_order, phi_bin, theta_bin)][n >= 3]
+  heat[, panel_col := factor(c("Early", "Mid", "Late")[window_order],
+                              levels = c("Early", "Mid", "Late"))]
+  heat[, species := factor(species, levels = c("Medaka", "Zebrafish"))]
+  tmax_m <- min(t_cap, max(sp_m$time_min, na.rm = TRUE))
+  tmax_z <- min(t_cap, max(sp_z$time_min, na.rm = TRUE))
 
-# Quick numeric check — does the margin layer actually thicken?
-margin_thick <- depth_summary[zone == "Margin layer"]
+  heat_band <- data.table(
+    species = factor(c("Medaka", "Zebrafish"), levels = c("Medaka", "Zebrafish")),
+    ymin    = c(MARGIN_M - MARGIN_WIDTH_DEG, MARGIN_Z - MARGIN_WIDTH_DEG),
+    ymax    = c(MARGIN_M + MARGIN_WIDTH_DEG, MARGIN_Z + MARGIN_WIDTH_DEG))
+
+  p3c <- ggplot(heat, aes(phi_bin, theta_bin, fill = deep_p90)) +
+    geom_tile() +
+    geom_rect(data = heat_band, inherit.aes = FALSE,
+              aes(xmin = -Inf, xmax = Inf, ymin = ymin, ymax = ymax),
+              fill = NA, color = "white", linewidth = 0.4, linetype = "dashed") +
+    geom_polygon(data = bulge_poly, inherit.aes = FALSE,
+                 aes(phi, theta), fill = NA,
+                 color = "white", linewidth = 0.5) +
+    geom_text(data = unique(heat[, .(species, panel_col, window)]),
+              aes(x = -Inf, y = -Inf, label = window),
+              inherit.aes = FALSE, hjust = -0.05, vjust = -0.5,
+              size = 2.6, color = "grey80", lineheight = 0.85) +
+    facet_grid(species ~ panel_col, scales = "free") +
+    scale_fill_viridis_c(option = "inferno", name = "P90 depth (\u00b5m)",
+                         limits = c(0, NA), oob = scales::squish) +
+    scale_y_reverse() +
+    labs(title = "Where the tissue is thickest on the embryo surface (temporal evolution)",
+         subtitle = sprintf("Tile = %g\u00b0 \u00d7 %g\u00b0 (\u03c6 \u00d7 \u03b8), coloured by P90 spherical depth.  Dashed = margin band.  Solid ellipse = head-mesoderm disc.  Medaka 0\u2013%.0f min, zebrafish 0\u2013%.0f min.",
+                            BIN_DEG, BIN_DEG, tmax_m, tmax_z),
+         x = expression(varphi*" (deg)"), y = expression(theta*" (deg, animal pole up)")) +
+    theme_pub() +
+    theme(plot.subtitle = element_text(size = 9, color = "grey25"))
+
+  fig <- (p3a / p3b / p3c) +
+    plot_layout(heights = c(1, 1.6, 1.6)) +
+    plot_annotation(
+      title = sprintf("Tissue thickness over time \u2014 Medaka vs Zebrafish%s",
+                      title_suffix),
+      subtitle = sprintf("Thickness = p90 \u2212 p10 spherical depth per zone.  Zones: Animal cap = \u03b8 \u2264 margin-W\u00b0 ; Margin = below that ; Head mesoderm = bulge disc (overrides). W = %g\u00b0 medaka, %g\u00b0 zebrafish.",
+                          ZONE_MARG_W_M, ZONE_MARG_W_Z),
+      theme = theme(plot.title = element_text(face = "bold", size = 14),
+                    plot.subtitle = element_text(size = 9, color = "grey25")))
+  save_pdf(fig, fname, w = 17, h = 18)
+  ds
+}
+
+depth_summary       <- build_fig3(Inf, "03_thickness.pdf")
+depth_summary_t170  <- build_fig3(170, "03b_thickness_t170.pdf",
+                                   title_suffix = "  (t \u2264 170 min)")
+
+fwrite(depth_summary,      file.path(OUT_DIR, "thickness_depth_distribution.csv"))
+fwrite(depth_summary_t170, file.path(OUT_DIR, "thickness_depth_distribution_t170.csv"))
+
+# Quick numeric check -- does the margin layer actually thicken?
+zone_report <- list(
+  Medaka    = c("Margin", "Head mesoderm"),
+  Zebrafish = c("Margin", "Head mesoderm"))
 for (sp in c("Medaka", "Zebrafish")) {
-  dd <- margin_thick[species == sp][order(time_bin)]
-  if (nrow(dd) >= 3) {
-    t0 <- dd$thickness_iqr[1]
-    tmax <- max(dd$thickness_iqr)
-    tend <- tail(dd$thickness_iqr, 1)
-    tmax_t <- dd$time_bin[which.max(dd$thickness_iqr)]
-    cat(sprintf("  %-9s margin IQR: t=0 %.1f µm | peak %.1f µm at t=%g min | end %.1f µm (Δpeak=%+.1f%%, Δend=%+.1f%%)\n",
-                sp, t0, tmax, tmax_t, tend,
-                100 * (tmax - t0) / t0, 100 * (tend - t0) / t0))
+  cat(sprintf("  --- %s ---\n", sp))
+  for (zn in zone_report[[sp]]) {
+    dd <- depth_summary[zone == zn & species == sp][order(time_bin)]
+    if (nrow(dd) >= 3) {
+      t0   <- dd$full_range[1]
+      tmax <- max(dd$full_range)
+      tend <- tail(dd$full_range, 1)
+      tmax_t <- dd$time_bin[which.max(dd$full_range)]
+      cat(sprintf("    %-26s full-range: t=0 %.1f \u00b5m | peak %.1f \u00b5m at t=%g min | end %.1f \u00b5m (\u0394peak=%+.1f%%, \u0394end=%+.1f%%)\n",
+                  zn, t0, tmax, tmax_t, tend,
+                  100 * (tmax - t0) / t0, 100 * (tend - t0) / t0))
+    }
   }
 }
 
@@ -638,6 +1192,132 @@ maj_strip <- ggplot(hour_majority,
        x = "Hour (from start of acquisition)", y = NULL) +
   theme_pub() + theme(panel.grid = element_blank())
 save_pdf(maj_strip, "04c_majority_movement_per_hour.pdf", w = 14, h = 4)
+
+# -----------------------------------------------------------------------------
+# 04d: Ingression-only vector map (validation of the per-TRACK classifier)
+# -----------------------------------------------------------------------------
+# Uses the SAME track-level movement_type produced by classify_tracks() that
+# Figure 2 uses (i.e. nothing here re-classifies anything). For each track
+# tagged "Ingression" we draw a SINGLE net-displacement arrow from its start
+# to its end position, so the per-step jitter does not turn the panel into
+# a fur-ball.  Two views, faceted by the HOUR IN WHICH THE TRACK STARTS:
+#
+#   * Top view (XY)  — shows WHERE on the embryo surface ingression happens
+#                      (should cluster inside the medaka bulge ellipse and
+#                      along the zebrafish margin strip).
+#   * Side view (YZ) — shows the cells actually diving INWARD (this is the
+#                      signal the classifier keys on: depth gain).  Arrows
+#                      pointing toward the embryo interior validate that
+#                      "Ingression" tracks really move into the deep tissue.
+#
+# Arrow colour = depth change (last - first SPHERICAL_DEPTH, in µm).
+# -----------------------------------------------------------------------------
+banner("FIGURE 4d — ingression-only net-displacement vectors (classifier validation)")
+
+ingression_track_endpoints <- function(vel, sp_label) {
+  setkey(vel, TRACK_ID, FRAME)
+  ing <- vel[movement_type == "Ingression",
+             .(start_frame = FRAME[1],
+               end_frame   = FRAME[.N],
+               start_x = POSITION_X[1], end_x = POSITION_X[.N],
+               start_y = POSITION_Y[1], end_y = POSITION_Y[.N],
+               start_z = POSITION_Z[1], end_z = POSITION_Z[.N],
+               start_depth = SPHERICAL_DEPTH[1],
+               end_depth   = SPHERICAL_DEPTH[.N],
+               depth_change = SPHERICAL_DEPTH[.N] - SPHERICAL_DEPTH[1],
+               n_steps     = .N),
+             by = TRACK_ID]
+  ing[, start_hour := floor(start_frame * (if (sp_label == "Medaka") MEDAKA_FI
+                                            else ZEB_FI) / 3600)]
+  ing[, species := sp_label]
+  ing
+}
+ing_ep_m <- ingression_track_endpoints(vel_m, "Medaka")
+ing_ep_z <- ingression_track_endpoints(vel_z, "Zebrafish")
+
+cat(sprintf("  Ingression tracks: Medaka n=%d (median depth gain %.1f µm) | Zebrafish n=%d (median depth gain %.1f µm)\n",
+            nrow(ing_ep_m), median(ing_ep_m$depth_change),
+            nrow(ing_ep_z), median(ing_ep_z$depth_change)))
+
+# Per-hour facet labels
+ing_hour_labels <- function(ep) {
+  ep[, .(n_tracks = .N,
+         med_depth_gain = round(median(depth_change), 1)),
+     by = start_hour][order(start_hour)][
+       , hour_lab := sprintf("h%02d  (n=%d, Δdepth med %+.1f µm)",
+                             start_hour, n_tracks, med_depth_gain)][]
+}
+ihl_m <- ing_hour_labels(ing_ep_m)
+ihl_z <- ing_hour_labels(ing_ep_z)
+
+plot_ingression_endpoints <- function(ep, ihl, sp_label) {
+  if (nrow(ep) == 0) return(NULL)
+  ep <- merge(ep, ihl[, .(start_hour, hour_lab)], by = "start_hour")
+  # Colour limits clipped to robust range
+  dc_lim <- range(ep$depth_change, na.rm = TRUE)
+  dc_lim[1] <- max(dc_lim[1], quantile(ep$depth_change, 0.02, na.rm = TRUE))
+  dc_lim[2] <- min(dc_lim[2], quantile(ep$depth_change, 0.98, na.rm = TRUE))
+
+  top <- ggplot(ep) +
+    geom_segment(aes(x = start_x, y = start_y,
+                     xend = end_x, yend = end_y,
+                     color = depth_change),
+                 arrow = arrow(length = unit(0.10, "cm"), type = "closed"),
+                 linewidth = 0.5, alpha = 0.9) +
+    geom_point(aes(start_x, start_y), size = 0.4,
+               color = "grey30", alpha = 0.6) +
+    facet_wrap(~ hour_lab, ncol = 4) +
+    scale_color_viridis_c(option = "magma", direction = -1,
+                          limits = dc_lim, oob = scales::squish,
+                          name = "Δ depth (µm)\nfirst→last") +
+    scale_y_reverse() + coord_fixed() +
+    labs(title = sprintf("%s — INGRESSION tracks: TOP view (XY)  — WHERE on the surface", sp_label),
+         subtitle = "one arrow per track = start→end XY position | dot = start | colour = depth gained over track lifetime",
+         x = "X (µm)", y = "Y (µm)  [AP top, VP bottom]") +
+    theme_pub(10) + theme(strip.text = element_text(size = 8))
+
+  side <- ggplot(ep) +
+    geom_segment(aes(x = start_y, y = start_z,
+                     xend = end_y, yend = end_z,
+                     color = depth_change),
+                 arrow = arrow(length = unit(0.10, "cm"), type = "closed"),
+                 linewidth = 0.5, alpha = 0.9) +
+    geom_point(aes(start_y, start_z), size = 0.4,
+               color = "grey30", alpha = 0.6) +
+    facet_wrap(~ hour_lab, ncol = 4) +
+    scale_color_viridis_c(option = "magma", direction = -1,
+                          limits = dc_lim, oob = scales::squish,
+                          name = "Δ depth (µm)\nfirst→last") +
+    coord_fixed() +
+    labs(title = sprintf("%s — INGRESSION tracks: SIDE view (YZ)  — diving INWARD", sp_label),
+         subtitle = "arrows should point toward the embryo interior (Z away from the outer surface) = the signal the classifier keys on",
+         x = "Y (µm)", y = "Z (µm)") +
+    theme_pub(10) + theme(strip.text = element_text(size = 8))
+
+  list(top = top, side = side)
+}
+
+# Per-track endpoint CSV (useful for downstream inspection)
+fwrite(rbind(ing_ep_m, ing_ep_z, fill = TRUE),
+       file.path(OUT_DIR, "ingression_track_endpoints.csv"))
+
+ing_pl_m <- plot_ingression_endpoints(ing_ep_m, ihl_m, "Medaka")
+ing_pl_z <- plot_ingression_endpoints(ing_ep_z, ihl_z, "Zebrafish")
+
+if (!is.null(ing_pl_m)) {
+  n_h <- nrow(ihl_m); h_panel <- max(6, 4 * ceiling(n_h / 4))
+  save_pdf(ing_pl_m$top / ing_pl_m$side + plot_layout(heights = c(1, 1)),
+           "04d_ingression_vectors_medaka.pdf", w = 18, h = 2 * h_panel)
+}
+if (!is.null(ing_pl_z)) {
+  n_h <- nrow(ihl_z); h_panel <- max(6, 4 * ceiling(n_h / 4))
+  save_pdf(ing_pl_z$top / ing_pl_z$side + plot_layout(heights = c(1, 1)),
+           "04e_ingression_vectors_zebrafish.pdf", w = 18, h = 2 * h_panel)
+}
+
+fwrite(rbind(ihl_m[, species := "Medaka"], ihl_z[, species := "Zebrafish"],
+             fill = TRUE),
+       file.path(OUT_DIR, "ingression_tracks_per_hour.csv"))
 
 # =============================================================================
 # FIGURE 5: MATCHED-TRACK COMPARISON (FAIR SAMPLING)
